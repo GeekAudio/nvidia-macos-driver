@@ -26,6 +26,30 @@ static int g_scalar_layout;
 
 void nvlog(const char *fmt, ...);
 
+// Debug probes may compile and encode MPS graphs without executing their shaders.
+// MPSGraph can submit from its encode API; it also initializes descriptor dummies
+// through a raw Vulkan submit. Latch this process-local guard before device init,
+// because loading a second (release) Metal bundle can clear the NVMTL environment.
+int nvmtl_vk_encode_only_active(void)
+{
+#if !NVMTL_RELEASE
+    static _Atomic int latched;
+    const char *value = getenv("NVMTL_ENCODE_ONLY");
+    if (value && !strcmp(value, "1")) atomic_store(&latched, 1);
+    return atomic_load(&latched);
+#else
+    return 0;
+#endif
+}
+
+static void nvmtl_vk_encode_only_refuse_submit(const char *where)
+{
+    if (!nvmtl_vk_encode_only_active()) return;
+    fprintf(stderr, "ENCODE_ONLY_GUARD: blocked Vulkan submission at %s\n", where);
+    fflush(stderr);
+    _Exit(20);
+}
+
 static __thread uint32_t g_copy_aspect_override, g_copy_bpp_override;
 void nvmtl_vk_copy_aspect_override(uint32_t aspect, uint32_t bpp) { g_copy_aspect_override = aspect; g_copy_bpp_override = bpp; }
 static VkImageAspectFlags nvmtl_copy_aspect(const nvk_image *img)
@@ -5314,6 +5338,10 @@ void nvmtl_vk_cmd_set_viewport(nvk_cmdbuf *c, float x, float y, float w, float h
 }
 static void nvmtl_vk_zero_dummies(void)
 {
+    if (nvmtl_vk_encode_only_active()) {
+        nvlog("encode-only: dummy image initialization was not submitted");
+        return;
+    }
     static int done;
     if (done) return;
     done = 1;
@@ -5345,6 +5373,7 @@ static void nvmtl_vk_zero_dummies(void)
     VkFenceCreateInfo fci = { VK_STRUCTURE_TYPE_FENCE_CREATE_INFO, NULL, 0 };
     if (pvkCreateFence(g_dev, &fci, NULL, &fence) != VK_SUCCESS) { nvlog("vk: dummy zero-fill SKIPPED — vkCreateFence failed; an unbound texture still samples uninitialised memory"); return; }
     VkSubmitInfo si = { VK_STRUCTURE_TYPE_SUBMIT_INFO, NULL, 0, NULL, NULL, 1, &cb, 0, NULL };
+    nvmtl_vk_encode_only_refuse_submit("dummy image initialization");
     VkResult sr = pvkQueueSubmit(g_queue, 1, &si, fence);
     if (sr != VK_SUCCESS) { nvlog("vk: dummy zero-fill FAILED — vkQueueSubmit -> %d; an unbound texture still samples uninitialised memory", sr); pvkDestroyFence(g_dev, fence, NULL); return; }
     VkResult wr = pvkWaitForFences(g_dev, 1, &fence, VK_TRUE, 2000000000ull);
@@ -5736,6 +5765,7 @@ int nvmtl_vk_submit_wait_at(nvk_cmdbuf *c, const char *who)
 }
 int nvmtl_vk_submit_begin_at(nvk_cmdbuf *c, nvmtl_inflight *f, const char *who)
 {
+    nvmtl_vk_encode_only_refuse_submit(who ? who : "command buffer");
     nvmtl_subwho_note(who, 0);
     memset(f, 0, sizeof *f); f->c = c;
     uint64_t *const pt = f->pt;
@@ -5789,6 +5819,7 @@ int nvmtl_vk_submit_begin_at(nvk_cmdbuf *c, nvmtl_inflight *f, const char *who)
     nvmtl_wit_control(wseq);
     const uint64_t sE = nvmtl_perf_now();
     if (pt[0]) { pt[1] = pt[0] + (sA - pt[0]) + (sD - sC); pt[2] = pt[1] + (sB - sA) + (sE - sD); pt[3] = pt[2] + (sC - sB); }
+    nvmtl_vk_encode_only_refuse_submit("vkQueueSubmit");
     result = g_state == 1 ? pvkQueueSubmit(g_queue, 1, &si, fence) : VK_ERROR_DEVICE_LOST;
     pthread_mutex_unlock(&nvmtl_submit_mutex);
     pt[4] = nvmtl_perf_now();

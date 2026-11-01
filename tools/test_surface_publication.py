@@ -34,6 +34,8 @@ typedef struct { unsigned w,h,bpp; unsigned char gpu[4]; } Image;
 typedef void nvk_buffer;
 static const char *test_program = "test";
 const char *getprogname(void) { return test_program; }
+typedef void *(*nvmtl_vk_lease_retain_fn)(void *);
+typedef void (*nvmtl_vk_lease_release_fn)(void *);
 static dispatch_semaphore_t entered, release_read;
 static unsigned uploads, gpu_seed;
 static unsigned wholeUploads, busyPlane, dirtyPlane;
@@ -64,7 +66,8 @@ static int nvmtl_vk_buffer_fill_from_surface(void *q, void *dst, const void *bas
 }
 // the imported-pages upload is unavailable here, so every upload takes the CPU copy this test checks
 // the host-page fast paths (#399) report "not available", so the copies below take the plain path this test checks
-static int nvmtl_vk_image_write_host(void *q, Image *img, void *base, size_t row, size_t bytes, void *cache) { return -1; }
+static int nvmtl_vk_image_write_host(void *q, Image *img, void *base, size_t row, size_t bytes, void *cache,
+    void *lease, nvmtl_vk_lease_retain_fn retain, nvmtl_vk_lease_release_fn release) { return -1; }
 static int nvmtl_vk_image_read_host(void *q, Image *img, void *base, size_t row, size_t bytes, void *cache) { return -1; }
 static uint32_t nvmtl_vram_gen(IOSurfaceRef s, NSUInteger p) { return 1; }
 static int nvmtl_vram_tag_current(IOSurfaceRef s, NSUInteger p, unsigned seed) { return gpu_seed == seed; }
@@ -110,6 +113,17 @@ static BOOL nvmtl_surface_pending_write(NVMTLCommandBuffer *cb, NVMTLTexture *t)
 - (BOOL)nvmtlSurfaceOut;
 - (BOOL)nvmtlSurfaceOutDirtied:(BOOL)dirtied;
 - (BOOL)nvmtlSurfaceOutDirtied:(BOOL)dirtied copied:(BOOL)copied;
+@end
+@interface NVMTLSurfaceUploadLease : NSObject
+- (instancetype)initWithSurface:(IOSurfaceRef)surface options:(uint32_t)options pages:(id)pages;
+@end
+static id nvmtl_surface_page_lease(NVMTLTexture *r, nvk_buffer *pages) { (void)r; (void)pages; return nil; }
+static void *nvmtl_surface_upload_lease_retain(void *lease) { (void)lease; return NULL; }
+static void nvmtl_surface_upload_lease_release(void *lease) { (void)lease; }
+@implementation NVMTLSurfaceUploadLease
+- (instancetype)initWithSurface:(IOSurfaceRef)surface options:(uint32_t)options pages:(id)pages {
+    (void)surface; (void)options; (void)pages; return [super init];
+}
 @end
 @implementation NVMTLTexture
 - (BOOL)nvmtlSurfaceCopyable { return YES; }

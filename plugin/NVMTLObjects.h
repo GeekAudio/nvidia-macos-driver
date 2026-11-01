@@ -49,6 +49,7 @@ static inline void *nvmtl_buf_cpu(NVMTLBuffer *b) { nvmtl_buf_settle(b); return 
   nvk_buffer _hostPages;   // this surface's pages imported for the host copies (nvmtl_host_pages), kept while they hold
   id _hostPageLease;      // shared across wrappers; the existing synchronous copy owns its use
   id _capturePages;       // each recorded copy also retains its import until that submission finishes
+  BOOL _vramMulti;   // fork: one plane of a multi-plane surface aliased in the whole surface's family VRAM (kernel / tag state: plane 0)
   BOOL _stex;
   uint64_t _resid;
   NSUInteger _usage;

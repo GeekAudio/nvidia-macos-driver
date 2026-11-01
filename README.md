@@ -1,5 +1,12 @@
 # NullMoth NVIDIA Driver for macOS
 
+> **NVEncVT development handoff:** this `integration/mickys-266-codecs` branch
+> contains the v2.6.6 mickys integration and tested RTX 3080 codec changes.
+> For RTX 50 H.264/HEVC/AV1 work, start with the
+> [中文移植指南](docs/NVENCVT-RTX50-PORTING.zh-CN.md).
+> NVEncVT on RTX 50 has not been validated by this branch's author; this is a
+> development baseline, separate from the upstream driver's GPU support below.
+
 A Metal driver for NVIDIA GeForce cards on macOS 15 Sequoia (Intel Macs and OpenCore PCs). It is open source; the
 kernel extensions, the Metal plugin and the shader translator are in this repository. The 1401 app that installs it
 (Mac and Windows) is its own project: [1401](https://github.com/nullmoth/1401).

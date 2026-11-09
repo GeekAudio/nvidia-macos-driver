@@ -41,9 +41,23 @@ static void nvbt(const char *tag, int *count, int max);
     // synchronizeResource (GPU -> CPU). Apple's OpenCL wraps every cl_mem this way; importing the pages zero-copy put
     // every kernel access across PCIe instead (a 5600x4200 byte-image rotate: 6.6 s per dispatch, Geekbench 6 OpenCL
     // Horizon Detection hit the 60 s GPU watchdog). The caller's pages become the managed shadow, so contents is still
-    // the caller's pointer, and the GPU side lives in VRAM. This isolated 16 KiB experiment also gives small
-    // caller-page buffers a private GPU copy; smaller buffers keep the established direct-host path.
-    if (sm == MTLStorageModeManaged && a1 >= (1u << 14)) {
+    // the caller's pointer, and the GPU side lives in VRAM.
+    // This used to apply only from 1 MiB up, on the theory that a small buffer's transfer outweighs the win. It does
+    // not: the transfer is one DMA of the dirty range per submission, while a kernel that reads a small buffer reads it
+    // once per thread. Geekbench 7 OpenCL keeps exactly its hottest data in small cl_mem objects - Particle Physics'
+    // whole state (4 buffers, 0.1 MB, 1000 dispatches per chain), Video Filter's colour LUT (read per pixel), the
+    // network weights and biases in Blur / Face / Super Resolution, the path tracer's ray counters (atomics) - and
+    // every one of those accesses crossed PCIe: those workloads ran at 0.4-12% of the same card under OpenCL on
+    // Windows, while the two whose buffers are all large (Horizon, Fluid) ran at 64-82%.
+    // NVMTL_MANAGED_VRAM_MIN=<bytes> sets the floor (1048576 restores the old behaviour).
+    static NSUInteger vramMin = NSUIntegerMax;
+    if (vramMin == NSUIntegerMax) {
+        const char *e = getenv("NVMTL_MANAGED_VRAM_MIN");
+        vramMin = e && *e ? (NSUInteger)strtoull(e, NULL, 0) : 0;
+        nvlog("newBufferWithBytesNoCopy: managed buffers from %lu bytes get a VRAM copy (NVMTL_MANAGED_VRAM_MIN=%s)",
+              (unsigned long)vramMin, e ? e : "unset");
+    }
+    if (sm == MTLStorageModeManaged && a1 >= vramMin) {
         const BOOL imported = nvmtl_vk_buffer_import_host(a0, a1, &b->_shadow) == 0;
         // A caller's unaligned pointer or unpadded length cannot be imported. Keep managed GPU accesses in VRAM:
         // owned coherent staging carries the explicit didModifyRange / synchronizeResource transfers instead.

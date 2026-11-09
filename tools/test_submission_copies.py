@@ -16,18 +16,27 @@ advance = events[events.index('- (BOOL)nvmtlAdvancePart'):events.index('- (void)
 ws = events[events.index('static const void *const nvmtl_ws_marks_key'):events.index('static void nvmtl_surface_finish_writes(')]
 objects = (root / 'plugin/NVMTLObjects.m').read_text()
 start = objects.index('static void nvmtl_buffer_sync_in(NVMTLBuffer *b)\n{')
-sync = objects[start:]
+owned_start = objects.index('static BOOL nvmtl_owned_host_shadow(')
+owned = objects[owned_start:objects.index('\n}', owned_start) + 2]
+sync = owned + '\n' + objects[start:]
 fixture = r'''
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
 #include <assert.h>
 #include <stdint.h>
 #include <string.h>
-typedef struct { void *map; size_t size; } Buffer;
+typedef struct { void *map; size_t size; BOOL imported; } Buffer;
 @interface NVMTLBuffer : NSObject { @public
     void *_hostPtr; size_t _hostLen; Buffer _b, _shadow; unsigned _syncOut, _zshadow;
+    MTLStorageMode _storage; BOOL _texSeen, _everGpuWritten;
 } @end
 @implementation NVMTLBuffer @end
+@interface NVMTLResSet : NSObject
+- (BOOL)isWrittenObject:(id)object;
+@end
+@implementation NVMTLResSet
+- (BOOL)isWrittenObject:(id)object { (void)object; return NO; }
+@end
 @interface NVMTLTexture : NSObject { @public
     NVMTLBuffer *_backBuf; NVMTLTexture *_parent; MTLTextureUsage _usage;
     IOSurfaceRef _surf; NSUInteger _plane; BOOL _vramOn; int _tag;
@@ -108,6 +117,7 @@ typedef struct { int unused; } nvmtl_inflight;
     BOOL waitFolded, aheadEmpty, claimed; int aheadFailed; unsigned encoders;
     nvmtl_inflight *inflight;
     NSArray<NVMTLBuffer *> *copyInputs; BOOL copyInputsPrepared, hasHostCopies;
+    NSSet *hostPublications;
 } @end
 @implementation NVMTLSubmissionPart @end
 @interface NVMTLTexture (Publication)
@@ -121,7 +131,8 @@ typedef struct { int unused; } nvmtl_inflight;
 - (BOOL)nvmtlSurfaceOutDirtied:(BOOL)dirtied { if (events) [events addObject:[NSString stringWithFormat:@"o%d:%d",_tag,(int)dirtied]]; return YES; }
 @end
 @interface NVMTLCommandBuffer : NSObject { @public
-    BOOL _executionDone, _committed, _commitMarking, _partsRetiring; NSError *_cbError;
+    BOOL _executionDone, _committed, _commitMarking, _partsRetiring, _scheduleAfterPublish;
+    NSError *_cbError; NVMTLTexture *_present; NSCondition *_completionCondition;
     NSUInteger _nextSubmit, _nextPart; NSMutableArray *_parts; double _legacyKernelStart;
 }
 - (BOOL)nvmtlSubmitAhead;
@@ -155,6 +166,8 @@ static int nvmtl_vk_submit_wait(Commands *cmd) { waits++; fakeGPU(); return subm
 // finishing waits for the work begin submitted: it counts as the wait and the GPU's write lands
 static int nvmtl_vk_submit_finish(nvmtl_inflight *f) { (void)f; waits++; if (!submitResult) memset(testGPU,writtenPixel,16); return submitResult; }
 static BOOL nvmtl_gsub_ahead_on(void) { return NO; }
+static int nvmtl_schedule_after_surface_writes(void) { return 0; }
+static BOOL nvmtl_surface_holds_schedule(int mode, NVMTLTexture *surface, NVMTLTexture *drawable) { return NO; }
 static void nvmtl_ahead_kick(void) {}
 static int nvmtl_gsub_finish(NVMTLSubmissionPart *part) {
     finishes++; nvmtl_vk_inflight_free(part->inflight); part->inflight=NULL;
@@ -216,27 +229,17 @@ int main(void) { @autoreleasepool {
     assert(cb->_cbError && uploads==2 && downloads==1 && event->signals==1 && cpu[0]==61);
     submitResult=0; expectedPixel=73; writtenPixel=89; memset(cpu,73,16);
     cb=makeCommand([NSSet setWithObjects:t,v,nil],event); event->expected=89;
-    const char *lift=getenv("NVMTL_GSUB_HOSTPTR_LIFT");
-    // the part-advance path above begins and finishes its own submissions; these checks count only the ahead pass's
+    // Legacy host copies must stay ordered even when the old per-part hold is lifted.
     const unsigned base=begins;
-    if (!lift) {
-        assert(![cb nvmtlSubmitAhead]); // Texture views retain the default host-pointer hold.
-        assert(begins==base && uploads==2 && !cb->_nextSubmit);
-    } else {
-        allocationFails=YES;
-        assert(![cb nvmtlSubmitAhead] && uploads==2 && begins==base && !cb->_nextSubmit);
-        allocationFails=NO;
-        assert([cb nvmtlSubmitAhead] && begins==base+1 && uploads==3 && downloads==1);
-        memset(cpu,101,16); // Finishing an ahead submission must not upload again.
-        assert([cb nvmtlAdvancePart]);
-        // a submission whose begin fails has nothing to wait for, so only the first advance waited
-        assert(finishes==1 && waits==1 && uploads==3 && downloads==2 && cpu[0]==89 && event->signals==2);
-        assert(cb->_executionDone && !cb->_cbError);
-        submitResult=-1; expectedPixel=113; memset(cpu,113,16);
-        cb=makeCommand([NSSet setWithObject:v],event);
-        assert(![cb nvmtlSubmitAhead]); assert([cb nvmtlAdvancePart]);
-        assert(cb->_cbError && downloads==2 && event->signals==2 && !atomic_load(&gsub_inflight));
-    }
+    assert(![cb nvmtlSubmitAhead]);
+    assert(begins==base && uploads==2 && !cb->_nextSubmit);
+    assert([cb nvmtlAdvancePart]);
+    assert(cb->_executionDone && !cb->_cbError);
+    assert(waits==2 && uploads==3 && downloads==2 && cpu[0]==89 && event->signals==2);
+    submitResult=-1; expectedPixel=113; memset(cpu,113,16);
+    cb=makeCommand([NSSet setWithObject:v],event);
+    assert(![cb nvmtlSubmitAhead] && [cb nvmtlAdvancePart]);
+    assert(cb->_cbError && downloads==2 && event->signals==2 && !atomic_load(&gsub_inflight));
     // A commit still putting its kernel marks in is not submitted ahead: the GPU would start a write that no mark holds.
     submitResult=0; expectedPixel=gpu[0]; writtenPixel=gpu[0];
     {

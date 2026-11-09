@@ -14,6 +14,7 @@ fixture = r'''
 #include <assert.h>
 #include <dispatch/dispatch.h>
 #include <stdint.h>
+#include <stdatomic.h>
 #include <string.h>
 #include <time.h>
 #import <objc/runtime.h>

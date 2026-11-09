@@ -976,7 +976,7 @@ static NvU32 nvdec_class(void)
 // NVENCVT_AMPERE_H264_DEC=0 keeps the previous decoder selection. VP9 and AV1
 // retain their existing gates. HEVC/MPEG remain behind the upstream
 // NVENCVT_AMPERE_ALL_DEC development override until separately validated.
-OSStatus NVDecVT_Register(int rating)
+__attribute__((visibility("hidden"))) OSStatus nvdecvt_register(int rating, bool h264Only, bool legacyMpeg)
 {
     gDLog = getenv("NVENCVT_LOG") != NULL; gDLogAll = gDLog && !strcmp(getenv("NVENCVT_LOG"), "2");
     // /tmp flag files are honoured only in a diagnostics build (vt/nvencvt.c explains why)
@@ -1001,6 +1001,10 @@ OSStatus NVDecVT_Register(int rating)
     if (h264 && !getenv("NVENCVT_NO_HEV1")) { OSStatus s3 = reg(CODEC_AVC3, info, (void *)NVDecVT_CreateInstance); DLOG("registered %s for avc3 -> %d", DECODER_ID, (int)s3); }
     CFRelease(info);
     DLOG("registered %s -> %d (rating %d)", DECODER_ID, (int)st, rating);
+    if (h264Only) {
+        CFRelease(nr);
+        return st;
+    }
     if (hevcMpeg && !getenv("NVENCVT_NO_HEVCDEC")) {   // HEVC (NVENCVT_NO_HEVCDEC=1 leaves it out): above NullMoth's own HEVC decoder too
         const void *vh[] = { CFSTR(DECODER_ID_HEVC), CFSTR("NVDEC - HEVC - mickys/nvenc"), nr, kCFBooleanTrue };
         CFDictionaryRef ih = CFDictionaryCreate(NULL, k, vh, 4, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
@@ -1039,7 +1043,7 @@ OSStatus NVDecVT_Register(int rating)
         SuppFn supp = (SuppFn)dlsym(RTLD_DEFAULT, "VTRegisterSupplementalVideoDecoderIfAvailable");
         if (supp && !getenv("NVENCVT_NO_VP9SUPP")) { supp(CODEC_AV1); DLOG("opted in to AV1 decoding for this process"); }
     }
-    if (hevcMpeg && !getenv("NVENCVT_NO_MPEG2DEC")) {   // MPEG-1 / MPEG-2 and MPEG-4 Part 2 (M14): above Apple's software decoders
+    if (legacyMpeg && hevcMpeg && !getenv("NVENCVT_NO_MPEG2DEC")) {   // MPEG-1 / MPEG-2 and MPEG-4 Part 2 (M14)
         const struct { FourCharCode c; const char *id, *name; } m[] = {
             { kCMVideoCodecType_MPEG2Video, DECODER_ID_MPEG2, "NVDEC - MPEG-2 - mickys/nvenc" },
             { kCMVideoCodecType_MPEG1Video, DECODER_ID_MPEG1, "NVDEC - MPEG-1 - mickys/nvenc" },
@@ -1056,4 +1060,9 @@ OSStatus NVDecVT_Register(int rating)
     }
     CFRelease(nr);
     return st;
+}
+
+OSStatus NVDecVT_Register(int rating)
+{
+    return nvdecvt_register(rating, false, true);
 }

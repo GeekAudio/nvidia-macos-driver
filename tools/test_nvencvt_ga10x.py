@@ -133,7 +133,7 @@ class NVEncVTGa10x(unittest.TestCase):
         self.assertRegex(kind, r"rm_class\s*\(\s*&rm\s*,\s*RM_CLS_NVENC\s*\)")
         self.assertRegex(kind, r"cls\s*==\s*0xc7b7\s*\?\s*GPU_AMPERE")
 
-        register = c_function_body(source, "NVEncVT_Register(int rating)")
+        register = c_function_body(source, "nvencvt_register(int rating, bool automatic)")
         self.assertRegex(
             register,
             r"gpu\s*!=\s*GPU_AMPERE\s*\|\|\s*\(\s*"
@@ -155,7 +155,7 @@ class NVEncVTGa10x(unittest.TestCase):
 
     def test_av1_encoder_remains_ada_only_at_registration_and_submission(self):
         vt_source = (NVENC / "vt/nvencvt.c").read_text()
-        register = c_function_body(vt_source, "NVEncVT_Register(int rating)")
+        register = c_function_body(vt_source, "nvencvt_register(int rating, bool automatic)")
         self.assertRegex(
             register,
             r"!encoders\s*\|\|\s*getenv\s*\(\s*\"NVENCVT_NO_AV1\"\s*\)\s*"

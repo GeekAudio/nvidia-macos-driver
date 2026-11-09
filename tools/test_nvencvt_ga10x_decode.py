@@ -77,7 +77,7 @@ def check_source_contract() -> None:
         raise AssertionError("avc3 registration must follow the H.264-specific policy")
     if not re.search(r"if\s*\(\s*hevcMpeg\s*&&\s*!getenv\(\s*\"NVENCVT_NO_HEVCDEC\"", vt_dec):
         raise AssertionError("HEVC registration must remain behind the separate HEVC/MPEG policy")
-    if not re.search(r"if\s*\(\s*hevcMpeg\s*&&\s*!getenv\(\s*\"NVENCVT_NO_MPEG2DEC\"", vt_dec):
+    if not re.search(r"if\s*\(\s*legacyMpeg\s*&&\s*hevcMpeg\s*&&\s*!getenv\(\s*\"NVENCVT_NO_MPEG2DEC\"", vt_dec):
         raise AssertionError("MPEG registration must remain behind the separate HEVC/MPEG policy")
 
 

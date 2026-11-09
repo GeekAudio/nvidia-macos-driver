@@ -378,8 +378,9 @@ static void nvmtl_nvenc_register(void)
 // An external VideoToolbox codec library can register beside ours; VideoToolbox's rating decides which
 // implementation is selected. The library decides which codecs its GPU classes support. For example,
 // mickys/nvenc registers VP9 and AV1 decoders on GA10x by default, but leaves its encoders disabled there.
-// Off unless NVMTL_NVENCVT names this process (or is 1). Release builds read this selector from
-// nvrm610.conf: their constructor scrubs this selector and rating from the inherited environment.
+// When the selector is absent, the library registers the default codecs for this GPU.
+// An explicit NVMTL_NVENCVT selector controls the full registration path. Release builds read it
+// from nvrm610.conf and scrub the selector and rating from the inherited environment.
 // This loads code into each selected process, so the library and the directory holding it must be
 // ours and nobody else's. The firmware taught this: it used to sit in /Users/Shared, which is mode
 // 1777, and the only permission step was a chmod that adds read bits and never takes write away, so
@@ -415,8 +416,14 @@ static void nvmtl_nvencvt_register(void)
     dispatch_once(&once, ^{
         const char *me = getprogname();
         const char *sel = getenv("NVMTL_NVENCVT");
-        if (!nvmtl_nvencvt_selected_for_process(sel, me)) return;
         if (!me || !strcmp(me, "WindowServer")) return; // the codec registrars all stay out of WindowServer
+        const bool automatic = sel == NULL;
+        if (automatic) {
+            if (nvmtl_env_privileged() || nvmtl_is_decode_service(me) || nvmtl_decode_is_delegated(me)) return;
+            char gen[32];
+            if (nvmtl_gpu_profile_string(CFSTR("generation"), gen, sizeof gen) &&
+                !nvmtl_gen_is(gen, "Ampere") && !nvmtl_gen_is(gen, "Ada")) return;
+        } else if (!nvmtl_nvencvt_selected_for_process(sel, me)) return;
         Dl_info di;
         if (!dladdr((const void *)nvmtl_nvencvt_register, &di) || !di.dli_fname) { nvlog("nvencvt: dladdr failed - not registering"); return; }
         char dir[1024], path[1200];
@@ -429,14 +436,15 @@ static void nvmtl_nvencvt_register(void)
         void *h = dlopen(path, RTLD_NOW | RTLD_LOCAL);
         if (!h) { nvlog("nvencvt: dlopen %s FAILED: %s", path, dlerror()); return; }
         typedef int32_t (*RegFn)(int);
-        RegFn r = (RegFn)dlsym(h, "NVEncVT_Register");
-        if (!r) { nvlog("nvencvt: %s has no NVEncVT_Register", path); return; }
-        int rating = 1100;                           // above our own 1000, so the opt-in one wins where it is asked for
+        const char *symbol = automatic ? "NVEncVT_RegisterDefault" : "NVEncVT_Register";
+        RegFn r = (RegFn)dlsym(h, symbol);
+        if (!r) { nvlog("nvencvt: %s has no %s", path, symbol); dlclose(h); return; }
+        int rating = 1100;                           // above the built-in codecs rated 1000
         const char *rv = getenv("NVMTL_NVENCVT_RATING");
         if (rv) { int v = atoi(rv); if (v > 0) rating = v; }
         int32_t st = r(rating);
-        nvlog("nvencvt: external codec registration call in %s (NVEncVT_Register -> %d, rating %d, %s)",
-              me, (int)st, rating, path);
+        nvlog("nvencvt: external codec registration call in %s (%s -> %d, rating %d, %s)",
+              me, symbol, (int)st, rating, path);
     });
 }
 static void nvmtl_nvdec_hevc_register(void)
@@ -753,7 +761,7 @@ static void nvmtl_install_hw_resource_pools(id dev)
         nvmtl_nvenc_register();
         nvmtl_nvdec_hevc_register();
         nvmtl_nvenc_hevc_register();
-        nvmtl_nvencvt_register();   // last, so an opt-in external encoder registers above ours
+        nvmtl_nvencvt_register();   // register the selected external codecs above the native ones
     }
     SEL il = sel_registerName("initLimits");
     if ([self respondsToSelector:il]) {

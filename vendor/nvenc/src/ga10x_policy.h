@@ -3,8 +3,8 @@
 #include <stdbool.h>
 #include <string.h>
 
-// The outer NVMTL_NVENCVT loader remains opt-in. An explicit 0 retains the
-// previous decoder-only GA10x behavior; invalid values do not enable encoders.
+// The full GA10x registrar is opt-in. An explicit 0 keeps its decoder-only
+// behavior; invalid values do not enable encoders.
 static inline bool nvenc_ga10x_encode_enabled(const char *setting)
 {
     return !setting || !strcmp(setting, "1");

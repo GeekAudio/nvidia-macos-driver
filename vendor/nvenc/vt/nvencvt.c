@@ -1,7 +1,7 @@
 // nvencvt.c: a VideoToolbox H.264 encoder on top of src/enc.c (M4). Interface: docs/vt-encoder.md.
 // Built as libnvencvt.dylib. Injected, it registers the encoder in the process (constructor), e.g.
 //   DYLD_INSERT_LIBRARIES=~/nvenc-dev/libnvencvt.dylib ./vttest hw avc1 1920 1080 60
-// Loaded otherwise (the Metal plugin with NVMTL_NVENCVT set), call NVEncVT_Register(rating), or register
+// Loaded by the Metal plugin, call NVEncVT_RegisterDefault(rating) or NVEncVT_Register(rating), or register
 // NVEncVT_CreateInstance as the factory yourself. Environment: NVENCVT_RATING (default 1100,
 // above nullmoth's 1000), NVENCVT_NO_REGISTER, NVENCVT_LOG, NVENCVT_DEPTH, NVENCVT_ENGINE, NVENCVT_STATS=<file> (or touch
 // /tmp/nvencvt.stats: statistics every 2 s to /tmp/nvencvt-stats.log, also in apps that get no environment).
@@ -1066,16 +1066,20 @@ static void rename_encoders(const char *const ids[], const char *const names[], 
     LOG("rename: %d of %d encoder names set", done, n);
 }
 
-// registers the H.264 (avc1) and HEVC (hvc1) encoders; returns the H.264 registration's status
-__attribute__((visibility("default"))) OSStatus NVEncVT_Register(int rating)
+__attribute__((visibility("hidden"))) OSStatus nvdecvt_register(int rating, bool h264Only, bool legacyMpeg);
+
+// Returns the H.264 registration status for the selected encoder or decoder path.
+static OSStatus nvencvt_register(int rating, bool automatic)
 {
-    int gpu = getenv("NVENCVT_ANY_GPU") ? GPU_ADA : pci_gpu_kind();
+    int gpu = !automatic && getenv("NVENCVT_ANY_GPU") ? GPU_ADA : pci_gpu_kind();
     if (gpu < 0) gpu = gpu_nvenc_kind();   // no PCI match (unusual): ask RM for the class list
     if (gpu <= 0) {
         LOG("GPU is neither Ada, TU117 nor GA10x (NVENC class c9b7 / b4b7 / c7b7): not registering");
         return kVTCouldNotFindVideoEncoderErr;
     }
+    if (automatic && gpu != GPU_ADA && gpu != GPU_AMPERE) return kVTCouldNotFindVideoEncoderErr;
     gNvencvtGpu = gpu;
+    if (automatic && gpu == GPU_AMPERE) return nvdecvt_register(rating, true, false);
     // Not when the driver plugin was loaded from inside VTCompressionSessionCreate: VideoToolbox enumerates the Metal devices
     // while it creates a session, which loads the plugin (and so registers us) in processes without a Metal device of their
     // own (command-line tools). That session already has Apple's encoder and the next one would get ours: ffmpeg opens one
@@ -1092,8 +1096,7 @@ __attribute__((visibility("default"))) OSStatus NVEncVT_Register(int rating)
         }
         if (inCreate && !getenv("NVENCVT_LATE")) {
             LOG("loaded inside VTCompressionSessionCreate (%s): not registering the encoders", getprogname());
-            extern OSStatus NVDecVT_Register(int rating);
-            NVDecVT_Register(rating);
+            nvdecvt_register(rating, false, !automatic);
             return kVTCouldNotFindVideoEncoderErr;
         }
     }
@@ -1122,9 +1125,18 @@ __attribute__((visibility("default"))) OSStatus NVEncVT_Register(int rating)
     if (!sh) { ids[nreg] = ENCODER_ID_HEVC; names[nreg] = nameHevc; codecs[nreg++] = "HEVC"; }
     if (!s1) { ids[nreg] = ENCODER_ID_AV1; names[nreg] = nameAv1; codecs[nreg++] = "AV1"; }
     rename_encoders(ids, names, codecs, nreg);
-    extern OSStatus NVDecVT_Register(int rating);   // vt/nvencvt_dec.c: the H.264 decoder (NVDEC), same rating
-    NVDecVT_Register(rating);
+    nvdecvt_register(rating, false, !automatic);
     return st;
+}
+
+__attribute__((visibility("default"))) OSStatus NVEncVT_Register(int rating)
+{
+    return nvencvt_register(rating, false);
+}
+
+__attribute__((visibility("default"))) OSStatus NVEncVT_RegisterDefault(int rating)
+{
+    return nvencvt_register(rating, true);
 }
 
 // System-wide settings for apps that do not get our environment variables (started from the Dock / Finder):

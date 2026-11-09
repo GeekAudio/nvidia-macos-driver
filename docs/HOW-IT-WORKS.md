@@ -76,8 +76,8 @@ on macOS against NVRM instead of the Linux DRM interface (`nvk/nvk-macos.patch` 
 plugin's MPS convolution fast path is `plugin/nvconv.metal`.
 
 The bundle may also contain the optional `Contents/MacOS/libnvencvt.dylib` from `vendor/nvenc/`. It registers NVENC and
-NVDEC through VideoToolbox when `NVMTL_NVENCVT` selects a process; the selector is unset by default and the loader
-excludes `WindowServer`. See [NVENCVT.md](NVENCVT.md) for app and command-line usage, including the upstream-reported
+NVDEC through VideoToolbox. With the selector unset, the plugin enables the C7B0 H.264 fast decoder on Ampere
+and the Ada codecs in eligible Metal apps. See [NVENCVT.md](NVENCVT.md) for app and command-line usage, including the
 Safari sandbox boundary.
 
 ## 4. OpenCore settings the driver needs

@@ -68,7 +68,10 @@ fi
 xcrun lipo "$LIB" -verify_arch x86_64
 MINOS_FOUND=$(xcrun vtool -show-build "$LIB" | awk '/minos/{print $2; exit}')
 [ "$MINOS_FOUND" = "$MIN_OS" ] || { echo "built minos $MINOS_FOUND, expected $MIN_OS" >&2; exit 1; }
-xcrun nm -gU "$LIB" | grep -q ' _NVEncVT_Register$' || { echo "NVEncVT_Register is not exported" >&2; exit 1; }
+SYMBOLS=$(xcrun nm -gU "$LIB")
+for symbol in NVEncVT_Register NVEncVT_RegisterDefault; do
+    grep -q " _${symbol}\$" <<<"$SYMBOLS" || { echo "$symbol is not exported" >&2; exit 1; }
+done
 
 SHA256=$(shasum -a 256 "$LIB" | awk '{print $1}')
 SDK=$(xcrun --show-sdk-version)

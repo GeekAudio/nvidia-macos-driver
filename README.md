@@ -44,7 +44,7 @@ Metal app ─► NVMTLDriver.bundle ─► translator (Apple AIR → SPIR-V) ─
 | Metal driver plugin | `/Library/GPUBundles/NVMTLDriver.bundle` | `plugin/` |
 | Shader translator | inside the plugin (`libnvmtl_translate.dylib`) | `translator/` (LGPL-3.0, based on metal2vulkan) |
 | Vulkan back end (NVK) | `/Library/GPUBundles/nvmtl/` | `nvk/nvk-macos.patch` on Mesa `17ca6174` |
-| Optional VideoToolbox codecs | inside `NVMTLDriver.bundle/Contents/MacOS/libnvencvt.dylib` | `vendor/nvenc/` (MIT; opt-in, off by default) |
+| Additional VideoToolbox codecs | inside `NVMTLDriver.bundle/Contents/MacOS/libnvencvt.dylib` | `vendor/nvenc/` (MIT, automatic on Ampere and Ada as described in [NVENCVT.md](docs/NVENCVT.md)) |
 | Kernel extensions | `/Library/Extensions/NVRM, NVAccel, NVRMFB, NVRMAGDC` | `kexts/` |
 | GPU firmware (GSP) | `/Library/NullMoth/nvfw/nvidia/620.70.06` | NVIDIA, unmodified |
 

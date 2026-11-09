@@ -130,16 +130,21 @@ guard = function_source(dev, "static bool nvmtl_loadable_root_only(const char *p
 check("the loader consumes the selected process through the production helper",
       bool(loader) and 'getenv("NVMTL_NVENCVT")' in loader
       and "nvmtl_nvencvt_selected_for_process(sel, me)" in loader)
-check("WindowServer remains excluded after opt-in selection",
+check("WindowServer remains excluded in both modes",
       bool(loader) and 'strcmp(me, "WindowServer")' in loader)
 check("the dylib still passes the root-owned file and parent-directory gate before dlopen",
       bool(loader) and bool(guard) and loader.index("nvmtl_loadable_root_only(path)") < loader.index("dlopen(path")
       and guard.count("lstat(") == 2 and "S_ISREG" in guard and "S_ISDIR" in guard
       and "st.st_uid != 0" in guard and "ds.st_uid == 0" in guard
       and guard.count("S_IWGRP | S_IWOTH") == 2)
-check("the production loader resolves its sibling dylib and the documented registrar symbol",
+check("only an absent selector uses the default registrar",
+      "const bool automatic = sel == NULL" in loader
+      and 'automatic ? "NVEncVT_RegisterDefault" : "NVEncVT_Register"' in loader)
+check("automatic registration skips privileged and delegated decode contexts",
+      "nvmtl_env_privileged() || nvmtl_is_decode_service(me) || nvmtl_decode_is_delegated(me)" in loader)
+check("the production loader resolves its sibling dylib and the selected registrar symbol",
       bool(loader) and '"%s/libnvencvt.dylib"' in loader
-      and 'dlsym(h, "NVEncVT_Register")' in loader and "RTLD_NOW | RTLD_LOCAL" in loader)
+      and "dlsym(h, symbol)" in loader and "RTLD_NOW | RTLD_LOCAL" in loader)
 check("the log describes the registration call without claiming every codec registered",
       bool(loader) and '"nvencvt: external codec registration call' in loader
       and '"nvencvt: external encoder %s' not in loader)

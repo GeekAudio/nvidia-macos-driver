@@ -3,14 +3,27 @@
 The package can include `libnvencvt.dylib`, the VideoToolbox layer from the
 pinned `mickys/nvenc` v0.9.5 source with local GA10x codec changes
 (`v0.9.5-ga10x2`, revision `ga10x-codecs-2`). It provides NVIDIA NVENC encoders and
-NVDEC decoders through VideoToolbox. The library is present in the bundle but
-registration is **off by default**.
+NVDEC decoders through VideoToolbox.
 This page describes the local integration. The vendored README and GA10x notes
 remain the upstream v0.9.5 snapshot, including its older decoder-only GA10x policy.
 
+## Defaults in eligible Metal apps
+
+With `NVMTL_NVENCVT` absent, the driver selects these codecs:
+
+| GPU | Additional codecs |
+|---|---|
+| Ampere (RTX 30) | Fast H.264 decode (`avc1`, `avc3`) when RM reports C7B0. The native driver handles the other codec paths. |
+| Ada (RTX 40, including 4060 and 4060 Ti) | H.264, HEVC and AV1 encode; H.264, HEVC, VP9 and AV1 decode. |
+
+Automatic registration skips privileged processes, WindowServer, Apple's
+sandboxed processes that delegate decode, and VTDecoderXPCService. The existing
+late encoder guard still applies when Metal first loads inside
+`VTCompressionSessionCreate`. See the command-line section below.
+
 ## RTX 30 series encoding
 
-In normal operation, once the optional library is loaded, H.264 and HEVC encoders register on GA10x
+With the full registrar selected, H.264 and HEVC encoders register on GA10x
 only when the NVIDIA RM reports the C7B7 encoder class. A PCI family match alone
 is insufficient. Each session uses NVENC0; the RTX 3080 has one NVENC engine.
 AV1 encoding remains limited to Ada. NVIDIA's [support matrix](https://developer.nvidia.com/video-encode-decode-support-matrix)
@@ -43,9 +56,9 @@ normal use should leave that broad override unset.
 The [H.264 validation record](NVENCVT-GA10X-H264-VALIDATION.md) documents the
 exact decoder attribution, CPU reference checks and fixed-input comparison.
 
-## Apps that load the Metal plugin
+## Override automatic selection
 
-To opt in, add one of these lines to the personal settings block in
+To use the full registrar in selected processes, add a line to the personal settings block in
 `/Library/GPUBundles/nvmtl/nvrm610.conf`:
 
 ```text
@@ -54,8 +67,9 @@ NVMTL_NVENCVT=OBS,SomeOtherApp
 
 Each selector must match a process name returned by `getprogname()`. Separate
 names with commas, spaces, or colons; the installer keeps these selectors
-across updates up to the loader's 511-byte limit. `NVMTL_NVENCVT=1` opts every
-eligible process in; leave the setting unset for the default-off behavior.
+across updates up to the loader's 511-byte limit. `NVMTL_NVENCVT=1` selects the
+full registrar globally, and `NVMTL_NVENCVT=0` disables the external registrar.
+Remove the line to restore automatic selection.
 `WindowServer` is always excluded. Restart the target app after changing the
 setting.
 
@@ -100,9 +114,9 @@ Measured on an RTX 4060 Ti (AD106), macOS 26.7.2, Firefox 159, a YouTube 4K60
 video: `about:support` lists hardware decoding for VP9, AV1 and HEVC, and
 "GPU Video Decode Utilization" rises while the video plays.
 
-Firefox decodes in `plugin-container`. Name it in the personal settings block
-of `/Library/GPUBundles/nvmtl/nvrm610.conf`, as for any app that loads the
-Metal plugin (see above), then quit Firefox completely and open it again:
+Firefox decodes in `plugin-container`. On Ada, automatic selection covers this
+process when it initializes NullMoth's Metal device. To use the full registrar
+only there, put the following line in the personal settings block and restart Firefox:
 
 ```text
 NVMTL_NVENCVT=plugin-container

@@ -6,6 +6,8 @@ source=(root/'plugin/NVMTLEventSync.m').read_text()
 start=source.index('@interface NVMTLPendingSurfaceWrite')
 end=source.index('@implementation NVMTLSubmissionPart',start)
 helpers=source[start:end]
+objects=(root/'plugin/NVMTLObjects.m').read_text()
+plane_macro=next(line for line in objects.splitlines() if line.startswith('#define NVMTL_VP('))+'\n'
 fixture=r'''
 #import <Foundation/Foundation.h>
 #include <assert.h>
@@ -37,15 +39,18 @@ static void nvmtl_busy_write(IOSurfaceRef s,NSUInteger p,uint64_t seq,int done){
 static unsigned IOSurfaceGetID(IOSurfaceRef s){return s->id;}
 static unsigned IOSurfaceGetSeed(IOSurfaceRef s){return s->seed;}
 @class NVMTLCommandBuffer;
-@interface NVMTLTexture:NSObject{@public IOSurfaceRef _surf; BOOL _vramOn;NSUInteger _plane;}@end
+@interface NVMTLTexture:NSObject{@public IOSurfaceRef _surf; BOOL _vramOn,_vramMulti;NSUInteger _plane;}@end
+static unsigned copiedPublications, readbackPublications;
 @implementation NVMTLTexture
 - (BOOL)nvmtlSurfaceOut{return YES;}
 - (BOOL)nvmtlSurfaceOutDirtied:(BOOL)dirtied{(void)dirtied;return YES;}
+- (BOOL)nvmtlSurfaceOutDirtied:(BOOL)dirtied copied:(BOOL)copied{(void)dirtied;if(copied)copiedPublications++;else readbackPublications++;return YES;}
 @end
 @interface NVMTLCommandBuffer:NSObject{@public id _queue;NSArray *_parts;NSDictionary *_busyMarks;}@end
 @implementation NVMTLCommandBuffer @end
-@interface NVMTLSubmissionPart:NSObject{@public NSSet *surfaces;}@end
+@interface NVMTLSubmissionPart:NSObject{@public NSSet *surfaces, *copiedSurfaces;}@end
 @implementation NVMTLSubmissionPart @end
+static void nvmtl_ws_gpu_copyout(NVMTLCommandBuffer *cb){(void)cb;}
 '''
 checks=r'''
 static NVMTLTexture *texture(IOSurfaceRef surface){NVMTLTexture*t=[NVMTLTexture new];t->_surf=surface;t->_vramOn=YES;return t;}
@@ -66,7 +71,10 @@ int main(void){@autoreleasepool{
  surface.seed++;assert(!nvmtl_surface_pending_write(b,t));surface.seed--;
  alias->_vramOn=NO;assert(!nvmtl_surface_pending_write(b,alias));alias->_vramOn=YES;
  t->_vramOn=NO;assert(nvmtl_surface_pending_write(b,t));assert(!nvmtl_surface_pending_write(b,alias));t->_vramOn=YES;
- alias->_plane=1;assert(!nvmtl_surface_pending_write(b,alias));alias->_plane=0;
+ alias->_plane=1;assert(!nvmtl_surface_pending_write(b,alias));
+ // Full-allocation aliases share the pending writer across planes.
+ t->_vramMulti=alias->_vramMulti=YES;assert(nvmtl_surface_pending_write(b,alias));
+ t->_vramMulti=alias->_vramMulti=NO;alias->_plane=0;
  nvmtl_surface_register_writes(b);nvmtl_surface_finish_writes(a);
  assert(nvmtl_surface_pending_write(a,t));
  nvmtl_surface_finish_writes(b);assert(!nvmtl_surface_pending_write(a,t));
@@ -118,6 +126,28 @@ int main(void){@autoreleasepool{
  nvmtl_surface_finish_writes(w2);
  assert([markLog.lastObject isEqual:@"4:0"]&&[nvmtl_ws_pending_holds countForObject:@4]==0);
  assert(nvmtl_surface_writers.count==0&&!nvmtl_ws_deferred.count);
+ if(half){
+  // Deferred publications follow the latest completed writer's copy status, including when that writer used fallback.
+  for(unsigned mode=0;mode<4;mode++){
+   NVMTLCommandBuffer *a=writer(q,t),*b=writer(q,t);
+   ((NVMTLSubmissionPart*)a->_parts[0])->copiedSurfaces=(mode&1)?[NSSet setWithObject:t]:nil;
+   ((NVMTLSubmissionPart*)b->_parts[0])->copiedSurfaces=(mode&2)?[NSSet setWithObject:t]:nil;
+   COMMIT(a);COMMIT(b);
+   NSMutableArray *settled=[NSMutableArray new];
+   assert(!nvmtl_ws_part_landed(a,0,settled).count&&!settled.count);
+   unsigned copied=copiedPublications, readbacks=readbackPublications;
+   assert(!nvmtl_ws_part_landed(b,0,settled).count&&settled.count==1);
+   assert(nvmtl_ws_publish_settled(settled,b));
+   assert(copiedPublications==copied+!!(mode&2)&&readbackPublications==readbacks+!(mode&2));
+   nvmtl_surface_finish_writes(a);nvmtl_surface_finish_writes(b);
+  }
+  // A recorded copy whose submission failed never reaches part_landed or grants a later publication permission.
+  NVMTLCommandBuffer *failed=writer(q,t);
+  ((NVMTLSubmissionPart*)failed->_parts[0])->copiedSurfaces=[NSSet setWithObject:t];
+  COMMIT(failed);unsigned copied=copiedPublications;
+  nvmtl_surface_finish_writes(failed);assert(copiedPublications==copied);
+  assert(!nvmtl_ws_deferred.count);
+ }
  printf("PASS (kernel half %s): aliases, CPU seeds, queues, planes, private backing, latest writer, weak lifetime, 1000 cleanup "
         "cycles, WindowServer commit: %s, CPU edits still import, overlapping writers release the kernel mark once, with "
         "the last of them\n", half?"present":"absent",
@@ -142,7 +172,7 @@ pend=pend[:pend.index('\n}\n')]
 assert pend.index('nvmtl_vk_surface_dirty(')<pend.index('nvmtl_ws_mark(n.unsignedIntValue, YES)'), 'VRAM marks before pending marks'
 print('PASS: production commit order: kernel marks outside the class lock, VRAM marks before pending marks, records after both')
 with tempfile.TemporaryDirectory() as d:
- p=pathlib.Path(d);(p/'test.m').write_text(fixture+helpers+checks)
+ p=pathlib.Path(d);(p/'test.m').write_text(fixture+plane_macro+helpers+checks)
  subprocess.run(['clang','-fobjc-arc','-framework','Foundation',str(p/'test.m'),'-o',str(p/'test')],check=True)
  import os
  for half in ('1','0'): subprocess.run([str(p/'test')],check=True,env=dict(os.environ,KERNEL_HALF=half))

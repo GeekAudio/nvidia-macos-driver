@@ -1,5 +1,12 @@
 # NullMoth NVIDIA Driver for macOS
 
+> **NVEncVT development handoff:** this `integration/mickys-266-codecs` branch
+> contains the v2.6.6 mickys integration and tested RTX 3080 codec changes.
+> For RTX 50 H.264/HEVC/AV1 work, start with the
+> [中文移植指南](docs/NVENCVT-RTX50-PORTING.zh-CN.md).
+> NVEncVT on RTX 50 has not been validated by this branch's author; this is a
+> development baseline, separate from the upstream driver's GPU support below.
+
 A Metal driver for NVIDIA GeForce cards on macOS 15 Sequoia (Intel Macs and OpenCore PCs). It is open source; the
 kernel extensions, the Metal plugin and the shader translator are in this repository. The 1401 app that installs it
 (Mac and Windows) is its own project: [1401](https://github.com/nullmoth/1401).
@@ -37,11 +44,15 @@ Metal app ─► NVMTLDriver.bundle ─► translator (Apple AIR → SPIR-V) ─
 | Metal driver plugin | `/Library/GPUBundles/NVMTLDriver.bundle` | `plugin/` |
 | Shader translator | inside the plugin (`libnvmtl_translate.dylib`) | `translator/` (LGPL-3.0, based on metal2vulkan) |
 | Vulkan back end (NVK) | `/Library/GPUBundles/nvmtl/` | `nvk/nvk-macos.patch` on Mesa `17ca6174` |
+| Optional VideoToolbox codecs | inside `NVMTLDriver.bundle/Contents/MacOS/libnvencvt.dylib` | `vendor/nvenc/` (MIT; opt-in, off by default) |
 | Kernel extensions | `/Library/Extensions/NVRM, NVAccel, NVRMFB, NVRMAGDC` | `kexts/` |
 | GPU firmware (GSP) | `/Library/NullMoth/nvfw/nvidia/615.78.08` | NVIDIA, unmodified |
 
 The kernel side runs NVIDIA's own open GPU kernel modules (r610) under macOS. NVRMFB is the display framebuffer,
 NVAccel the accelerator WindowServer composites through, NVRMAGDC the display-policy shim.
+
+The optional [NVEncVT VideoToolbox component](docs/NVENCVT.md) adds NVIDIA video encoding and decoding. It remains
+disabled unless selected in `nvrm610.conf`; command-line tools can load it explicitly with `DYLD_INSERT_LIBRARIES`.
 
 ## Install — by hand
 

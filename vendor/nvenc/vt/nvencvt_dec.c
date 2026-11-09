@@ -24,6 +24,7 @@
 #include <dlfcn.h>
 #include <dispatch/dispatch.h>
 #include <pthread.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -79,6 +80,78 @@ static bool gDLog, gDLogAll; static FILE *gDLogF;   // gDLogAll: NVENCVT_LOG=2, 
 // another process (Firefox's GPU process) takes the IOSurface over a few ms after it is emitted; released at once, the
 // buffer could go back out of the pool and the next picture would overwrite the one about to be drawn.
 #define NVDEC_HOLD_MAX 16
+#define DEVICE_EVIDENCE_KEY CFSTR("org.nvenc.decoder-device.v1")
+
+// Match the hardware described by NV_ESC_CARD_INFO against the PCI endpoint
+// of the two opened RM services. BAR0 disambiguates identical BDFs on separate PCI domains.
+static bool matching_bar0(CFTypeRef property, const nv_ioctl_card_info_t *card)
+{
+    if (!card->reg_address || !card->reg_size || !property || CFGetTypeID(property) != CFDataGetTypeID()) return false;
+    const CFIndex length = CFDataGetLength(property);
+    const uint32_t address = (uint32_t)card->pci_info.bus << 16 | (uint32_t)card->pci_info.slot << 11 |
+                             (uint32_t)card->pci_info.function << 8 | 0x10;
+    if (length % (5 * sizeof(uint32_t))) return false;
+    unsigned matches = 0;
+    for (CFIndex offset = 0; offset < length; offset += 5 * sizeof(uint32_t)) {
+        uint32_t cells[5];
+        CFDataGetBytes(property, CFRangeMake(offset, sizeof cells), (UInt8 *)cells);
+        const uint32_t space = (cells[0] >> 24) & 3;
+        const uint64_t base = (uint64_t)cells[1] << 32 | cells[2];
+        const uint64_t size = (uint64_t)cells[3] << 32 | cells[4];
+        if (space >= 2 && (cells[0] & 0xffffff) == address && base == card->reg_address && size == card->reg_size)
+            matches++;
+    }
+    return matches == 1;
+}
+
+static uint64_t connected_gpu(uint64_t serviceID, const nv_ioctl_card_info_t *card)
+{
+    if (!serviceID) return 0;
+    io_service_t service = IOServiceGetMatchingService(kIOMainPortDefault, IORegistryEntryIDMatching(serviceID));
+    if (!service) return 0;
+    io_iterator_t parents = IO_OBJECT_NULL;
+    kern_return_t kr = IORegistryEntryGetParentIterator(service, kIOServicePlane, &parents);
+    IOObjectRelease(service);
+    if (kr != KERN_SUCCESS) return 0;
+    io_registry_entry_t pci = IO_OBJECT_NULL;
+    unsigned count = 0;
+    for (io_registry_entry_t parent; (parent = IOIteratorNext(parents)); IOObjectRelease(parent)) {
+        if (IOObjectConformsTo(parent, "IOPCIDevice") && ++count == 1) {
+            pci = parent;
+            IOObjectRetain(pci);
+        }
+    }
+    IOObjectRelease(parents);
+    if (count != 1) { if (pci) IOObjectRelease(pci); return 0; }
+
+    CFTypeRef vendor = IORegistryEntryCreateCFProperty(pci, CFSTR("vendor-id"), NULL, 0);
+    CFTypeRef device = IORegistryEntryCreateCFProperty(pci, CFSTR("device-id"), NULL, 0);
+    CFTypeRef addresses = IORegistryEntryCreateCFProperty(pci, CFSTR("assigned-addresses"), NULL, 0);
+    uint64_t id = 0;
+    if (vendor && CFGetTypeID(vendor) == CFDataGetTypeID() && CFDataGetLength(vendor) == 4 &&
+        device && CFGetTypeID(device) == CFDataGetTypeID() && CFDataGetLength(device) == 4) {
+        uint32_t vid, did;
+        CFDataGetBytes(vendor, CFRangeMake(0, 4), (UInt8 *)&vid);
+        CFDataGetBytes(device, CFRangeMake(0, 4), (UInt8 *)&did);
+        if (vid == 0x10de && vid == card->pci_info.vendor_id && did == card->pci_info.device_id &&
+            matching_bar0(addresses, card))
+            IORegistryEntryGetRegistryEntryID(pci, &id);
+    }
+    if (addresses) CFRelease(addresses);
+    if (device) CFRelease(device);
+    if (vendor) CFRelease(vendor);
+    IOObjectRelease(pci);
+    return id;
+}
+
+static uint64_t session_device_id(const Rm *rm)
+{
+    if (!rm->card.valid || !rm->subdevice) return 0;
+    uint64_t ctlGPU = connected_gpu(rm->ctlServiceID, &rm->card);
+    uint64_t devGPU = rm->ctlServiceID == rm->devServiceID ? ctlGPU : connected_gpu(rm->devServiceID, &rm->card);
+    return ctlGPU == devGPU ? ctlGPU : 0;
+}
+
 typedef struct {
     pthread_mutex_t lock;
     VTVideoDecoderSession session;
@@ -86,6 +159,7 @@ typedef struct {
     FourCharCode codec;
     Rm rm; H264Dec dec; bool opened;
     Rm *vrm; Vp9Dec *vp9;           // VP9: on the heap, so that the next session can take them over (park_vp9)
+    atomic_uint_fast64_t pciID;
     Av1Dec *av1;                    // AV1: likewise (with vrm)
     HevcDec *hevc;                  // HEVC (with rm)
     Mpeg2Dec *m2;                   // MPEG-1/2 (with rm)
@@ -205,6 +279,7 @@ static OSStatus b_invalidate(CMBaseObjectRef o)
         else if (s->codec == kCMVideoCodecType_MPEG4Video) { mpeg4dec_close(s->m4); free(s->m4); s->m4 = NULL; rm_close(&s->rm); }
         else { h264dec_close(&s->dec); rm_close(&s->rm); }
         s->opened = false;
+        atomic_store(&s->pciID, 0);
     }
     if (s->fmt) { CFRelease(s->fmt); s->fmt = NULL; }
     hold_release_all(s);
@@ -232,8 +307,16 @@ static CFStringRef b_desc(CMBaseObjectRef o)
 }
 static OSStatus b_copyProperty(CMBaseObjectRef o, CFStringRef key, CFAllocatorRef al, void *out)
 {
-    (void)o; (void)al;
     if (CFEqual(key, kVTDecompressionPropertyKey_UsingHardwareAcceleratedVideoDecoder)) { *(CFTypeRef *)out = kCFBooleanTrue; return noErr; }
+    if (CFEqual(key, DEVICE_EVIDENCE_KEY)) {
+        const int64_t id = (int64_t)atomic_load(&dstate(o)->pciID);
+        if (id > 0) {
+            CFNumberRef number = CFNumberCreate(al, kCFNumberSInt64Type, &id);
+            if (!number) return kVTAllocationFailedErr;
+            *(CFTypeRef *)out = number;
+            return noErr;
+        }
+    }
     if (gDLog) { char k[128]; CFStringGetCString(key, k, sizeof k, kCFStringEncodingUTF8); DLOG("copy %s: not available", k); }
     return kCMBaseObjectError_ValueNotAvailable;
 }
@@ -456,6 +539,9 @@ static OSStatus set_output(DState *s, VTVideoDecoderSession session, CMVideoForm
 {
     OSStatus st;
     s->pf = pf;
+    const uint64_t pciID = session_device_id(s->vrm ? s->vrm : &s->rm);
+    atomic_store(&s->pciID, pciID);
+    DLOG("decoder device evidence: PCI 0x%llx", (unsigned long long)pciID);
     if (gDLog) {   // what the client asked for (T8.06: matching it avoids a conversion inside EmitDecodedFrame)
         CFDictionaryRef dst = VTDecoderSessionGetDestinationPixelBufferAttributes(session);
         CFStringRef ds = dst ? CFCopyDescription(dst) : NULL; char buf[2048] = "(none)";
@@ -909,9 +995,13 @@ static OSStatus d_copySupported(VTVideoDecoderRef o, CFDictionaryRef *out)
     const void *pk[] = { kVTPropertyTypeKey, kVTPropertyReadWriteStatusKey };
     const void *pv[] = { kVTPropertyType_Boolean, kVTPropertyReadWriteStatus_ReadOnly };
     CFDictionaryRef ro = CFDictionaryCreate(NULL, pk, pv, 2, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
-    const void *k[] = { kVTDecompressionPropertyKey_UsingHardwareAcceleratedVideoDecoder };
-    const void *v[] = { ro };
-    *out = CFDictionaryCreate(NULL, k, v, 1, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
+    const void *nv[] = { kVTPropertyType_Number, kVTPropertyReadWriteStatus_ReadOnly };
+    CFDictionaryRef num = CFDictionaryCreate(NULL, pk, nv, 2, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
+    const void *k[] = { kVTDecompressionPropertyKey_UsingHardwareAcceleratedVideoDecoder,
+                        DEVICE_EVIDENCE_KEY };
+    const void *v[] = { ro, num };
+    *out = CFDictionaryCreate(NULL, k, v, 2, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
+    CFRelease(num);
     CFRelease(ro);
     return noErr;
 }
@@ -947,6 +1037,7 @@ __attribute__((visibility("default"))) OSStatus NVDecVT_CreateInstance(FourCharC
     OSStatus st = CMDerivedObjectCreate(al, &gDVT.base, VTVideoDecoderGetClassID(), &obj);
     if (st) return st;
     DState *s = calloc(1, sizeof *s);
+    atomic_init(&s->pciID, 0);
     pthread_mutex_init(&s->lock, NULL); pthread_mutex_init(&s->heldLock, NULL); pthread_cond_init(&s->cv, NULL);
     s->codec = codec; s->hold = hold_count();
     *(DState **)CMBaseObjectGetDerivedStorage(obj) = s;

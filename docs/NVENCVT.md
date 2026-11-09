@@ -21,6 +21,39 @@ sandboxed processes that delegate decode, and VTDecoderXPCService. The existing
 late encoder guard still applies when Metal first loads inside
 `VTCompressionSessionCreate`. See the command-line section below.
 
+## Identifying the decoder's GPU
+
+After a hardware session has successfully emitted frames, call
+`VTSessionCopyProperty(session, CFSTR("org.nvenc.decoder-device.v1"), NULL, &value)`.
+On success the value is a positive integer `CFNumber` holding the **PCI
+IORegistry entry ID** of the NVEncVT session's GPU. The ID is valid for the
+current boot. Resolve it with `IORegistryEntryIDMatching` and check that it
+identifies an NVIDIA `IOPCIDevice`. The driver's RM control and device
+connections must resolve to the same PCI endpoint and agree with RM's PCI
+identifiers and BAR0 before this property is available.
+
+Use the value only with a successful hardware decode from the same session.
+If the session also reports `UsingGPURegistryID`, resolve its accelerator
+entry to the PCI endpoint before comparing IDs. A mismatch, missing entry or
+unavailable property leaves device attribution unknown. Software and native
+NullMoth decoders do not publish this NVEncVT property.
+
+On macOS 26.7.3 the standard `UsingGPURegistryID` remained empty for NVEncVT
+even after advertising it and resolving the actual accelerator. The versioned
+property above reached the VideoToolbox client. This interface reports device
+identity and does not affect VideoToolbox's GPU selection.
+
+Run the [reader probe](../tools/probe_nvencvt_decoder_device.m) against a short
+clip. It prints frame counts, hardware status and the verified PCI entry ID:
+
+```sh
+xcrun clang -fobjc-arc tools/probe_nvencvt_decoder_device.m -o /tmp/probe-nvencvt-device \
+  -framework Foundation -framework AVFoundation -framework CoreMedia -framework CoreVideo \
+  -framework Metal -framework VideoToolbox -framework IOKit
+/tmp/probe-nvencvt-device sample.mp4 hw
+/tmp/probe-nvencvt-device sample.mp4 sw
+```
+
 ## RTX 30 series encoding
 
 With the full registrar selected, H.264 and HEVC encoders register on GA10x

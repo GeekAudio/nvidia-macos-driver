@@ -9,8 +9,8 @@ SRC="$HERE/vendor/nvenc"
 OUT=${1:?usage: build/nvenc_build.sh <output-directory>}
 UPSTREAM_TAG=v0.9.5
 UPSTREAM_COMMIT=1e91845d6f37d8bce671d62c14f4390324da3659
-ARTIFACT_VERSION=v0.9.5-ga10x2
-LOCAL_REVISION=ga10x-codecs-2
+ARTIFACT_VERSION=v0.9.5-ga10x3
+LOCAL_REVISION=ga10x-codecs-3
 MIN_OS=15.0
 
 OGKM="$SRC/vendor/open-gpu-kernel-modules"

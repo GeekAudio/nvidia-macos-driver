@@ -2,7 +2,7 @@
 
 The package can include `libnvencvt.dylib`, the VideoToolbox layer from the
 pinned `mickys/nvenc` v0.9.5 source with local GA10x codec changes
-(`v0.9.5-ga10x2`, revision `ga10x-codecs-2`). It provides NVIDIA NVENC encoders and
+(`v0.9.5-ga10x3`, revision `ga10x-codecs-3`). It provides NVIDIA NVENC encoders and
 NVDEC decoders through VideoToolbox.
 This page describes the local integration. The vendored README and GA10x notes
 remain the upstream v0.9.5 snapshot, including its older decoder-only GA10x policy.
@@ -13,7 +13,7 @@ With `NVMTL_NVENCVT` absent, the driver selects these codecs:
 
 | GPU | Additional codecs |
 |---|---|
-| Ampere (RTX 30) | Fast H.264 decode (`avc1`, `avc3`) when RM reports C7B0. The native driver handles the other codec paths. |
+| Ampere (RTX 30) | Fast H.264 decode (`avc1`, `avc3`) and HEVC decode (`hvc1`) when RM reports C7B0. |
 | Ada (RTX 40, including 4060 and 4060 Ti) | H.264, HEVC and AV1 encode; H.264, HEVC, VP9 and AV1 decode. |
 
 Automatic registration skips privileged processes, WindowServer, Apple's
@@ -84,8 +84,10 @@ support FMO/slice groups or SP/SI slices.
 disabling the NVEncVT encoders or VP9/AV1 decoders. Unset or `1` enables the
 H.264 registration after the class check; other values disable it. This
 specific setting takes precedence over the upstream `NVENCVT_AMPERE_ALL_DEC`
-development override. HEVC and MPEG decoding retain their earlier GA10x gate;
-normal use should leave that broad override unset.
+development override. The automatic registrar also enables HEVC (`hvc1`) on
+C7B0 so the session can report its PCI device. Set `NVENCVT_NO_HEVCDEC=1` to
+use the built-in HEVC decoder instead. MPEG retains its earlier GA10x gate;
+normal use should leave the broad override unset.
 The [H.264 validation record](NVENCVT-GA10X-H264-VALIDATION.md) documents the
 exact decoder attribution, CPU reference checks and fixed-input comparison.
 

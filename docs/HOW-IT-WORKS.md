@@ -159,6 +159,6 @@ Mesa `17ca6174` with, in order, `nvk/nvk-macos.patch`, `nvk/nvk-fixes-after-def1
 (`patch -p1` from the Mesa root). NVK compiles against the `open-gpu-kernel-modules` 610.57.04 headers with
 `nvk/ogkm-nvos-620.patch` applied to that tree; 620's `nv.h` does not compile in user space, so the rest stays 610.
 The bundled NVEncVT source is pinned at `mickys/nvenc` v0.9.5 with local GA10x H.264/HEVC encoding and H.264 decoding changes, identified as
-`v0.9.5-ga10x2` / `ga10x-codecs-2`; build it locally with `build/nvenc_build.sh <out-dir>`.
+`v0.9.5-ga10x3` / `ga10x-codecs-3`; build it locally with `build/nvenc_build.sh <out-dir>`.
 Stage its output into the offline package root with `package/stage_nvencvt.py <pkgroot> <out-dir>` before producing the
 release archive. That staging step signs and checksums the final payload; it does not install or execute the library.

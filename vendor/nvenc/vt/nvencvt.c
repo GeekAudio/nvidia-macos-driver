@@ -1066,9 +1066,9 @@ static void rename_encoders(const char *const ids[], const char *const names[], 
     LOG("rename: %d of %d encoder names set", done, n);
 }
 
-__attribute__((visibility("hidden"))) OSStatus nvdecvt_register(int rating, bool h264Only, bool legacyMpeg);
+__attribute__((visibility("hidden"))) OSStatus nvdecvt_register(int rating, bool ampereDefault, bool legacyMpeg);
 
-// Returns the H.264 registration status for the selected encoder or decoder path.
+// Returns the registration status for the selected codec path.
 static OSStatus nvencvt_register(int rating, bool automatic)
 {
     int gpu = !automatic && getenv("NVENCVT_ANY_GPU") ? GPU_ADA : pci_gpu_kind();

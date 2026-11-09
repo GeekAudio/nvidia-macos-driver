@@ -1065,9 +1065,9 @@ static NvU32 nvdec_class(void)
 // VP9 and AV1 too (NVENCVT_NO_HEVCDEC / _VP9DEC / _AV1DEC=1 leave one out).
 // On GA10x (RTX 30), H.264 additionally requires the actual C7B0 NVDEC class;
 // NVENCVT_AMPERE_H264_DEC=0 keeps the previous decoder selection. VP9 and AV1
-// retain their existing gates. HEVC/MPEG remain behind the upstream
-// NVENCVT_AMPERE_ALL_DEC development override until separately validated.
-__attribute__((visibility("hidden"))) OSStatus nvdecvt_register(int rating, bool h264Only, bool legacyMpeg)
+// retain their existing gates. Automatic GA10x registration also offers hvc1
+// after checking C7B0, so HEVC sessions can report their actual PCI device.
+__attribute__((visibility("hidden"))) OSStatus nvdecvt_register(int rating, bool ampereDefault, bool legacyMpeg)
 {
     gDLog = getenv("NVENCVT_LOG") != NULL; gDLogAll = gDLog && !strcmp(getenv("NVENCVT_LOG"), "2");
     // /tmp flag files are honoured only in a diagnostics build (vt/nvencvt.c explains why)
@@ -1076,6 +1076,9 @@ __attribute__((visibility("hidden"))) OSStatus nvdecvt_register(int rating, bool
     extern int gNvencvtGpu;   // vt/nvencvt.c: 1 Ada, 2 TU117 (GTX 1650: NVDEC 0xc4b0 has no AV1), 3 GA10x (RTX 30)
     const bool ampere = gNvencvtGpu == 3;
     const bool hevcMpeg = !ampere || getenv("NVENCVT_AMPERE_ALL_DEC") != NULL;
+    const bool hevc = ampereDefault
+        ? nvdec_class() == 0xc7b0 && !getenv("NVMTL_NO_NVDEC_HEVC")
+        : hevcMpeg;
     const bool h264 = !ampere || nvenc_ga10x_h264_decode_enabled(getenv("NVENCVT_AMPERE_H264_DEC"), nvdec_class());
     if (ampere) DLOG("GA10x H.264 decoder %s (NVDEC class 0x%x; NVENCVT_AMPERE_H264_DEC=0 disables)",
                     h264 ? "enabled" : "disabled", nvdec_class());
@@ -1092,17 +1095,18 @@ __attribute__((visibility("hidden"))) OSStatus nvdecvt_register(int rating, bool
     if (h264 && !getenv("NVENCVT_NO_HEV1")) { OSStatus s3 = reg(CODEC_AVC3, info, (void *)NVDecVT_CreateInstance); DLOG("registered %s for avc3 -> %d", DECODER_ID, (int)s3); }
     CFRelease(info);
     DLOG("registered %s -> %d (rating %d)", DECODER_ID, (int)st, rating);
-    if (h264Only) {
-        CFRelease(nr);
-        return st;
-    }
-    if (hevcMpeg && !getenv("NVENCVT_NO_HEVCDEC")) {   // HEVC (NVENCVT_NO_HEVCDEC=1 leaves it out): above NullMoth's own HEVC decoder too
+    OSStatus sh = kVTCouldNotFindVideoDecoderErr;
+    if (hevc && !getenv("NVENCVT_NO_HEVCDEC")) {
         const void *vh[] = { CFSTR(DECODER_ID_HEVC), CFSTR("NVDEC - HEVC - mickys/nvenc"), nr, kCFBooleanTrue };
         CFDictionaryRef ih = CFDictionaryCreate(NULL, k, vh, 4, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
-        OSStatus sh = reg(kCMVideoCodecType_HEVC, ih, (void *)NVDecVT_CreateInstance);
-        if (!getenv("NVENCVT_NO_HEV1")) { OSStatus s1 = reg(CODEC_HEV1, ih, (void *)NVDecVT_CreateInstance); DLOG("registered %s for hev1 -> %d", DECODER_ID_HEVC, (int)s1); }
+        sh = reg(kCMVideoCodecType_HEVC, ih, (void *)NVDecVT_CreateInstance);
+        if (!ampereDefault && !getenv("NVENCVT_NO_HEV1")) { OSStatus s1 = reg(CODEC_HEV1, ih, (void *)NVDecVT_CreateInstance); DLOG("registered %s for hev1 -> %d", DECODER_ID_HEVC, (int)s1); }
         CFRelease(ih);
         DLOG("registered %s -> %d (rating %d)", DECODER_ID_HEVC, (int)sh, rating);
+    }
+    if (ampereDefault) {
+        CFRelease(nr);
+        return st ? sh : st;
     }
     if (!getenv("NVENCVT_NO_VP9DEC")) {
         const void *v9[] = { CFSTR(DECODER_ID_VP9), CFSTR("NVDEC - VP9 - mickys/nvenc"), nr, kCFBooleanTrue };

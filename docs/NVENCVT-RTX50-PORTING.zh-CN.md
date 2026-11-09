@@ -17,7 +17,7 @@ git rev-parse HEAD
 | 内容 | 位置 / 版本 |
 | --- | --- |
 | 上游 NVEncVT | `mickys/nvenc` v0.9.5，`1e91845d6f37d8bce671d62c14f4390324da3659` |
-| 本地编解码版本 | `v0.9.5-ga10x2` / `ga10x-codecs-2` |
+| 本地编解码版本 | `v0.9.5-ga10x3` / `ga10x-codecs-3` |
 | 来源、依赖 pin、本地改动清单 | [SOURCE.json](../vendor/nvenc/SOURCE.json) |
 | NVEncVT 导入及 3080 后续改动 PR | [#477](https://github.com/nullmoth/nvidia-macos-driver/pull/477) |
 | 3080 编码验证 | [H.264 / HEVC 验证记录](NVENCVT-GA10X-VALIDATION.md) |

@@ -146,11 +146,10 @@ check("the log describes the registration call without claiming every codec regi
 
 # Release builds discard inherited NVMTL_* switches before reading the root-managed config. Keep
 # that policy: this opt-in is configured in nvrm610.conf, not opened to every process environment.
-conf = function_source(objects, "__attribute__((constructor)) static void nvmtl_conf_knobs(void)")
-scrub = conf.split("#endif", 1)[0] if conf else ""
+conf = function_source(objects, "static void nvmtl_conf_read_file(unsigned forgot)")
+scrub = function_source(objects, "static unsigned nvmtl_conf_forget_inherited(void)")
 check("release builds still scrub inherited NVMTL_* environment switches",
-      bool(conf) and "#if NVMTL_RELEASE" in conf and 'strncmp(*e, "NVMTL_", 6)' in scrub
-      and "NVMTL_NVENCVT=" not in scrub and "NVMTL_NVENCVT_RATING=" not in scrub)
+      "#if NVMTL_RELEASE" in scrub and "nvmtl_release_forget_env(environ)" in scrub)
 check("the root-managed config continues to accept the NVMTL_NVENCVT selector",
       bool(conf) and 'fopen("/Library/GPUBundles/nvmtl/nvrm610.conf"' in conf
       and 'strncmp(key, "NVMTL_", 6)' in conf)
@@ -159,23 +158,24 @@ check("the production conf reader can hold the full 511-byte selector line",
       bool(conf) and "char line[1024];" in conf)
 if conf:
     # Call the exact production parser body, but route its fixed system path to a temporary fixture.
-    # Strip only the constructor attribute so loading the test executable cannot run the parser early.
-    conf_function = conf.replace("__attribute__((constructor)) ", "", 1)
-    conf_fixture = r'''#define _POSIX_C_SOURCE 200809L
+    conf_fixture = r'''#define _DARWIN_C_SOURCE
+#define _POSIX_C_SOURCE 200809L
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include "nvmtl_env_knobs.h"
 static const char *test_config_path;
 static void nvlog(const char *format, ...) { (void)format; }
+static void nvmtl_conf_note_mine(const char *key) { (void)key; }
 static FILE *route_fopen(const char *path, const char *mode) {
     if (!strcmp(path, "/Library/GPUBundles/nvmtl/nvrm610.conf"))
         return fopen(test_config_path, mode);
     return fopen(path, mode);
 }
 #define fopen route_fopen
-''' + conf_function + r'''
+''' + scrub + "\n" + conf + r'''
 int main(int argc, char **argv) {
     if (argc != 2) return 2;
     test_config_path = argv[1];
@@ -183,7 +183,8 @@ int main(int argc, char **argv) {
     setenv("NVMTL_FAKE", "from-environment", 1);
     unsetenv("NVMTL_EXPECTED");
     unsetenv("NVMTL_CONF_SET");
-    nvmtl_conf_knobs();
+    unsetenv("NVMTL_PROCESS_ENV");
+    nvmtl_conf_read_file(nvmtl_conf_forget_inherited());
 
     char expected[512];
     memset(expected, 'A', 497);
@@ -218,7 +219,8 @@ int main(int argc, char **argv) {
         source.write_text(conf_fixture)
         try:
             build = subprocess.run(["cc", "-std=c11", "-Wall", "-Wextra", "-Werror", "-DNVMTL_RELEASE=1",
-                                    str(source), "-o", str(binary)], capture_output=True, text=True)
+                                    "-I", str(root / "plugin"), str(source), "-o", str(binary)],
+                                   capture_output=True, text=True)
         except FileNotFoundError:
             check("host C compiler available for the extracted conf fixture", False, "cc not found")
         else:

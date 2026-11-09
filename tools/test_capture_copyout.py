@@ -14,9 +14,6 @@ budget = vk[start:vk.index("\nstatic nvk_buffer *nvmtl_host_pages(", start)]
 event = (root / "plugin/NVMTLEventSync.m").read_text()
 start = event.index("static void nvmtl_ws_gpu_copyout(")
 copyout = event[start:event.index("\n@interface NVMTLPendingSurfaceWrite", start)]
-objects = (root / "plugin/NVMTLObjects.m").read_text()
-start = objects.index("#if NVMTL_RELEASE", objects.index("static void nvmtl_conf_knobs(")) + len("#if NVMTL_RELEASE")
-prune = "static void prune_release_environment(void) {\n" + objects[start:objects.index("#endif", start)] + "\n}\n"
 
 c_fixture = r'''
 #include <assert.h>
@@ -211,16 +208,8 @@ objc_checks = r'''
 static int shared_pages_checks(void) {
     static struct __IOSurface s={.base=0x400000,.alloc=16384,.row=128,.planes=2};
     NVMTLTexture *a=[NVMTLTexture new], *b=[NVMTLTexture new]; a->_surf=&s; b->_surf=&s;
-    setenv("NVMTL_SURFIN_PAGE_CACHE_EXTRA", "1", 1);
-    setenv("NVMTL_SURFIN_ASYNC", "1", 1); setenv("NVMTL_SURFIN_ASYNC_EXTRA", "1", 1);
-    setenv("NVMTL_SURFIN_ORDERED", "0", 1); setenv("NVMTL_SURFIN_ORDERED_EXTRA", "1", 1);
-    setenv("NVMTL_ASYNC_SURFACE_UPLOAD", "0", 1); setenv("NVMTL_ASYNC_SURFACE_UPLOAD_EXTRA", "1", 1);
-    prune_release_environment();
-    assert(!getenv("NVMTL_SURFIN_PAGE_CACHE_EXTRA"));
-    assert(getenv("NVMTL_SURFIN_ASYNC") && !getenv("NVMTL_SURFIN_ASYNC_EXTRA"));
-    assert(getenv("NVMTL_SURFIN_ORDERED") && !strcmp(getenv("NVMTL_SURFIN_ORDERED"),"0") && !getenv("NVMTL_SURFIN_ORDERED_EXTRA"));
-    assert(getenv("NVMTL_ASYNC_SURFACE_UPLOAD") && !strcmp(getenv("NVMTL_ASYNC_SURFACE_UPLOAD"),"0")
-        && !getenv("NVMTL_ASYNC_SURFACE_UPLOAD_EXTRA"));
+    // test_env_knobs.c covers inherited knobs. These cases run after the
+    // configuration has settled, so test the effective switch directly.
     nvk_buffer *first=nvmtl_surface_host_pages(a,(void *)s.base,s.alloc);
     if(getenv("NVMTL_SURFIN_PAGE_CACHE") && !strcmp(getenv("NVMTL_SURFIN_PAGE_CACHE"),"0")) {
         assert(first==&a->_hostPages && !imports && !a->_hostPageLease);
@@ -256,9 +245,6 @@ static NVMTLCommandBuffer *buffer(NSArray *parts) {
 }
 int main(void) { @autoreleasepool {
     if(getenv("TEST_SHARED_PAGES")) return shared_pages_checks();
-    setenv("NVMTL_GPU_COPYOUT_EXTRA","1",1);
-    prune_release_environment();
-    assert(getenv("NVMTL_GPU_COPYOUT") && !getenv("NVMTL_GPU_COPYOUT_EXTRA"));
     static struct __IOSurface s={.base=0x100000,.alloc=16384,.row=128,.planes=2}; kept=&s;
     NVMTLTexture *t=[NVMTLTexture new]; t->_surf=&s;
     NVMTLTexture *alias=[NVMTLTexture new]; alias->_parent=t;
@@ -317,7 +303,7 @@ with tempfile.TemporaryDirectory() as directory:
                     str(c), "-o", str(path / "copy")], check=True)
     subprocess.run([str(path / "copy")], check=True)
     m = path / "ownership.m"
-    m.write_text(objc_fixture + prune + (root / "plugin/NVMTLCapture.m").read_text() + copyout + objc_checks)
+    m.write_text(objc_fixture + (root / "plugin/NVMTLCapture.m").read_text() + copyout + objc_checks)
     subprocess.run(["xcrun", "clang", "-fobjc-arc", "-fsanitize=address,undefined", "-fno-omit-frame-pointer", *includes,
                     "-framework", "Foundation", str(m), "-o", str(path / "ownership")], check=True)
     subprocess.run([str(path / "ownership")], check=True, env=dict(os.environ, NVMTL_GPU_COPYOUT="1"))

@@ -8,7 +8,7 @@ translator/  Based on metal2vulkan, Copyright (C) Anees Iqbal
              (translator/LICENSE, translator/COPYING). Modifications by NullMoth Systems
              are released under the same licence.
 
-kexts/       Builds against NVIDIA's open GPU kernel modules 615.78.08, MIT (with GPL-2.0 alternatives
+kexts/       Builds against NVIDIA's open GPU kernel modules 620.70.06, MIT (with GPL-2.0 alternatives
              where noted), https://github.com/NVIDIA/open-gpu-kernel-modules
              (licenses/NVIDIA-open-gpu-kernel-modules-COPYING.txt).
 
@@ -24,7 +24,7 @@ SMC adapter  Minimal public VirtualSMC 1.3.8 / Lilu 1.6.9 SDK headers and adapte
              (licenses/VirtualSMC-LICENSE.txt and licenses/Lilu-LICENSE.txt).
              Source pins: kexts/NVRM/accel/smc/vendor/VERSIONS.md.
 
-GSP firmware gsp_tu10x.bin, gsp_ga10x.bin and the matching ucode images from NVIDIA's 615.78.08 driver,
+GSP firmware gsp_tu10x.bin, gsp_ga10x.bin and the matching ucode images from NVIDIA's 620.70.06 driver,
              redistributed unmodified under NVIDIA's licence (licenses/NVIDIA-firmware-LICENCE.txt), the same
              terms under which linux-firmware redistributes these images.
 

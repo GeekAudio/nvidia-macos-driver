@@ -6,8 +6,7 @@ import tempfile
 
 root = pathlib.Path(__file__).resolve().parents[1]
 source = (root / 'plugin/NVMTLObjects.m').read_text()
-release_keep = source[source.index('#if NVMTL_RELEASE'):source.index('const char *eq = strchr', source.index('#if NVMTL_RELEASE'))]
-assert 'NVMTL_SURFIN_READER_SKIP=' in release_keep, 'release environment filtering must preserve the explicit opt-in'
+assert 'nvmtl_release_forget_env(environ)' in source, 'surface knobs must follow the current release environment policy'
 wrapper_start = source.index('static BOOL nvmtl_surfin_reader_only(NVMTLTexture *r);')
 wrapper_end = source.index('static unsigned nvmtl_surf_id', wrapper_start)
 wrappers = source[wrapper_start:wrapper_end]

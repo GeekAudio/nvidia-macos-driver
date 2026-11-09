@@ -360,6 +360,7 @@ pub(crate) fn air_image_intrinsic(name: &str) -> bool {
                 "air.sample_compare_depth",
                 "air.gather_texture",
                 "air.gather_depth",
+                "air.gather_compare_depth",
                 "air.read_texture",
                 "air.read_depth",
                 "air.write_texture",
@@ -544,6 +545,7 @@ pub fn air_intrinsic_disposition(name: &str) -> Option<AirIntrinsicDisposition> 
                 "air.simdgroup_matrix_8x8_load.",
                 "air.simdgroup_matrix_8x8_store.",
                 "air.simdgroup_matrix_8x8_init_diag.",
+                "air.simdgroup_matrix_8x8_init_filled.",
                 "air.simdgroup_async_copy_2d.",
                 "air.get_null_simdgroup_event",
                 "air.is_null_simdgroup_event",
@@ -696,10 +698,17 @@ pub fn air_intrinsic_disposition(name: &str) -> Option<AirIntrinsicDisposition> 
             "air.get_local_id",
             "air.get_group_id",
             "air.get_num_groups",
+            "air.get_local_size",
+            "air.get_global_size",
             "air.clamp",
             "air.saturate",
         ],
-    ) || name.strip_prefix("air.fast_").is_some_and(|tail| {
+    ) || name
+        .strip_prefix("air.fast_")
+        // Metal's native_* math (native_powr, native_exp2, ...) has fast_'s contract: precision is the
+        // implementation's, so it lowers the same way (Geekbench's resolve_radiance used native_powr)
+        .or_else(|| name.strip_prefix("air.native_"))
+        .is_some_and(|tail| {
         [
             "sincos", "cospi", "sinpi", "tanpi", "exp10", "fmod", "log10", "fmax3", "fmin3",
             "fmedian3", "ldexp", "atan2", "asin", "acos", "atan", "fmax", "max", "fmin", "min",
@@ -794,6 +803,7 @@ mod tests {
     fn image_handle_families_are_classified_by_the_shared_abi_predicate() {
         assert!(air_image_intrinsic("air.write_texture_2d.i16.v4f32"));
         assert!(air_image_intrinsic("air.sample_compare_depth_2d.f32"));
+        assert!(air_image_intrinsic("air.gather_compare_depth_2d.f32"));
         assert!(air_image_intrinsic(
             "air.calculate_unclamped_lod_texture_2d"
         ));

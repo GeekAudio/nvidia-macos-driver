@@ -188,10 +188,20 @@ pub const BINDLESS_HEAP_SET: u32 = 2;
 pub const BINDLESS_HEAP_BINDING: u32 = 0;
 pub const BINDLESS_SAMPLER_BINDING: u32 = 1;
 pub const BINDLESS_SAMPLER_SLOTS: u32 = 2048;
+/// Descriptor set of [[color(n)]] framebuffer-fetch input attachments (binding 192 + n), apart from the resource sets.
+pub const INPUT_ATTACHMENT_SET: u32 = 3;
 pub const BINDLESS_STORAGE_BINDING: u32 = 2;
 pub const BINDLESS_UTEXEL_BINDING: u32 = 3;
 pub const BINDLESS_STEXEL_BINDING: u32 = 4;
 pub const BINDLESS_HEAP_SLOTS: u32 = 131072;
+/// Heap slots the plugin reserves for typed dummies when it tells the translator so (cap bit 8): a null resource id
+/// is redirected to the dummy of the image dimensionality the shader declares (passes/resources/dummy_slots.rs).
+pub const BINDLESS_DUMMY_SLOT_2D: u32 = 1;
+pub const BINDLESS_DUMMY_SLOT_2D_ARRAY: u32 = 2;
+pub const BINDLESS_DUMMY_SLOT_3D: u32 = 3;
+pub const BINDLESS_DUMMY_SLOT_CUBE: u32 = 4;
+pub const BINDLESS_DUMMY_SLOT_CUBE_ARRAY: u32 = 5;
+pub const BINDLESS_RESERVED_SLOTS: u32 = 6;
 pub fn bindless_fixed_fields_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| !matches!(std::env::var("NVMTL_NO_TIER2_FIXED").as_deref(), Ok(v) if !v.is_empty() && v != "0"))
@@ -1236,7 +1246,7 @@ struct EmittedImage {
 
 impl EmittedImage {
     fn of(
-        types: &std::collections::HashMap<spirv::Word, &crate::spirv_module::Instruction>,
+        types: &crate::fxhash::HashMap<spirv::Word, &crate::spirv_module::Instruction>,
         image: spirv::Word,
     ) -> Option<Self> {
         let instruction = types.get(&image)?;
@@ -1281,7 +1291,7 @@ impl EmittedImage {
 }
 
 fn pointee_of(
-    types: &std::collections::HashMap<spirv::Word, &crate::spirv_module::Instruction>,
+    types: &crate::fxhash::HashMap<spirv::Word, &crate::spirv_module::Instruction>,
     pointer: spirv::Word,
 ) -> Option<spirv::Word> {
     let instruction = types.get(&pointer)?;
@@ -1392,7 +1402,7 @@ pub(crate) fn has_sample_position_payload(module: &Module) -> bool {
         .types_global_values
         .iter()
         .filter_map(|i| i.result_id.map(|id| (id, i)))
-        .collect::<std::collections::HashMap<_, _>>();
+        .collect::<crate::fxhash::HashMap<_, _>>();
     let id = |operand: &Operand| match operand {
         Operand::IdRef(id) => Some(*id),
         _ => None,
@@ -1907,8 +1917,8 @@ impl ShaderReflection {
             .types_global_values
             .iter()
             .filter_map(|instruction| Some((instruction.result_id?, instruction)))
-            .collect::<std::collections::HashMap<_, _>>();
-        let mut declared = std::collections::HashMap::<u32, Option<EmittedImage>>::new();
+            .collect::<crate::fxhash::HashMap<_, _>>();
+        let mut declared = crate::fxhash::HashMap::<u32, Option<EmittedImage>>::default();
         for instruction in module
             .types_global_values
             .iter()
@@ -1962,7 +1972,7 @@ impl ShaderReflection {
             .types_global_values
             .iter()
             .filter_map(|instruction| Some((instruction.result_id?, instruction)))
-            .collect::<std::collections::HashMap<_, _>>();
+            .collect::<crate::fxhash::HashMap<_, _>>();
         let bound = module
             .types_global_values
             .iter()
@@ -1994,7 +2004,7 @@ impl ShaderReflection {
             .types_global_values
             .iter()
             .filter_map(|instruction| Some((instruction.result_id?, instruction)))
-            .collect::<std::collections::HashMap<_, _>>();
+            .collect::<crate::fxhash::HashMap<_, _>>();
         let mut null_textures = 0;
         let mut read_samplers = 0;
         for &binding in bindings {
@@ -2219,7 +2229,11 @@ impl ShaderReflection {
                     static_sampler: None,
                 },
                 FragRole::Texture(n) => texture_binding(*n, Some(idx), &meta.texture_type_names),
-                FragRole::Sampler(n) => sampler_binding(*n, Some(idx)),
+                FragRole::Sampler(n) => sampler_binding(
+                    *n,
+                    Some(idx),
+                    meta.declared_descriptor_count(idx).unwrap_or(1),
+                ),
                 FragRole::AccelerationStructureShadow(n) => ResourceBinding {
                     kind: ResourceKind::AccelerationStructureShadow,
                     metal_index: *n,
@@ -2421,7 +2435,11 @@ impl ShaderReflection {
                     static_sampler: None,
                 },
                 VertRole::Texture(n) => texture_binding(*n, Some(idx), &meta.texture_type_names),
-                VertRole::Sampler(n) => sampler_binding(*n, Some(idx)),
+                VertRole::Sampler(n) => sampler_binding(
+                    *n,
+                    Some(idx),
+                    meta.declared_descriptor_count(idx).unwrap_or(1),
+                ),
                 VertRole::AccelerationStructureShadow(n) => ResourceBinding {
                     kind: ResourceKind::AccelerationStructureShadow,
                     metal_index: *n,
@@ -2448,6 +2466,8 @@ impl ShaderReflection {
                 VertRole::VertexInput(_)
                 | VertRole::VertexId
                 | VertRole::InstanceId
+                | VertRole::BaseVertex
+                | VertRole::BaseInstance
                 | VertRole::PatchControlPoints
                 | VertRole::PatchInput(_)
                 | VertRole::PositionInPatch
@@ -2616,7 +2636,11 @@ impl ShaderReflection {
                     }
                 }
                 KernRole::Texture(n) => texture_binding(*n, Some(idx), &meta.texture_type_names),
-                KernRole::Sampler(n) => sampler_binding(*n, Some(idx)),
+                KernRole::Sampler(n) => sampler_binding(
+                    *n,
+                    Some(idx),
+                    meta.declared_descriptor_count(idx).unwrap_or(1),
+                ),
                 KernRole::StageInput(location) => {
                     let metal_index = stage_input_bindings
                         .get(&idx)
@@ -2924,8 +2948,8 @@ fn llvm_arg_has_attribute(arg: &str, attribute: &str) -> bool {
 }
 
 fn parse_static_sampler_constants(ll: &str) -> Result<Vec<[u64; 2]>, String> {
-    let mut globals = std::collections::HashMap::<String, [u64; 2]>::new();
-    let mut nodes = std::collections::HashMap::<u32, String>::new();
+    let mut globals = crate::fxhash::HashMap::<String, [u64; 2]>::default();
+    let mut nodes = crate::fxhash::HashMap::<u32, String>::default();
     let mut root = None;
 
     for raw in ll.lines() {
@@ -3014,7 +3038,7 @@ fn global_name(body: &str) -> Option<&str> {
 fn texture_binding(
     n: u32,
     param_index: Option<u32>,
-    type_names: &std::collections::HashMap<u32, String>,
+    type_names: &crate::fxhash::HashMap<u32, String>,
 ) -> ResourceBinding {
     let type_name = param_index.and_then(|idx| type_names.get(&idx).cloned());
     let texture_shape = type_name.as_deref().map(texture_shape_from_name);
@@ -3226,11 +3250,17 @@ fn embedded_argument_fields(arguments: &[crate::meta::EmbeddedArgument]) -> Vec<
         .collect()
 }
 
-fn sampler_binding(n: u32, param_index: Option<u32>) -> ResourceBinding {
+fn sampler_binding(n: u32, param_index: Option<u32>, count: u32) -> ResourceBinding {
+    let mut descriptor = ResourceBinding::descriptor_at(sampler_resource_binding(n));
+    if let Some(location) = descriptor.as_mut() {
+        // `array<sampler, N>` occupies N consecutive descriptors of the sampler band, exactly like
+        // a texture array: the consumer has to create an array binding, not one sampler.
+        location.count = count.max(1);
+    }
     ResourceBinding {
         kind: ResourceKind::Sampler,
         metal_index: n,
-        descriptor: ResourceBinding::descriptor_at(sampler_resource_binding(n)),
+        descriptor,
         param_index,
         stage_input_location: None,
         address_space: None,

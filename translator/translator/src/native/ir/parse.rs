@@ -30,14 +30,38 @@ impl LlModule {
         Self::parse_inner(ll, true, kern, entry_name)
     }
 
+    /// `parse_inner_uncached`, served from the parse cache while a `ParseScope` is held on this thread. One translation
+    /// parses the same text several times (the primary emit, each raw construction tier, the storage-image reflection),
+    /// which was 10-14% of translation time on No Man's Sky's and Cyberpunk's shaders. Parsing reads nothing but its
+    /// arguments, so an entry with the same text, flag, kernel metadata and entry name is the same module.
     pub(in crate::native) fn parse_inner(
         ll: &str,
         primitive_phi_metadata: bool,
         kern: Option<&meta::KernMeta>,
         entry_name: Option<&str>,
     ) -> Result<Self, String> {
-        let mut types = HashMap::new();
-        let mut loop_metadata: HashMap<String, String> = HashMap::new();
+        if !parse_cache::active() {
+            return Self::parse_inner_uncached(ll, primitive_phi_metadata, kern, entry_name);
+        }
+        // KernMeta has no equality; its debug text is the key. A map inside it may print in another order for an equal
+        // value, which only misses the cache.
+        let kern_key = kern.map(|k| format!("{k:?}"));
+        if let Some(module) = parse_cache::get(ll, primitive_phi_metadata, kern_key.as_deref(), entry_name) {
+            return Ok(module);
+        }
+        let module = Self::parse_inner_uncached(ll, primitive_phi_metadata, kern, entry_name)?;
+        parse_cache::put(ll, primitive_phi_metadata, kern_key, entry_name, &module);
+        Ok(module)
+    }
+
+    pub(super) fn parse_inner_uncached(
+        ll: &str,
+        primitive_phi_metadata: bool,
+        kern: Option<&meta::KernMeta>,
+        entry_name: Option<&str>,
+    ) -> Result<Self, String> {
+        let mut types = HashMap::default();
+        let mut loop_metadata: HashMap<String, String> = HashMap::default();
         for raw_line in ll.lines() {
             let line = strip_comment(raw_line).trim();
             if line.starts_with('!')
@@ -116,7 +140,7 @@ impl LlModule {
             return Err("native emitter: no function definitions found".into());
         }
         let entry_functions = entry_name
-            .map(|name| HashSet::from([name.to_string()]))
+            .map(|name| crate::fxhash::set_from([name.to_string()]))
             .unwrap_or_else(|| infer_entry_functions(ll));
         let metadata_byte_buffer_params =
             infer_metadata_byte_buffer_params(kern, entry_name, &functions);
@@ -153,7 +177,19 @@ impl LlModule {
         let imageblock_shared_cells = cross_coordinate_imageblock
             || !aliased_imageblock_planes.is_empty()
             || calls_imageblock_slice_write(&functions, &entry_functions);
-        let imageblock_cell_scale = infer_imageblock_cell_scale(&functions, &entry_functions);
+        let imageblock_statics = meta::static_init_foldable_global_values(ll);
+        let imageblock_cell_scale = infer_imageblock_cell_scale(
+            &functions,
+            &entry_functions,
+            &imageblock_statics,
+            imageblock_threads_per_threadgroup_param.as_deref(),
+        );
+        let imageblock_cell_scale_xy = infer_imageblock_lane_scales(
+            &functions,
+            &entry_functions,
+            &imageblock_statics,
+            imageblock_threads_per_threadgroup_param.as_deref(),
+        );
         if imageblock_shared_cells
             && imageblock_dimensions.is_none()
             && imageblock_threads_per_threadgroup_param.is_none()
@@ -196,27 +232,30 @@ impl LlModule {
             globals,
             static_init_globals: meta::static_init_foldable_global_values(ll),
             entry_name: entry_name.map(str::to_string),
-            preinlined_static_initializers: HashSet::new(),
-            preinlined_helper_pointer_loads: HashSet::new(),
-            preinlined_helper_type_capabilities: HashSet::new(),
+            preinlined_static_initializers: HashSet::default(),
+            preinlined_helper_pointer_loads: HashSet::default(),
+            preinlined_helper_type_capabilities: HashSet::default(),
             entry_functions,
-            ptr_pointees: HashMap::new(),
-            local_alloca_pointees: HashMap::new(),
+            ptr_pointees: HashMap::default(),
+            local_alloca_pointees: HashMap::default(),
             imageblock_data_pointee,
             imageblock_dimensions,
             imageblock_shared_cells,
             aliased_imageblock_planes,
             imageblock_threads_per_threadgroup_param,
             imageblock_cell_scale,
-            metadata_pointee_params: HashSet::new(),
-            metadata_pointee_sizes: HashMap::new(),
+            imageblock_cell_scale_xy,
+            metadata_pointee_params: HashSet::default(),
+            metadata_pointee_sizes: HashMap::default(),
             metadata_byte_buffer_params,
             metadata_data_buffer_params,
+            has_kernel_metadata: kern.is_some(),
             metadata_primitive_buffer_pointees,
             metadata_fc_buffer_locations,
-            raw_buffer_params: HashSet::new(),
-            call_connected_raw_params: HashSet::new(),
-            param_connected_raw_params: HashSet::new(),
+            raw_buffer_params: HashSet::default(),
+            byte_addressed_raw_params: HashSet::default(),
+            call_connected_raw_params: HashSet::default(),
+            param_connected_raw_params: HashSet::default(),
         };
         module.infer_metadata_buffer_pointees(kern, entry_name);
         module.infer_pointer_pointees();
@@ -654,11 +693,11 @@ fn source_loop_controls(
     blocks: &[crate::native::cfg::BodyBlock],
     loop_metadata: &HashMap<String, String>,
 ) -> HashMap<String, (spirv::LoopControl, Option<u32>)> {
-    let mut controls = HashMap::new();
+    let mut controls = HashMap::default();
     if loop_metadata.is_empty() {
         return controls;
     }
-    let mut latch_hints: HashMap<String, (spirv::LoopControl, Option<u32>)> = HashMap::new();
+    let mut latch_hints: HashMap<String, (spirv::LoopControl, Option<u32>)> = HashMap::default();
     let mut current = entry_label.to_string();
     for raw in body {
         let line = strip_comment(raw).trim();
@@ -780,6 +819,10 @@ entry:
         assert_eq!(
             threaded.call_connected_raw_params,
             reparsed.call_connected_raw_params
+        );
+        assert_eq!(
+            threaded.byte_addressed_raw_params,
+            reparsed.byte_addressed_raw_params
         );
         assert_eq!(
             threaded.param_connected_raw_params,

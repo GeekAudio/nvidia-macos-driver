@@ -1,27 +1,28 @@
 # NullMoth NVIDIA Driver for macOS
 
-A Metal driver for NVIDIA Turing-and-later cards on Intel Macs and OpenCore systems running **macOS 15 Sequoia**.
-The device table includes GTX 16, RTX 20/30/40/50, TITAN RTX, and supported Quadro/RTX workstation cards.
-Your NVIDIA card drives the desktop, Metal apps, games, Core ML/MPS, and OpenCL — the way an Apple-supported GPU does.
+A Metal driver for NVIDIA GeForce cards on macOS 15 Sequoia (Intel Macs and OpenCore PCs). It is open source; the
+kernel extensions, the Metal plugin and the shader translator are in this repository. The 1401 app that installs it
+(Mac and Windows) is its own project: [1401](https://github.com/nullmoth/1401).
 
-Made by **NullMoth Systems**.
+Supported cards are Turing and newer: GTX 16, RTX 20, 30, 40 and 50, TITAN RTX, Quadro RTX and the T-series. Most
+testing is done on an RTX 5060, so other cards may have problems that haven't been found yet. See
+[card support](docs/CARD-SUPPORT.md) for what has been reported working.
 
-**Latest maintenance update:** [1401 Mac 1.0.13 / driver package 1.0.9](docs/RELEASE-1.0.13.md). See the change list, validation and remaining work before updating.
+- Changes: [CHANGELOG.md](CHANGELOG.md), downloads on the [releases page](https://github.com/nullmoth/nvidia-macos-driver/releases)
+- Problems: [troubleshooting](docs/TROUBLESHOOTING.md), then Send logs from the 1401 app
+- Installing macOS from Windows: [1401](https://github.com/nullmoth/1401)
+- How it works: [docs/HOW-IT-WORKS.md](docs/HOW-IT-WORKS.md)
+- Contributing: [CONTRIBUTING.md](CONTRIBUTING.md)
 
-Installing macOS from Windows? Use **1401**: https://github.com/nullmoth/1401
-
-> **This driver is new and may not work on every PC.** It is tested on an RTX 5060 under macOS 15.7.x and 15.8.1. Device-table coverage is broader than physical hardware validation; see [card support](docs/CARD-SUPPORT.md). If your PC does
-> not boot macOS with OpenCore yet, set that up first with the
-> [OpenCore Install Guide](https://dortania.github.io/OpenCore-Install-Guide/)
-> ([OpenCore releases](https://github.com/acidanthera/OpenCorePkg/releases)), then install the driver.
-> The full write-up of how the driver works is in [`docs/HOW-IT-WORKS.md`](docs/HOW-IT-WORKS.md).
+If your PC doesn't boot macOS with OpenCore yet, set that up first with the
+[OpenCore Install Guide](https://dortania.github.io/OpenCore-Install-Guide/), then install the driver.
 
 Support the work: https://buymeacoffee.com/nullmoth
 
 | | |
 |---|---|
-| macOS | 15 Sequoia (tested 15.7.x and 15.8.1), x86_64 |
-| GPUs | NVIDIA Turing and later from the GSP device table; physical validation: RTX 5060 |
+| macOS | 15.5 Sequoia or later (tested 15.7.x and 15.8.1), or 26 Tahoe, x86_64 |
+| GPUs | NVIDIA Turing and later; developed on an RTX 5060 |
 | Metal | Metal 3: argument buffers tier 2, ray tracing, mesh shaders, MPS, MetalFX path |
 | Also | OpenGL (through Apple's GL-on-Metal), OpenCL, Core Image, Core ML |
 
@@ -37,45 +38,54 @@ Metal app ─► NVMTLDriver.bundle ─► translator (Apple AIR → SPIR-V) ─
 | Shader translator | inside the plugin (`libnvmtl_translate.dylib`) | `translator/` (LGPL-3.0, based on metal2vulkan) |
 | Vulkan back end (NVK) | `/Library/GPUBundles/nvmtl/` | `nvk/nvk-macos.patch` on Mesa `17ca6174` |
 | Kernel extensions | `/Library/Extensions/NVRM, NVAccel, NVRMFB, NVRMAGDC` | `kexts/` |
-| GPU firmware (GSP) | `/Users/Shared/nvfw/nvidia/610.57.04` | NVIDIA, unmodified |
+| GPU firmware (GSP) | `/Library/NullMoth/nvfw/nvidia/615.78.08` | NVIDIA, unmodified |
 
 The kernel side runs NVIDIA's own open GPU kernel modules (r610) under macOS. NVRMFB is the display framebuffer,
 NVAccel the accelerator WindowServer composites through, NVRMAGDC the display-policy shim.
 
-## Install — prebuilt (recommended)
+## Install — by hand
+
+Use the 1401 Mac app below unless you manage your OpenCore config yourself. `install.sh` installs the driver files but
+does not change OpenCore, and the driver does not start until OpenCore has these settings:
+
+- `boot-args` include `nvfb=1 nvaccel=1 nvfbheads=4 -nvkmsnosmooth amfi_get_out_of_my_way=0x1 amfi=0x80
+  ipc_control_port_options=0`, and not `nv_disable=1` or `-wegnoegpu` (both hide the NVIDIA card)
+- `csr-active-config` includes the bits `0x0A43`
+- `Misc > Security > SecureBootModel` is `Disabled`
+- `Lilu.kext` and `AMFIPass.kext` are in `Kernel > Add` and enabled
 
 Download `nullmoth-nvidia-<version>.tar.gz` from **Releases**, then:
 
 ```bash
 tar -xzf nullmoth-nvidia-*.tar.gz && cd pkgroot
-shasum -a 256 -c SHA256SUMS          # every file must say OK
-sudo ./install.sh                    # copies the files, rebuilds the Auxiliary Kernel Collection
-sudo shutdown -r now                 # a reboot is required: logout does not load the driver
+shasum -a 256 -c SHA256SUMS
+sudo ./install.sh
+sudo shutdown -r now
 ```
+
+Every file must say OK in the check. `install.sh` copies the files and rebuilds the Auxiliary Kernel Collection; the
+restart is required, because logging out does not load the driver. (Paste the lines without anything after them: the
+Terminal on macOS does not treat `#` as a comment, so a pasted comment becomes part of the command.)
 
 macOS asks you to **allow the extensions** in System Settings → Privacy & Security the first time. Allow, then reboot again.
 
-## 1401 Mac app (easiest)
+## 1401 Mac app (recommended)
 
 Download the latest `1401-Mac-<version>.dmg` from **Releases**, open it, and run **1401** (the driver package is inside the disk
-image, so nothing else to download). Follow its four steps. It works on any OpenCore
-setup, whether 1401 built it or you did: it finds the OpenCore that started your Mac (in `EFI/OC` or `EFI/BOOT`, on an
+image, so nothing else to download). Follow its steps. A supported setup must use a verified or explicitly selected OpenCore partition. The app finds the OpenCore that started your Mac (in `EFI/OC` or `EFI/BOOT`, on an
 EFI or FAT32 partition), shows every change before making it, backs the config up, installs the driver, and adds
 **1401: Remove NVIDIA driver** to the OpenCore boot picker. Choosing that entry removes the driver at the next start and
 puts the Mac back exactly as it was before the install, OpenCore config included, then restarts by itself. The app also
 maps your USB ports and, if the driver ever crashes the Mac, offers to make a crash report you can upload yourself
 (it never sends anything on its own).
 
-**Something not working?** Open 1401 > Crash report > **Send logs to NullMoth**. It sends what 1401 did, the driver's
-state, driver crash reports, recent WindowServer crash reports and OpenCore's startup logs (names, serial numbers and addresses removed), each
-with a SHA-256 the site checks, and shows a report ID to quote in the NullMoth Discord.
+If something goes wrong, open 1401 > Crash report > Send logs to NullMoth. It uploads what 1401 did, the driver's
+state, crash reports and OpenCore's startup log, with names, serial numbers and addresses removed, and gives you a
+report ID to put in your issue or in Discord.
 
-**macOS 26 Tahoe (beta):** the package carries a Tahoe build of NVAccel. Click **Prepare this Mac for Tahoe** before updating
-in System Settings; the first start of Tahoe sets the driver up and restarts once. Not yet tested on hardware.
-
-**Keep the USB stick or disk OpenCore started your Mac from plugged in** while the app runs: that is the config it
-changes. It only edits a config whose SMBIOS model matches this Mac, and stops if none is connected. After the install,
-restart; the first start with the driver pauses for up to a minute at "PCI configuration end" while the GPU comes up.
+Keep the USB stick or disk that OpenCore started from plugged in while the app runs, and for every restart after:
+that is the config the app changes. The app never copies OpenCore to your internal disk. The first start with the
+driver pauses for up to a minute at "PCI configuration end" while the GPU comes up.
 
 ## Wiring into an existing OpenCore setup
 
@@ -87,33 +97,47 @@ them from `EFI/OC/Kexts`. OpenCore only needs to set SIP and boot-args.
 | Key | Value | Why |
 |---|---|---|
 | `csr-active-config` | `<430A0000>` (Data) | the tested value: unsigned kexts, plus what root patches need |
-| `boot-args` | `nvfb=1 nvaccel=1 nvfbheads=4 -nvkmsnosmooth amfi_get_out_of_my_way=0x1 amfi=0x80` | framebuffer + accelerator, 4 display heads; the AMFI args let WindowServer load the driver bundle |
+| `boot-args` | `nvfb=1 nvaccel=1 nvfbheads=4 -nvkmsnosmooth amfi_get_out_of_my_way=0x1 amfi=0x80 ipc_control_port_options=0` | framebuffer + accelerator, 4 display heads; the AMFI args let WindowServer load the driver bundle |
+
+Optional boot arguments, for troubleshooting:
+
+| boot-arg | Effect |
+|---|---|
+| `-nvrmnoflip` | keeps the composited frame on the copy path: NVRM never turns on zero-copy scan-out (`debug.nvaccel_iop_flip`), so the display reads a finished copy instead of the surface the GPU may still be drawing. Try it first when the desktop flashes or tears while the cursor moves. |
+| `-nvrmnogo` | the driver idles until `nvrmctl go <pass>` instead of starting the GPU itself. |
+| `-nvrmnobootscreen` | do not snapshot the boot screen. |
+| `-nvrmnopm` | turns off system sleep support: NVRM stays out of the power tree, as before it had one. A Mac that sleeps then comes back without the GPU. See [docs/SLEEP-WAKE.md](docs/SLEEP-WAKE.md). |
 
 Add every key you set to `NVRAM → Delete` as well, so the values are rewritten each boot.
 
 | Setting | Value | Why |
 |---|---|---|
-| `UEFI → Quirks → ResizeGpuBars` | `13` | 8 GB BAR: full memory bandwidth (tested on the RTX 5060) |
-| `Booter → Quirks → ResizeAppleGpuBars` | `-1` | macOS sees the full BAR |
+| `UEFI → Quirks → ResizeGpuBars` | keep the existing value | Forced resizing can stop firmware before the picker; `-1` preserves firmware sizing |
+| `Booter → Quirks → ResizeAppleGpuBars` | keep the existing value | Large firmware BARs can stop PCI configuration; `0` is the installer-safe small-BAR setting |
 | `Kernel → Block` | `com.apple.iokit.IONDRVSupport`, Strategy `Exclude` | otherwise the firmware framebuffer takes display index 0 from NVRMFB |
 | `Misc → Security → SecureBootModel` | `Disabled` | Apple Secure Boot refuses kexts Apple did not sign |
 
-The macOS **installer** needs the opposite BAR settings (`ResizeAppleGpuBars` `0`, `ResizeGpuBars` `-1`, IONDRVSupport
-not excluded): it has no NVIDIA driver and runs on the firmware's screen. 1401 builds installers that way, and the 1401
-Mac app switches to the values above when it installs the driver.
+The macOS **installer** uses `ResizeAppleGpuBars` `0`, `ResizeGpuBars` `-1`, and IONDRVSupport
+not excluded: it runs on the firmware framebuffer. The Mac app keeps your existing BAR settings when it installs or
+updates the driver, and the driver sets up the BAR itself after macOS starts, so don't copy BAR values from someone
+else's board.
 
 Also required:
 - **BIOS:** Above 4G Decoding ON (the card maps memory above 4 GB), CSM OFF.
 - **SMBIOS:** a Mac model that runs macOS 15 with a discrete GPU (tested: `iMacPro1,1`, which 1401 uses).
 - **Remove** any `nv_disable=1`, WhateverGreen NVIDIA patches, or `agdpmod=pikera` for this card.
+- **With WhateverGreen installed** (for an Intel or AMD GPU), add `gfxrst=4` to boot-args. Without it, WhateverGreen's
+  boot screen copy can read freed memory when the NVIDIA display opens, and the Mac panics.
 - **No `DeviceProperties`** are needed for the NVIDIA card.
 
 Verify after the reboot:
 
 ```bash
-kmutil showloaded --list-only | grep nullmoth      # 4 lines
-system_profiler SPDisplaysDataType | head -20      # your GeForce, Metal: supported
+kmutil showloaded --list-only | grep nullmoth
+system_profiler SPDisplaysDataType | head -20
 ```
+
+The first shows 4 lines; the second shows your GeForce with Metal: supported.
 
 ## Dual boot
 
@@ -128,14 +152,22 @@ sudo ./uninstall.sh && sudo shutdown -r now
 
 ## Build from source
 
-Requires Xcode 16, Rust (stable), Meson/Ninja, and NVIDIA's `open-gpu-kernel-modules` at tag `610.57.04`.
+Requires Xcode 16, Rust (stable), Meson/Ninja, and NVIDIA's `open-gpu-kernel-modules` at tag `615.78.08`.
 
 ```bash
-build/build_xlate.sh       # translator  -> libnvmtl_translate.dylib
-RELEASE=1 build/build_plugin.sh   # plugin -> NVMTLDriver.bundle (RELEASE=1 strips every diagnostic)
-build/build263.sh          # NVK: apply nvk/nvk-macos.patch to Mesa 17ca6174 first
-build/accel_build.sh <src> <out>  # kexts
+build/build_xlate.sh
+RELEASE=1 build/build_plugin.sh
+build/build263.sh
+build/accel_build.sh <src> <out>
+build/accel_build_all.sh kexts/NVRM <out>
 ```
+
+In order: the translator (`libnvmtl_translate.dylib`); the plugin (`NVMTLDriver.bundle`; `RELEASE=1` strips every
+diagnostic); NVK (apply `nvk/nvk-macos.patch` to Mesa `17ca6174` first); the kexts; and NVAccel for macOS 15 and 26
+(`NM_TAHOE=1`), written to `<out>/15` and `<out>/26`.
+
+Rebuild both accelerators whenever `nvrm_vram_abi.h` or `nvrm_gpuva_abi.h` changes: an accelerator built against an
+older ABI loads, but NVRMFB refuses all its VRAM requests and the desktop stays black.
 
 ## License
 

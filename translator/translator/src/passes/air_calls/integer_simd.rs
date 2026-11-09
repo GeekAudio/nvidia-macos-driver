@@ -919,6 +919,31 @@ fn lower_quad_vote(
     ])
 }
 
+/// The subgroup lane of the first ACTIVE lane in this lane's 32-lane Metal SIMD-group. simd_broadcast_first and
+/// simd_is_first are defined over active lanes; taking the cluster's lane 0 read an inactive lane wherever lane 0 was not
+/// running (outside the primitive, a discarded pixel, a branch it did not take) and broadcast garbage: Eevee's light loop
+/// took its word range from it and ran for ~10^8 iterations per pixel until the channel timed out.
+fn metal_simd_first_active_lane_u32(ctx: &mut Ctx, lane: Word, insts: &mut Vec<Instruction>) -> Word {
+    let uint = ctx.ty_uint();
+    let bool_ty = ctx.ty_bool();
+    let truth = ctx.const_bool_of(bool_ty, true);
+    let simd_lane = metal_simd_lane_local_u32(ctx, lane, insts);
+    let base = metal_simd_lane_base_u32(ctx, lane, simd_lane, insts);
+    // the cluster's 32 bits are one word of the ballot, because clusters are 32-lane aligned
+    let word = subgroup_partition_ballot_word(ctx, insts, lane, truth);
+    let ext = ctx.glsl();
+    let first_bit = ctx.module.fresh_id();
+    insts.push(Instruction::new(
+        Op::ExtInst,
+        Some(uint),
+        Some(first_bit),
+        vec![Operand::IdRef(ext), Operand::LiteralExtInstInteger(GLSLstd450::FindILsb as u32), Operand::IdRef(word)],
+    ));
+    let first = ctx.module.fresh_id();
+    insts.push(Instruction::new(Op::IAdd, Some(uint), Some(first), vec![Operand::IdRef(base), Operand::IdRef(first_bit)]));
+    first
+}
+
 fn subgroup_partition_ballot_word(
     ctx: &mut Ctx,
     insts: &mut Vec<Instruction>,
@@ -1152,12 +1177,12 @@ pub(in crate::passes) fn lower_simd_op(
         }
         let mut insts = Vec::new();
         let lane = subgroup_lane_index_u32(ctx, &mut insts);
-        let simd_lane = metal_simd_lane_local_u32(ctx, lane, &mut insts);
+        let first = metal_simd_first_active_lane_u32(ctx, lane, &mut insts);
         insts.push(Instruction::new(
             Op::IEqual,
             Some(rty),
             Some(res),
-            vec![Operand::IdRef(simd_lane), Operand::IdRef(ctx.const_uint(0))],
+            vec![Operand::IdRef(lane), Operand::IdRef(first)],
         ));
         return Ok(Some(insts));
     }
@@ -1165,8 +1190,7 @@ pub(in crate::passes) fn lower_simd_op(
         let scope = ctx.const_uint(Scope::Subgroup as u32);
         let mut insts = Vec::new();
         let lane = subgroup_lane_index_u32(ctx, &mut insts);
-        let simd_lane = metal_simd_lane_local_u32(ctx, lane, &mut insts);
-        let base_lane = metal_simd_lane_base_u32(ctx, lane, simd_lane, &mut insts);
+        let first = metal_simd_first_active_lane_u32(ctx, lane, &mut insts);
         insts.push(Instruction::new(
             Op::GroupNonUniformShuffle,
             Some(rty),
@@ -1174,7 +1198,7 @@ pub(in crate::passes) fn lower_simd_op(
             vec![
                 Operand::IdScope(scope),
                 Operand::IdRef(args[0]),
-                Operand::IdRef(base_lane),
+                Operand::IdRef(first),
             ],
         ));
         return Ok(Some(insts));
@@ -1425,6 +1449,24 @@ pub(in crate::passes) fn lower_one(
                      silently drop what the call does"
                 ))
             }
+            // Only an explicit target capability may establish that no map can be bound.
+            // A generic translator cannot infer identity from opaque runtime map bytes.
+            // METAL2VULKAN_NO_RRM_IDENTITY restores refusal even for that target.
+            Some(crate::air_intrinsics::AirIntrinsicDisposition::RequiresResourceModel)
+                if crate::air_intrinsics::is_rasterization_rate_map_helper(name)
+                    && ctx.no_rasterization_rate_maps
+                    && !crate::env_vars::no_rrm_identity() =>
+            {
+                let (Some(res), Some(rty), Some(&coord)) = (res, rty, args.first()) else {
+                    return Err(format!("{name}: expected a result and a coordinate operand"));
+                };
+                return Ok(vec![Instruction::new(
+                    Op::CopyObject,
+                    Some(rty),
+                    Some(res),
+                    vec![Operand::IdRef(coord)],
+                )]);
+            }
             Some(crate::air_intrinsics::AirIntrinsicDisposition::RequiresResourceModel) => {
                 return Err(format!(
                     "AIR family {name} requires rasterization-rate-map parameter data decoding; \
@@ -1437,6 +1479,9 @@ pub(in crate::passes) fn lower_one(
     if let Some(builtin) = cl_work_item_builtin(name) {
         return lower_cl_work_item(ctx, name, builtin, res, rty, args);
     }
+    if let Some(global) = cl_size_query(name) {
+        return lower_cl_size(ctx, name, global, res, rty, args);
+    }
     if name == "air.get_sample_position.v2f32" {
         return lower_sample_position(ctx, res, rty, args);
     }
@@ -1448,6 +1493,9 @@ pub(in crate::passes) fn lower_one(
     }
     if name.starts_with("air.gather_depth") {
         return lower_gather_depth(ctx, name, res, rty, args, v4);
+    }
+    if name.starts_with("air.gather_compare_depth") {
+        return lower_gather_compare_depth(ctx, name, res, rty, args, v4);
     }
     if name.starts_with("air.sample_compare_depth") {
         return lower_sample_compare_depth(ctx, name, res, rty, args, v4);
@@ -1607,6 +1655,9 @@ pub(in crate::passes) fn lower_one(
     if name.starts_with("air.simdgroup_matrix_8x8_init_diag.") {
         return lower_simdgroup_matrix_8x8_init_diag(ctx, res, rty, args);
     }
+    if name.starts_with("air.simdgroup_matrix_8x8_init_filled.") {
+        return lower_simdgroup_matrix_8x8_init_filled(ctx, res, rty, args);
+    }
     if name.starts_with("air.simdgroup_matrix_8x8_load.") {
         return lower_simdgroup_matrix_8x8_load(ctx, res, rty, args);
     }
@@ -1678,6 +1729,92 @@ fn cl_work_item_builtin(name: &str) -> Option<BuiltIn> {
         "get_num_groups" => Some(BuiltIn::NumWorkgroups),
         _ => None,
     }
+}
+
+// OpenCL get_local_size / get_global_size (Apple's OpenCL hands its kernels to the Metal driver as AIR). Geekbench 6's
+// OpenCL run stopped at its first workload: gemm and softmax kernels use get_local_size, the translation failed, and
+// clSetKernelArg returned CL_INVALID_ARG_INDEX (-49) for a kernel that had no function. The local size is the pipeline's
+// WorkgroupSize (the same spec constants [[threads_per_threadgroup]] reads); the global size is groups x local size.
+fn cl_size_query(name: &str) -> Option<bool> {
+    match name {
+        "air.get_local_size.i32" => Some(false),
+        "air.get_global_size.i32" => Some(true),
+        _ => None,
+    }
+}
+
+fn lower_cl_size(
+    ctx: &mut Ctx,
+    name: &str,
+    global: bool,
+    res: Option<Word>,
+    rty: Option<Word>,
+    args: &[Word],
+) -> Result<Vec<Instruction>, String> {
+    let (Some(res), Some(rty), Some(&dim)) = (res, rty, args.first()) else {
+        return Err(format!("{name}: expected one dimension operand and a result"));
+    };
+    let uint = ctx.ty_uint();
+    let v3 = ctx.ty_vec_uint(3);
+    let size = ctx.kernel_workgroup_size_id();
+    let mut insts = Vec::new();
+    let vector = if global {
+        let groups = match existing_builtin_input_var(ctx, BuiltIn::NumWorkgroups, v3) {
+            Some(var) => var,
+            None => {
+                let ptr_ty = ctx.ty_ptr(StorageClass::Input, v3);
+                let var = ctx.module.fresh_id();
+                ctx.new_globals.push(Instruction::new(
+                    Op::Variable,
+                    Some(ptr_ty),
+                    Some(var),
+                    vec![Operand::StorageClass(StorageClass::Input)],
+                ));
+                ctx.module.annotations.push(Instruction::new(
+                    Op::Decorate,
+                    None,
+                    None,
+                    vec![
+                        Operand::IdRef(var),
+                        Operand::Decoration(Decoration::BuiltIn),
+                        Operand::BuiltIn(BuiltIn::NumWorkgroups),
+                    ],
+                ));
+                ctx.interface.push(var);
+                var
+            }
+        };
+        let loaded = ctx.module.fresh_id();
+        insts.push(Instruction::new(Op::Load, Some(v3), Some(loaded), vec![Operand::IdRef(groups)]));
+        let product = ctx.module.fresh_id();
+        insts.push(Instruction::new(
+            Op::IMul,
+            Some(v3),
+            Some(product),
+            vec![Operand::IdRef(loaded), Operand::IdRef(size)],
+        ));
+        product
+    } else {
+        size
+    };
+    if rty == uint {
+        insts.push(Instruction::new(
+            Op::VectorExtractDynamic,
+            Some(rty),
+            Some(res),
+            vec![Operand::IdRef(vector), Operand::IdRef(dim)],
+        ));
+    } else {
+        let lane = ctx.module.fresh_id();
+        insts.push(Instruction::new(
+            Op::VectorExtractDynamic,
+            Some(uint),
+            Some(lane),
+            vec![Operand::IdRef(vector), Operand::IdRef(dim)],
+        ));
+        insts.push(Instruction::new(Op::Bitcast, Some(rty), Some(res), vec![Operand::IdRef(lane)]));
+    }
+    Ok(insts)
 }
 
 fn lower_cl_work_item(

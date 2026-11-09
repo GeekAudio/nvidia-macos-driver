@@ -29,6 +29,17 @@ struct nv_xnu_pci_slot {
 };
 extern "C" {
 void nv_xnu_register_pci(IOPCIDevice *pci, NvU32 domain, NvU8 bus, NvU8 slot, NvU8 function);
+void nv_xnu_register_all_pci(void);
+NvBool nvkms_xnu_backlight(NvBool set, NvU32 *percent);   // os-nvkms-xnu.cpp: laptop panel brightness
 void *kern_os_malloc(size_t size);
 void  kern_os_free(void *addr);
+// System sleep gate (NVRM.cpp), the nv_system_pm_lock of nv.c: macOS does not freeze processes for sleep, so every
+// call into RM made for a client waits here while the GPU is in standby. Returns whether the caller was counted.
+int  nv_xnu_pm_enter(void);
+void nv_xnu_pm_exit(int counted);
 }
+struct NvXnuPmUse {
+    int counted;
+    explicit NvXnuPmUse(bool use = true) : counted(use ? nv_xnu_pm_enter() : 0) {}
+    ~NvXnuPmUse() { nv_xnu_pm_exit(counted); }
+};

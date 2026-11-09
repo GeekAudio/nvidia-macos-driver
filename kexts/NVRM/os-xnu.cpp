@@ -5,6 +5,8 @@
  */
 
 #include "nv-xnu.h"
+
+extern "C" void nv_xnu_power_state(bool *acPlugged, bool *haveBattery);   // nv_xnu_power.cpp
 #include <sys/kauth.h>
 #include <mach/mach_time.h>
 #include <mach/semaphore.h>
@@ -62,6 +64,15 @@ int NV_API_CALL nv_printf(NvU32 debuglevel, const char *printf_format, ...)
     va_list ap; va_start(ap, printf_format);
     vsnprintf(buf, sizeof buf, printf_format, ap);
     va_end(ap);
+    buf[sizeof buf - 1] = 0;
+    kprintf("%s", buf);
+    IOLog("%s", buf);
+    return 0;
+}
+int NV_API_CALL nv_dev_vprintf(struct nv_state_t *nv, NV_LOG_LEVEL level, const char *format, va_list ap)
+{ NV_XNU_TRC;
+    char buf[512];
+    vsnprintf(buf, sizeof buf, format, ap);
     buf[sizeof buf - 1] = 0;
     kprintf("%s", buf);
     IOLog("%s", buf);
@@ -133,18 +144,41 @@ NV_STATUS NV_API_CALL os_acquire_mutex(void *p) { NV_XNU_TRC; IOLockLock((IOLock
 NV_STATUS NV_API_CALL os_cond_acquire_mutex(void *p) { NV_XNU_TRC; return IOLockTryLock((IOLock *)p) ? NV_OK : NV_ERR_TIMEOUT_RETRY; }
 void      NV_API_CALL os_release_mutex(void *p) { NV_XNU_TRC; IOLockUnlock((IOLock *)p); }
 
-struct nv_xnu_spin { IOSimpleLock *l; IOInterruptState s; };
+// The saved interrupt state is CARRIED BY THE CALLER, never stored in the lock.
+//
+// This used to hold the state in the lock object: acquire did `sp->s = IOSimpleLockLockDisableInterrupt(...)`
+// and returned 0, and release passed `sp->s` back. That is a kernel panic, and it was reported 37 times in the
+// Support logs as
+//     panic [kalloc.type.varN.16]: element modified after free (off:8, val:0x0000000000000002, sz:16)
+// with the trace NVRM::autoGo -> rm_init_rm -> RmInitRm -> nvlogInit -> tlsInitialize ->
+// portSyncSpinlockCreate -> os_alloc_spinlock -> kern_os_malloc -> kalloc_ext. The figures identify it
+// exactly: the old struct was 16 bytes, `s` sat at offset 8, and a saved interrupt mask is a small integer
+// like 0x2 - so the allocator was reporting OUR write at offset 8 of a 16-byte block that had already been
+// freed. Two ways it goes wrong, and both were live:
+//   - two CPUs holding the same lock overwrite each other's saved state, so one of them restores the wrong
+//     interrupt mask on release;
+//   - a lock freed while a thread sits between acquire and release gets `sp->s` written after the free,
+//     which is the poison the allocator catches at the next 16-byte allocation - usually the next spinlock
+//     this very driver asks for during init, which is why the panic kept landing on NVRM's own start-up.
+// The allocator reports corruption at the NEXT allocation of that size class, so a trace like the one above
+// names the finder, not always the culprit; here they are the same code, and the numbers (size 16, offset 8,
+// a small mask value) tie the report to this struct rather than to a guess.
+//
+// NVIDIA's own contract is plain in the signatures it declares for us: acquire RETURNS the state and release
+// is handed it back as `old`. Honouring it removes the shared mutable field altogether, so the lock object is
+// immutable once created and there is nothing for a late writer to corrupt.
+struct nv_xnu_spin { IOSimpleLock *l; };
 NV_STATUS NV_API_CALL os_alloc_spinlock(void **pp)
 { NV_XNU_TRC;
     nv_xnu_spin *sp = (nv_xnu_spin *)kern_os_malloc(sizeof *sp);
     if (!sp) return NV_ERR_NO_MEMORY;
-    sp->l = IOSimpleLockAlloc(); sp->s = 0;
+    sp->l = IOSimpleLockAlloc();
     if (!sp->l) { kern_os_free(sp); return NV_ERR_NO_MEMORY; }
     *pp = sp; return NV_OK;
 }
 void  NV_API_CALL os_free_spinlock(void *p) { NV_XNU_TRC; nv_xnu_spin *sp = (nv_xnu_spin *)p; if (sp) { IOSimpleLockFree(sp->l); kern_os_free(sp); } }
-NvU64 NV_API_CALL os_acquire_spinlock(void *p) { NV_XNU_TRC; nv_xnu_spin *sp = (nv_xnu_spin *)p; sp->s = IOSimpleLockLockDisableInterrupt(sp->l); return 0; }
-void  NV_API_CALL os_release_spinlock(void *p, NvU64 old) { NV_XNU_TRC; nv_xnu_spin *sp = (nv_xnu_spin *)p; IOSimpleLockUnlockEnableInterrupt(sp->l, sp->s); }
+NvU64 NV_API_CALL os_acquire_spinlock(void *p) { NV_XNU_TRC; nv_xnu_spin *sp = (nv_xnu_spin *)p; return (NvU64)IOSimpleLockLockDisableInterrupt(sp->l); }
+void  NV_API_CALL os_release_spinlock(void *p, NvU64 old) { NV_XNU_TRC; nv_xnu_spin *sp = (nv_xnu_spin *)p; IOSimpleLockUnlockEnableInterrupt(sp->l, (IOInterruptState)old); }
 
 void     *NV_API_CALL os_alloc_rwlock(void) { NV_XNU_TRC; return IORWLockAlloc(); }
 void      NV_API_CALL os_free_rwlock(void *p) { NV_XNU_TRC; if (p) IORWLockFree((IORWLock *)p); }
@@ -171,14 +205,16 @@ NvBool NV_API_CALL os_semaphore_may_sleep(void) { NV_XNU_TRC; return NV_TRUE; }
 volatile thread_t nv_xnu_isr_thread = NULL;
 volatile int nv_xnu_in_isr = 0;
 NvBool NV_API_CALL os_is_isr(void) { return (nv_xnu_isr_thread != NULL && nv_xnu_isr_thread == current_thread()) ? NV_TRUE : NV_FALSE; }
-NvBool NV_API_CALL os_is_administrator(void) { NV_XNU_TRC; return NV_TRUE; }
+NvBool NV_API_CALL os_is_administrator(void) { NV_XNU_TRC; return (kauth_getuid() == 0) ? NV_TRUE : NV_FALSE; }
 NV_STATUS NV_API_CALL os_get_euid(NvU32 *pSecToken) { NV_XNU_TRC; if (!pSecToken) return NV_ERR_INVALID_ARGUMENT; *pSecToken = (NvU32)kauth_getuid(); return NV_OK; }
 
 NvU64 NV_API_CALL os_get_monotonic_time_ns(void)    { NV_XNU_TRC; uint64_t ns; absolutetime_to_nanoseconds(mach_absolute_time(), &ns); return ns; }
 NvU64 NV_API_CALL os_get_monotonic_time_ns_hr(void) { NV_XNU_TRC; uint64_t ns; absolutetime_to_nanoseconds(mach_absolute_time(), &ns); return ns; }
 NV_STATUS NV_API_CALL os_get_system_time(NvU32 *sec, NvU32 *usec) { NV_XNU_TRC; clock_sec_t s; clock_usec_t us; clock_get_calendar_microtime(&s, &us); *sec = (NvU32)s; *usec = (NvU32)us; return NV_OK; }
-NvBool NV_API_CALL nv_is_chassis_notebook(void)     { NV_XNU_TRC; return NV_FALSE; }
-NvBool NV_API_CALL nv_acpi_is_battery_present(void) { NV_XNU_TRC; return NV_FALSE; }
+// A battery means a notebook, and the firmware asks both questions to decide whether to run its mobile policy at
+// all. Both used to answer a flat no, so a laptop was treated as a desktop no matter what it was running on.
+NvBool NV_API_CALL nv_is_chassis_notebook(void)     { NV_XNU_TRC; bool ac, bat; nv_xnu_power_state(&ac, &bat); return bat ? NV_TRUE : NV_FALSE; }
+NvBool NV_API_CALL nv_acpi_is_battery_present(void) { NV_XNU_TRC; bool ac, bat; nv_xnu_power_state(&ac, &bat); return bat ? NV_TRUE : NV_FALSE; }
 NvBool NV_API_CALL nv_platform_supports_s0ix(void)  { NV_XNU_TRC; return NV_FALSE; }
 NvBool NV_API_CALL os_is_nvswitch_present(void)     { NV_XNU_TRC; return NV_FALSE; }
 
@@ -193,11 +229,46 @@ void  NV_API_CALL os_put_pid_info(void *pid_info) { NV_XNU_TRC;}
 NV_STATUS NV_API_CALL os_find_ns_pid(void *pid_info, NvU32 *ns_pid) { NV_XNU_TRC; return NV_ERR_NOT_SUPPORTED; }
 NV_STATUS NV_API_CALL os_get_random_bytes(NvU8 *buf, NvU16 n) { NV_XNU_TRC; read_random(buf, n); return NV_OK; }
 
-static nv_xnu_pci_slot nv_xnu_slots[8];
+#define NV_XNU_MAX_PCI 256
+static nv_xnu_pci_slot nv_xnu_slots[NV_XNU_MAX_PCI];
 static int nv_xnu_nslots;
 void nv_xnu_register_pci(IOPCIDevice *pci, NvU32 domain, NvU8 bus, NvU8 slot, NvU8 function)
 {
-    if (nv_xnu_nslots < 8) { nv_xnu_slots[nv_xnu_nslots++] = { pci, domain, bus, slot, function }; }
+    if (!pci) return;
+    for (int i = 0; i < nv_xnu_nslots; i++) {
+        nv_xnu_pci_slot *s = &nv_xnu_slots[i];
+        if (s->pci == pci ||
+            (s->domain == domain && s->bus == bus && s->slot == slot && s->function == function)) {
+            return; // already registered
+        }
+    }
+    // Retained: RM keeps these handles for config-space access for as long as the driver runs, and a device behind
+    // Thunderbolt or a dock can be terminated meanwhile. The table lives as long as the kext.
+    if (nv_xnu_nslots < NV_XNU_MAX_PCI) { pci->retain(); nv_xnu_slots[nv_xnu_nslots++] = { pci, domain, bus, slot, function }; }
+}
+
+// The RM enumerates the whole PCI tree through os_pci_init_handle to find the
+// host bridge (FHB), root ports and P2P bridges for its chipset object. Only the
+// GPU used to be registered here, so that enumeration came up empty and the RM
+// logged "FHB/P2P/3DCTRL not found in cached bus topology" + "Unable to get PCI
+// port handles". Walk every IOPCIDevice in the IORegistry and register them all
+// so the RM sees the real topology.
+void nv_xnu_register_all_pci(void)
+{
+    OSDictionary *match = IOService::serviceMatching("IOPCIDevice");
+    if (!match) return;
+    OSIterator *it = IOService::getMatchingServices(match);
+    if (it) {
+        OSObject *obj;
+        while ((obj = it->getNextObject()) != NULL) {
+            IOPCIDevice *pd = OSDynamicCast(IOPCIDevice, obj);
+            if (pd) {
+                nv_xnu_register_pci(pd, 0, pd->getBusNumber(), pd->getDeviceNumber(), pd->getFunctionNumber());
+            }
+        }
+        it->release();
+    }
+    match->release();
 }
 void *NV_API_CALL os_pci_init_handle(NvU32 domain, NvU8 bus, NvU8 slot, NvU8 function, NvU16 *vendor, NvU16 *device)
 { NV_XNU_TRC;
@@ -214,6 +285,37 @@ void *NV_API_CALL os_pci_init_handle(NvU32 domain, NvU8 bus, NvU8 slot, NvU8 fun
 #define NV_PCI_H(h) do { if (!(h)) { static bool _w; if (!_w) { _w = true; kprintf("NVRM-xnu: %s: NULL pci handle\n", __func__); } return NV_ERR_INVALID_ARGUMENT; } } while (0)
 NV_STATUS NV_API_CALL os_pci_read_byte(void *h, NvU32 off, NvU8 *v)   { NV_XNU_TRC; NV_PCI_H(h); *v = ((nv_xnu_pci_slot *)h)->pci->configRead8(off);  return NV_OK; }
 NV_STATUS NV_API_CALL os_pci_read_word(void *h, NvU32 off, NvU16 *v)  { NV_XNU_TRC; NV_PCI_H(h); *v = ((nv_xnu_pci_slot *)h)->pci->configRead16(off); return NV_OK; }
+// The GPU's Product Device Identifier lives in NVIDIA's DVSEC 3 in PCIe extended config space; RM builds the GPU UUID
+// from it the way NVIDIA's own driver does (nv-pci.c). A board without that capability answers NOT_SUPPORTED and RM
+// falls back to the PBI read. The walk is bounded the way nv-pci.c bounds it: offsets 0x100..0xfff, DWORD aligned,
+// at most (0x1000 - 0x100) / 8 links, since a malformed chain must not loop.
+NV_STATUS NV_API_CALL nv_pci_read_gpu_pdi_from_dvsec(nv_state_t *nv, NvU64 *pdi)
+{ NV_XNU_TRC;
+    if (!nv || !pdi || !nv->handle) return NV_ERR_INVALID_ARGUMENT;
+    IOPCIDevice *pci = ((nv_xnu_pci_slot *)nv->handle)->pci;
+    if (!pci) return NV_ERR_INVALID_ARGUMENT;
+    NvU32 cap = 0x100;
+    for (NvU32 i = 0; i < (0x1000 - 0x100) / 8; i++) {
+        if (cap < 0x100 || cap >= 0x1000 || (cap & 3)) return NV_ERR_INVALID_OFFSET;
+        const NvU32 hdr0 = pci->extendedConfigRead32(cap);
+        if (hdr0 == 0xffffffffu) return NV_ERR_INVALID_READ;
+        if ((hdr0 & 0xffff) == 0x0023) {                       // DVSEC
+            const NvU32 hdr1 = pci->extendedConfigRead32(cap + 0x4);
+            const NvU32 hdr2 = pci->extendedConfigRead32(cap + 0x8);
+            if ((hdr1 & 0xffff) == 0x10de && (hdr2 & 0xffff) == 0x3) {   // NVIDIA, DVSEC 3 = GPU PDI
+                const NvU32 len = (hdr1 >> 20) & 0xfff;
+                if (len < 0x14 || cap > 0x1000 - 0x14) return NV_ERR_INVALID_DATA;
+                const NvU64 v = ((NvU64)pci->extendedConfigRead32(cap + 0x10) << 32) | pci->extendedConfigRead32(cap + 0xc);
+                if (v == 0 || v == ~0ull) return NV_ERR_NOT_SUPPORTED;
+                *pdi = v;
+                return NV_OK;
+            }
+        }
+        cap = (hdr0 >> 20) & 0xfff;
+        if (cap == 0) return NV_ERR_NOT_SUPPORTED;
+    }
+    return NV_ERR_INVALID_OFFSET;
+}
 NV_STATUS NV_API_CALL os_pci_read_dword(void *h, NvU32 off, NvU32 *v) { NV_XNU_TRC; NV_PCI_H(h); *v = ((nv_xnu_pci_slot *)h)->pci->configRead32(off); return NV_OK; }
 NV_STATUS NV_API_CALL os_pci_write_byte(void *h, NvU32 off, NvU8 v)   { NV_XNU_TRC; NV_PCI_H(h); ((nv_xnu_pci_slot *)h)->pci->configWrite8(off, v);  return NV_OK; }
 NV_STATUS NV_API_CALL os_pci_write_word(void *h, NvU32 off, NvU16 v)  { NV_XNU_TRC; NV_PCI_H(h); ((nv_xnu_pci_slot *)h)->pci->configWrite16(off, v); return NV_OK; }
@@ -222,9 +324,31 @@ NV_STATUS NV_API_CALL os_pci_write_dword(void *h, NvU32 off, NvU32 v) { NV_XNU_T
 struct nv_xnu_map { IOMemoryDescriptor *md; IOMemoryMap *map; void *va; NvU64 phys; NvU64 size; void *alias; };
 extern "C" { void *nv_pm_alias(NvU64, NvU64, void **); void nv_pm_alias_drop(void *); bool nv_pm_is_gpu(NvU64, NvU64);
              void nv_pm_foreign(NvU64, NvU64, NvU32, void *); }
-#define NV_XNU_MAX_MAPS 1024
+// Every kernel mapping RM makes is tracked here (VA -> physical for the framebuffer's overlap and aperture checks).
+// WAS 1024: a resizable BAR1 has a 4 GB surface budget and the accelerator maps each allocation, so an RTX 3050 and
+// an RTX 5070 filled the table after ~20 minutes; every later surface then had no physical address and was refused.
+#define NV_XNU_MAX_MAPS 8192
 static nv_xnu_map nv_xnu_maps[NV_XNU_MAX_MAPS];
 static unsigned nv_xnu_maps_high;
+// Two writers used to be able to pick the same free slot, and a release could clear an entry while a lookup
+// was reading it, which is a double release of the same map or a lookup over a freed one. The writers
+// (os_map_kernel_space, os_unmap_kernel_space) are the only paths that allocate or clear a slot and both run
+// in thread context, so a mutex serialises them. The lookups, by contrast, are also reached from the
+// framebuffer's interrupt path, where a mutex is not allowed, so they stay lock-free and are made safe by
+// ordering instead: a slot's va is published LAST with a release store and cleared FIRST on teardown, so a
+// lookup that sees a va sees the rest of that entry fully written, and never reads an entry being freed.
+static IOLock *nv_xnu_maps_lock;
+extern "C" bool nv_xnu_maps_init(void)
+{
+    if (!nv_xnu_maps_lock) nv_xnu_maps_lock = IOLockAlloc();
+    return nv_xnu_maps_lock != NULL;
+}
+static inline void nv_xnu_map_publish(nv_xnu_map *m, IOMemoryDescriptor *md, IOMemoryMap *map,
+                                      void *va, NvU64 phys, NvU64 size, void *alias)
+{
+    m->md = md; m->map = map; m->phys = phys; m->size = size; m->alias = alias;
+    __atomic_store_n(&m->va, va, __ATOMIC_RELEASE);
+}
 void *NV_API_CALL os_map_kernel_space(NvU64 start, NvU64 size, NvU32 mode)
 {
     IOOptionBits cache = (mode == NV_MEMORY_CACHED) ? kIOMapDefaultCache : (mode == NV_MEMORY_WRITECOMBINED ? kIOMapWriteCombineCache : kIOMapInhibitCache);
@@ -232,7 +356,13 @@ void *NV_API_CALL os_map_kernel_space(NvU64 start, NvU64 size, NvU32 mode)
     if (!nv_pm_is_gpu(start, size)) {
         void *cookie = NULL; void *ava = nv_pm_alias(start, size, &cookie);
         if (ava) {
-            for (int i = 0; i < NV_XNU_MAX_MAPS; i++) if (nv_xnu_maps[i].va == NULL) { nv_xnu_maps[i] = { NULL, NULL, ava, start, size, cookie }; return ava; }
+            IOLockLock(nv_xnu_maps_lock);
+            for (int i = 0; i < NV_XNU_MAX_MAPS; i++) if (nv_xnu_maps[i].va == NULL) {
+                nv_xnu_map_publish(&nv_xnu_maps[i], NULL, NULL, ava, start, size, cookie);
+                if ((unsigned)i + 1 > nv_xnu_maps_high) nv_xnu_maps_high = (unsigned)i + 1;
+                break;
+            }
+            IOLockUnlock(nv_xnu_maps_lock);
             return ava;
         }
         nv_pm_foreign(start, size, mode, __builtin_return_address(0));
@@ -243,13 +373,17 @@ void *NV_API_CALL os_map_kernel_space(NvU64 start, NvU64 size, NvU32 mode)
     if (md && !map) { kprintf("NVRM-xnu:   md->map(cache=0x%x) FAILED\n", (unsigned)cache); md->release(); md = NULL; }
     void *va = map ? (void *)map->getVirtualAddress() : NULL;
     if (!va) return NULL;
+    IOLockLock(nv_xnu_maps_lock);
     for (int i = 0; i < NV_XNU_MAX_MAPS; i++) if (nv_xnu_maps[i].va == NULL) {
-        nv_xnu_maps[i] = { md, map, va, start, size };
+        nv_xnu_map_publish(&nv_xnu_maps[i], md, map, va, start, size, NULL);
         if ((unsigned)i + 1 > nv_xnu_maps_high) nv_xnu_maps_high = (unsigned)i + 1;
+        const unsigned high = nv_xnu_maps_high;
+        IOLockUnlock(nv_xnu_maps_lock);
         kprintf("NVRM-xnu:   mapped -> 0x%llx (slot %d, high water %u/%u)\n",
-                (unsigned long long)(uintptr_t)va, i, nv_xnu_maps_high, (unsigned)NV_XNU_MAX_MAPS);
+                (unsigned long long)(uintptr_t)va, i, high, (unsigned)NV_XNU_MAX_MAPS);
         return va;
     }
+    IOLockUnlock(nv_xnu_maps_lock);
     {
         static bool warned;
         if (!warned) { warned = true;
@@ -262,22 +396,38 @@ void *NV_API_CALL os_map_kernel_space(NvU64 start, NvU64 size, NvU32 mode)
 }
 NvU64 nv_xnu_phys_for_kernel_va(const void *va)
 {
-    for (int i = 0; i < NV_XNU_MAX_MAPS; i++) if (nv_xnu_maps[i].va && (const char *)va >= (const char *)nv_xnu_maps[i].va && (const char *)va < (const char *)nv_xnu_maps[i].va + nv_xnu_maps[i].size)
-        return nv_xnu_maps[i].phys + ((const char *)va - (const char *)nv_xnu_maps[i].va);
+    // Lookups stop at the high-water mark (every slot ever filled is below it), so a larger table costs nothing
+    // until it is actually used.
+    for (unsigned i = 0; i < nv_xnu_maps_high; i++) {
+        const char *base = (const char *)__atomic_load_n(&nv_xnu_maps[i].va, __ATOMIC_ACQUIRE);
+        if (base && (const char *)va >= base && (const char *)va < base + nv_xnu_maps[i].size)
+            return nv_xnu_maps[i].phys + ((const char *)va - base);
+    }
     return 0;
 }
 void NV_API_CALL os_unmap_kernel_space(void *va, NvU64 size)
 { NV_XNU_TRC;
-    for (int i = 0; i < NV_XNU_MAX_MAPS; i++) if (nv_xnu_maps[i].va == va) {
-        if (nv_xnu_maps[i].alias) nv_pm_alias_drop(nv_xnu_maps[i].alias);
-        else { nv_xnu_maps[i].map->release(); nv_xnu_maps[i].md->release(); }
-        nv_xnu_maps[i] = { NULL, NULL, NULL, 0, 0, NULL }; return;
+    IOLockLock(nv_xnu_maps_lock);
+    for (unsigned i = 0; i < nv_xnu_maps_high; i++) if (nv_xnu_maps[i].va == va) {
+        // The va goes first, so a lookup running beside this never walks into an entry being torn down.
+        __atomic_store_n(&nv_xnu_maps[i].va, (void *)NULL, __ATOMIC_RELEASE);
+        IOMemoryDescriptor *md = nv_xnu_maps[i].md; IOMemoryMap *map = nv_xnu_maps[i].map;
+        void *alias = nv_xnu_maps[i].alias;
+        nv_xnu_maps[i].md = NULL; nv_xnu_maps[i].map = NULL; nv_xnu_maps[i].alias = NULL;
+        nv_xnu_maps[i].phys = 0; nv_xnu_maps[i].size = 0;
+        IOLockUnlock(nv_xnu_maps_lock);
+        if (alias) nv_pm_alias_drop(alias);
+        else { if (map) map->release(); if (md) md->release(); }
+        return;
     }
+    IOLockUnlock(nv_xnu_maps_lock);
 }
 int nv_xnu_kmap_overlap(NvU64 phys, NvU64 len)
 {
-    for (int i = 0; i < NV_XNU_MAX_MAPS; i++)
-        if (nv_xnu_maps[i].va && !nv_xnu_maps[i].alias && phys < nv_xnu_maps[i].phys + nv_xnu_maps[i].size && nv_xnu_maps[i].phys < phys + len) return 1;
+    for (unsigned i = 0; i < nv_xnu_maps_high; i++) {
+        if (!__atomic_load_n(&nv_xnu_maps[i].va, __ATOMIC_ACQUIRE) || nv_xnu_maps[i].alias) continue;
+        if (phys < nv_xnu_maps[i].phys + nv_xnu_maps[i].size && nv_xnu_maps[i].phys < phys + len) return 1;
+    }
     return 0;
 }
 void  NV_API_CALL os_io_write_byte(NvU32 addr, NvU8 v)   { NV_XNU_TRC; __asm__ __volatile__("outb %0, %1" :: "a"(v), "d"((NvU16)addr)); }

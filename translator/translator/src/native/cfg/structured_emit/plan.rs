@@ -73,7 +73,7 @@ pub(in crate::native) fn blocks_changed(before: &[BodyBlock], after: &[BodyBlock
 pub(in crate::native) fn requires_shared_loop_entry_ownership(blocks: &[BodyBlock]) -> bool {
     let forest = analyze(blocks);
     let post_idoms = post_idom(blocks);
-    let mut predecessors = HashMap::<String, Vec<&str>>::new();
+    let mut predecessors = HashMap::<String, Vec<&str>>::default();
     for block in blocks {
         for successor in block_successors(block) {
             predecessors
@@ -126,7 +126,11 @@ pub(in crate::native) fn requires_shared_loop_entry_ownership(blocks: &[BodyBloc
 
 fn block_body_changed(left: &BodyBlock, right: &BodyBlock) -> bool {
     match (&left.typed, &right.typed) {
-        (Some(l), Some(r)) => format!("{l:?}") != format!("{r:?}"),
+        // The same `Arc` is the same body; otherwise the debug texts decide, each formatted once per planner call.
+        (Some(l), Some(r)) => {
+            !std::sync::Arc::ptr_eq(l, r)
+                && super::plan_cache::body_text(l) != super::plan_cache::body_text(r)
+        }
         (None, None) => false,
         _ => true,
     }
@@ -136,6 +140,7 @@ pub(in crate::native) fn structured_plan(blocks: &[BodyBlock]) -> Option<Structu
     if blocks.len() > STRUCTURED_PLAN_MAX_BLOCKS {
         return None;
     }
+    let _plan_cache = super::plan_cache::Scope::enter();
     let deep_shared = privatize_shared_continuations_for_ladder(blocks);
     if deep_shared.len() != blocks.len() {
         if let Some(plan) = structured_plan_ladder(&deep_shared, false) {

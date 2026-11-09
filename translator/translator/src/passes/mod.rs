@@ -1,3 +1,4 @@
+use crate::fxhash::{HashMap, HashSet};
 use crate::meta::{
     AirScalar, AirType, FragMeta, FragRole, KernMeta, KernRole, VertMeta, VertOutRole, VertRole,
 };
@@ -11,7 +12,7 @@ use spirv::{
     BuiltIn, Decoration, Dim, FunctionControl, ImageFormat, MemorySemantics, Op, Scope,
     StorageClass, Word,
 };
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::VecDeque;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Stage {
@@ -27,11 +28,20 @@ pub struct TransformOptions {
     pub kernel_dispatch: Option<crate::reflect::KernelDispatch>,
     pub denorm_flush_to_zero_f32: bool,
     pub raster_sample_count: Option<u32>,
+    /// The caller guarantees that no rasterization rate map can be bound.
+    /// Generic translation must keep rejecting undecoded runtime map data.
+    pub no_rasterization_rate_maps: bool,
+    /// The plugin reserved heap slots 1..5 for typed dummies: a null resource id reads the dummy of the declared
+    /// image dimensionality instead of slot 0 (reflect::BINDLESS_DUMMY_SLOT_*).
+    pub typed_dummy_slots: bool,
     pub runtime_sampler_states: [Option<RuntimeSamplerState>; SAMPLER_ARGUMENT_COUNT_USIZE],
     pub runtime_storage_image_states:
         [Option<RuntimeStorageImageState>; TEXTURE_ARGUMENT_COUNT_USIZE],
     pub vertex_amplification_count: u32,
     pub threadgroup_memory_lengths: [Option<u32>; THREADGROUP_BUFFER_ARGUMENT_COUNT_USIZE],
+    /// Colour attachments bound as Metal A8Unorm (bit per location). Vulkan has no A8 format, so the plugin backs
+    /// them with R8 and the fragment output's alpha is written to every lane; the red lane is what the target keeps.
+    pub a8_render_target_mask: u32,
 }
 
 impl Default for TransformOptions {
@@ -42,10 +52,13 @@ impl Default for TransformOptions {
             kernel_dispatch: None,
             denorm_flush_to_zero_f32: false,
             raster_sample_count: None,
+            no_rasterization_rate_maps: false,
+            typed_dummy_slots: false,
             vertex_amplification_count: 1,
             runtime_sampler_states: [None; SAMPLER_ARGUMENT_COUNT_USIZE],
             runtime_storage_image_states: [None; TEXTURE_ARGUMENT_COUNT_USIZE],
             threadgroup_memory_lengths: [None; THREADGROUP_BUFFER_ARGUMENT_COUNT_USIZE],
+            a8_render_target_mask: 0,
         }
     }
 }
@@ -67,6 +80,11 @@ impl TransformOptions {
         layout.validate()?;
         self.descriptor_layout = layout;
         Ok(self)
+    }
+
+    pub fn with_a8_render_targets(mut self, mask: u32) -> Self {
+        self.a8_render_target_mask = mask;
+        self
     }
 
     pub fn with_runtime_sampler(
@@ -299,6 +317,9 @@ struct Ctx {
     image_multisampled: HashSet<Word>,
     image_storage: HashSet<Word>,
     image_array_vars: HashMap<Word, (Word, (Dim, bool), ImageComp, bool)>,
+    /// sampled texture-array entry parameters -> (Metal texture index of element 0, element count)
+    image_array_base: HashMap<Word, (u32, u32)>,
+    sampler_array_vars: HashMap<Word, Vec<Word>>,
     bindless_heap_vars: HashMap<Word, Word>,
     address_table: Option<(Word, Word, Option<Word>)>,
     bound_buffer_vars: HashSet<Word>,
@@ -312,10 +333,14 @@ struct Ctx {
     kernel_workgroup_size_id: Option<Word>,
     kernel_dispatch: crate::reflect::KernelDispatch,
     raster_sample_count: Option<u32>,
+    no_rasterization_rate_maps: bool,
+    typed_dummy_slots: bool,
     vertex_amplification_count: u32,
     runtime_sampler_states: [Option<RuntimeSamplerState>; SAMPLER_ARGUMENT_COUNT_USIZE],
     runtime_storage_image_states: [Option<RuntimeStorageImageState>; TEXTURE_ARGUMENT_COUNT_USIZE],
     threadgroup_memory_lengths: [Option<u32>; THREADGROUP_BUFFER_ARGUMENT_COUNT_USIZE],
+    a8_render_target_mask: u32,
+    a8_output_vars: HashSet<Word>,
     runtime_storage_image_values: HashMap<Word, (u32, RuntimeStorageImageState)>,
     applied_runtime_storage_image_indices: HashSet<u32>,
     default_sampler_var: Option<Word>,
@@ -375,21 +400,23 @@ impl Ctx {
             glsl_ext: None,
             interface: vec![],
             new_globals: vec![],
-            synth_cache: HashMap::new(),
-            singleton_types: HashMap::new(),
-            struct_cache: HashMap::new(),
+            synth_cache: HashMap::default(),
+            singleton_types: HashMap::default(),
+            struct_cache: HashMap::default(),
             phase_value_types: None,
             phase_type_positions: None,
-            image_dims: HashMap::new(),
-            image_comp: HashMap::new(),
-            image_multisampled: HashSet::new(),
-            image_storage: HashSet::new(),
-            image_array_vars: HashMap::new(),
-            bindless_heap_vars: HashMap::new(),
+            image_dims: HashMap::default(),
+            image_comp: HashMap::default(),
+            image_multisampled: HashSet::default(),
+            image_storage: HashSet::default(),
+            image_array_vars: HashMap::default(),
+            image_array_base: HashMap::default(),
+            sampler_array_vars: HashMap::default(),
+            bindless_heap_vars: HashMap::default(),
             address_table: None,
-            bound_buffer_vars: HashSet::new(),
-            null_image_values: HashSet::new(),
-            laid_out: HashSet::new(),
+            bound_buffer_vars: HashSet::default(),
+            null_image_values: HashSet::default(),
+            laid_out: HashSet::default(),
             air_struct_offsets,
             air_data_layout,
             descriptor_layout: options.descriptor_layout,
@@ -400,30 +427,34 @@ impl Ctx {
                 .kernel_dispatch
                 .unwrap_or_else(crate::reflect::KernelDispatch::safe_default),
             raster_sample_count: options.raster_sample_count,
+            no_rasterization_rate_maps: options.no_rasterization_rate_maps,
+            typed_dummy_slots: options.typed_dummy_slots,
             vertex_amplification_count: options.vertex_amplification_count,
             runtime_sampler_states: options.runtime_sampler_states,
             runtime_storage_image_states: options.runtime_storage_image_states,
             threadgroup_memory_lengths: options.threadgroup_memory_lengths,
-            runtime_storage_image_values: HashMap::new(),
-            applied_runtime_storage_image_indices: HashSet::new(),
+            a8_render_target_mask: options.a8_render_target_mask,
+            a8_output_vars: HashSet::default(),
+            runtime_storage_image_values: HashMap::default(),
+            applied_runtime_storage_image_indices: HashSet::default(),
             default_sampler_var: None,
-            read_sampler_values: HashSet::new(),
+            read_sampler_values: HashSet::default(),
             air_call_body: None,
             air_call_block: 0,
-            mat8_nv: HashMap::new(),
+            mat8_nv: HashMap::default(),
             mat8_nv_phis: Vec::new(),
-            mat8_fuse: HashMap::new(),
-            mat8_cm: HashMap::new(),
+            mat8_fuse: HashMap::default(),
+            mat8_cm: HashMap::default(),
             unsurfaced_embedded_resources: Vec::new(),
-            variant_absent_texture_values: HashSet::new(),
-            sampler_states: HashMap::new(),
-            specialized_runtime_sampler_values: HashSet::new(),
-            ambiguous_sampler_states: HashSet::new(),
-            default_null_image_vars: HashMap::new(),
-            placeholder_descriptor_vars: HashMap::new(),
+            variant_absent_texture_values: HashSet::default(),
+            sampler_states: HashMap::default(),
+            specialized_runtime_sampler_values: HashSet::default(),
+            ambiguous_sampler_states: HashSet::default(),
+            default_null_image_vars: HashMap::default(),
+            placeholder_descriptor_vars: HashMap::default(),
             ray_instance_user_id_table: None,
-            implicit_imageblock_vars: HashMap::new(),
-            fragment_imageblock_vars: HashMap::new(),
+            implicit_imageblock_vars: HashMap::default(),
+            fragment_imageblock_vars: HashMap::default(),
             fragment_sample_positions_var: None,
             uses_fragment_imageblock: false,
             fragment_imageblock_coord_var: None,
@@ -559,7 +590,7 @@ impl Ctx {
 
     fn runtime_storage_image_origins(&self, image: Word) -> Vec<(u32, RuntimeStorageImageState)> {
         let mut pending = vec![image];
-        let mut visited = HashSet::new();
+        let mut visited = HashSet::default();
         let mut origins = Vec::new();
         while let Some(value) = pending.pop() {
             if !visited.insert(value) {
@@ -740,7 +771,7 @@ fn propagate_sampler_state_aliases(ctx: &mut Ctx, entry_idx: usize) {
             (!sources.is_empty()).then_some((result, sources))
         })
         .collect::<Vec<_>>();
-    let mut dependents = HashMap::<Word, Vec<usize>>::new();
+    let mut dependents = HashMap::<Word, Vec<usize>>::default();
     for (index, (_, sources)) in aliases.iter().enumerate() {
         for source in sources {
             dependents.entry(*source).or_default().push(index);
@@ -867,7 +898,7 @@ mod sampler_state_alias_tests {
 }
 
 fn type_defs(module: &Module) -> HashMap<Word, Instruction> {
-    let mut m = HashMap::new();
+    let mut m = HashMap::default();
     for inst in &module.types_global_values {
         if let Some(rid) = inst.result_id {
             m.insert(rid, inst.clone());
@@ -923,7 +954,19 @@ impl Ctx {
     fn get_or_create(&mut self, op: Op, result_type: Option<Word>, operands: Vec<Operand>) -> Word {
         let key = (op, result_type, operands.clone());
         if let Some(&id) = self.struct_cache.get(&key) {
-            return id;
+            // A cleanup between passes can drop an unused global this cache still names (a ConstantNull the NaN-to-zero
+            // conversion then selected: "owned Select references undefined id", Blender's light-probe kernel). Hand an id
+            // out only while it is still defined.
+            if self
+                .module
+                .types_global_values
+                .iter()
+                .chain(self.new_globals.iter())
+                .any(|inst| inst.result_id == Some(id))
+            {
+                return id;
+            }
+            self.struct_cache.remove(&key);
         }
         let mut highest_definition = 0;
         let mut existing = None;
@@ -1440,6 +1483,7 @@ pub(crate) use module_cleanup::{
 };
 mod byte_words;
 mod prune;
+mod resource_phi_fold;
 mod resources;
 mod spirv_cfg;
 mod stage_input;
@@ -1494,7 +1538,7 @@ use value_queries::*;
 use workgroup::*;
 
 fn air_names(module: &Module) -> HashMap<Word, String> {
-    let mut m = HashMap::new();
+    let mut m = HashMap::default();
     for inst in &module.debug_names {
         if inst.class.opcode == Op::Name {
             if let (Some(Operand::IdRef(id)), Some(Operand::LiteralString(s))) =
@@ -1717,7 +1761,7 @@ fn canonicalize_ids_and_collect_remap(
     module: &mut Module,
     tracked_ids: &mut [Word],
 ) -> HashMap<Word, Word> {
-    let mut remap: HashMap<Word, Word> = HashMap::new();
+    let mut remap: HashMap<Word, Word> = HashMap::default();
     let mut next: Word = 1;
     for inst in module.all_inst_iter() {
         if let Some(result_id) = inst.result_id {
@@ -1919,7 +1963,7 @@ mod emitted_inline_tests {
             module,
             crate::emit_sidecar::EmitSidecar::default(),
             Some("main"),
-            &HashSet::new(),
+            &HashSet::default(),
         )
         .expect("invalid intermediate follows the historical retry route");
 
@@ -1969,7 +2013,7 @@ mod emitted_inline_tests {
             module,
             crate::emit_sidecar::EmitSidecar::default(),
             Some("main"),
-            &HashSet::new(),
+            &HashSet::default(),
         )
         .expect("complete emitted closure");
 
@@ -2024,7 +2068,7 @@ mod emitted_inline_tests {
             module,
             crate::emit_sidecar::EmitSidecar::default(),
             Some("main"),
-            &HashSet::new(),
+            &HashSet::default(),
         )
         .expect("complete emitted closure");
 
@@ -2075,7 +2119,7 @@ mod emitted_inline_tests {
             module,
             crate::emit_sidecar::EmitSidecar::default(),
             Some("main"),
-            &HashSet::from([20]),
+            &crate::fxhash::set_from([20]),
         )
         .expect("preserve lowered leaf while splicing AIR helper");
         let calls = module.functions[0]
@@ -2132,7 +2176,7 @@ mod emitted_inline_tests {
     }
 
     fn phi_parents_are_predecessors(function: &Function) -> Vec<(Word, Word, bool)> {
-        let mut predecessors: HashMap<Word, HashSet<Word>> = HashMap::new();
+        let mut predecessors: HashMap<Word, HashSet<Word>> = HashMap::default();
         for (from, successors) in crate::spirv_module::block_successors_by_label(&function.blocks) {
             for to in successors {
                 predecessors.entry(to).or_default().insert(from);
@@ -2143,7 +2187,7 @@ mod emitted_inline_tests {
             let Some(here) = block.label.as_ref().and_then(|label| label.result_id) else {
                 continue;
             };
-            let empty = HashSet::new();
+            let empty = HashSet::default();
             let here_predecessors = predecessors.get(&here).unwrap_or(&empty);
             for instruction in &block.instructions {
                 if instruction.class.opcode != Op::Phi {
@@ -2246,7 +2290,7 @@ mod emitted_inline_tests {
             module,
             crate::emit_sidecar::EmitSidecar::default(),
             Some("main"),
-            &HashSet::new(),
+            &HashSet::default(),
         )
         .expect("complete emitted closure");
 
@@ -2773,10 +2817,13 @@ pub(crate) fn transform_with_options_and_sidecar(
     materialize_inlined_local_pointer_field_stores(&mut ctx, entry_idx);
     rewrite_return(&mut ctx, entry_idx, &stage, frag, vert, &input_defs)?;
     resources::materialize_texture_array_loads(&mut ctx, entry_idx);
+    resources::materialize_sampler_array_loads(&mut ctx, entry_idx);
     hoist_function_variables(&mut ctx, entry_idx);
     recover_inlined_local_pointer_fields(&mut ctx, entry_idx);
     resources::materialize_texture_array_loads(&mut ctx, entry_idx);
+    resources::materialize_sampler_array_loads(&mut ctx, entry_idx);
     neutralize_private_placeholder_access_chains(&mut ctx, entry_idx)?;
+    resource_phi_fold::fold_constant_resource_phis(&mut ctx, entry_idx);
     propagate_sampler_state_aliases(&mut ctx, entry_idx);
 
     lower_ray_queries(&mut ctx, entry_idx)?;
@@ -2924,6 +2971,7 @@ pub(crate) fn transform_with_options_and_sidecar(
     decorate_ptr_access_chain_base_strides(&mut ctx);
     ctx.emit_sidecar.buffer_root_source_types.clear();
     neutralize_private_placeholder_access_chains(&mut ctx, entry_idx)?;
+    resources::redirect_zero_heap_slots(&mut ctx);
     ctx.phase_type_positions = None;
     ctx.module.types_global_values.append(&mut ctx.new_globals);
     let preserved_pointer_facts = ctx
@@ -2934,6 +2982,7 @@ pub(crate) fn transform_with_options_and_sidecar(
         .collect::<HashSet<_>>();
     crate::native::eliminate_dead_pointer_values_module(&mut ctx.module, &preserved_pointer_facts);
     crate::native::construct_workgroup_atomic_floats_module(&mut ctx.module);
+    crate::native::construct_atomic_storage_image_formats_module(&mut ctx.module);
     crate::native::close_private_vector_word_views_module(&mut ctx.module);
     if let Some(address_table) =
         crate::native::construct_interface_cross_binding_pointer_phis_module(
@@ -2961,6 +3010,7 @@ pub(crate) fn transform_with_options_and_sidecar(
     materialize_selected_subgroup_results(&mut ctx);
 
     resources::sink_loop_header_texture_array_loads(&mut ctx, entry_idx);
+    resources::route_texture_array_elements_through_heap(&mut ctx, entry_idx);
     ctx.emit_sidecar.local_pointer_field_stores.clear();
     ctx.emit_sidecar.aggregate_pointer_values.clear();
     finalize(&mut ctx, entry_idx, &stage, frag, vert)?;
@@ -3005,6 +3055,23 @@ pub(crate) fn transform_with_options_and_sidecar(
             );
         }
     }
+    // A dispatch-tail guard used to run here: an entry-block test that retired the lanes a Metal
+    // dispatchThreads: grid never creates, by comparing GlobalInvocationId + thread_base against the
+    // threads_per_grid in the dispatch-region push constants. It was removed because both
+    // of its premises were false, and it cost a game run and two crashes to learn that:
+    //  - There is no overshoot to discard. nvmtl_vk_cmd_dispatch_threads already reproduces Metal's exact
+    //    thread count by dispatching a SMALLER-WORKGROUP pipeline variant for the partial group
+    //    (local[d] = threads[d] % tg[d]), so every launched invocation is one Metal would have created.
+    //    That emulation is also strictly better than a guard: it keeps the workgroup size honest, so
+    //    threadgroup-shared reductions and barriers in the tail group still see the right extent.
+    //  - The push constants it read are not always there. Only dispatch_threads and
+    //    dispatch_indirect_tg push the 12-uint region; nvmtl_vk_cmd_dispatch (dispatchThreadgroups:)
+    //    and nvmtl_vk_cmd_dispatch_indirect push nothing, and a kernel reached through either one read
+    //    whatever the previous compute dispatch had left in push-constant state. Lanes of a live kernel
+    //    were retired against a stale grid, which in Cyberpunk showed up as submits/frame climbing 2.5
+    //    -> 30.8 over four seconds and then FAULT_PDE at an unmapped 0x2ef3a2000.
+    // Read the region for POSITION (stage_input/kernel_grid.rs), never for a correctness decision about
+    // which lanes should run.
     debug_phase!("complete");
 
     let placeholder_descriptor_bindings = surviving_placeholder_bindings(&ctx);

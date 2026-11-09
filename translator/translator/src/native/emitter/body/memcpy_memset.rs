@@ -360,7 +360,7 @@ impl Emitter {
         let Some(shadow) = self.raw_memcpy_shadows.get(src_name) else {
             return Ok(None);
         };
-        let mut by_offset = HashMap::new();
+        let mut by_offset = HashMap::default();
         for (offset, word) in words {
             if offset % 4 != 0 || offset >= len {
                 return Ok(None);
@@ -1061,6 +1061,21 @@ impl Emitter {
         access_align: Option<u64>,
         instructions: &mut Vec<Instruction>,
     ) -> Result<(), String> {
+        // A function-local aggregate modelled as a byte array has no words to mask: clear it byte by byte, the way a
+        // plain i8 store into it is lowered. The word path would index into one of its bytes.
+        let zero_byte = self.const_null(&LlType::Int(8))?;
+        let mut staged = Vec::new();
+        let mut byte_array = true;
+        for byte in 0..len {
+            if !self.emit_raw_byte_array_integer_store(&LlType::Int(8), zero_byte, raw, byte, &mut staged)? {
+                byte_array = false;
+                break;
+            }
+        }
+        if byte_array {
+            instructions.extend(staged);
+            return Ok(());
+        }
         let zero = self.const_uint(0)?;
         if self.raw_pointer_word_aligned(raw) {
             let word_bytes = len / 4 * 4;

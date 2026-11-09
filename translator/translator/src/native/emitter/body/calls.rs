@@ -472,6 +472,84 @@ impl Emitter {
         Ok(())
     }
 
+    /// A sampler operand that is the address of a sampler inside a bound buffer (a Metal argument buffer holding samplers,
+    /// `array<sampler, N>` in a struct: Blender binds 17 that way). The sampler there is its gpuResourceID, whose low word
+    /// is the sampler-heap slot (the plugin's nvmtl_resid_for_sampler), so the operand becomes a heap load the passes
+    /// resolve (`device_handle_heap_loads`). None for every other operand.
+    fn argument_buffer_sampler_arg_id(
+        &mut self,
+        arg: &TypedValue,
+        instructions: &mut Vec<Instruction>,
+    ) -> Result<Option<Word>, String> {
+        let (LlValue::Local(name), LlType::Ptr(2)) = (&arg.value, &arg.ty) else {
+            return Ok(None);
+        };
+        // Only in the retry of a module that failed (crate::with_argument_buffer_samplers) or with NVMTL_ARGBUF_SAMPLERS=1:
+        // on by default it took over sampler operands three app modules already translated another way (measured on a 12,446-shader corpus).
+        if !crate::reflect::bindless_fixed_fields_on() || !argbuf_samplers_on() {
+            return Ok(None);
+        }
+        let Some(raw) = self.raw_offsets.get(name).cloned() else {
+            return Ok(None);
+        };
+        let low = self.emit_raw_word_load_for_access(&raw, 0, Some(8), instructions)?;
+        let mask = self.const_uint(crate::reflect::BINDLESS_SAMPLER_SLOTS - 1)?;
+        let u32_ty = self.type_id(&LlType::Int(32))?;
+        let slot = self.fresh();
+        instructions.push(Self::inst(
+            Op::BitwiseAnd,
+            Some(u32_ty),
+            Some(slot),
+            vec![Operand::IdRef(low), Operand::IdRef(mask)],
+        ));
+        let sampler_ptr_ty = self.type_id(&arg.ty)?;
+        let id = self.fresh();
+        // a placeholder of the operand's type; the passes replace every use of `id` with the heap sampler
+        instructions.push(Self::inst(Op::Undef, Some(sampler_ptr_ty), Some(id), vec![]));
+        self.emit_sidecar
+            .device_handle_heap_loads
+            .push(crate::emit_sidecar::DeviceHandleHeapLoad { id, slot, sampler: true });
+        Ok(Some(id))
+    }
+
+    /// A slice write whose size is left undef copies the whole imageblock, whose extent the dispatch sets
+    /// (setImageblockWidth:height:). In the staged tile that is the per-axis threadgroup count the coordinates span,
+    /// times threads_per_threadgroup: MPS's Lanczos kernels write unroll x unroll cells per thread and copy the tile
+    /// with one call (#405, Infuse). None (the undef stays, and the slice writer refuses) when either is unknown.
+    fn whole_imageblock_extent(
+        &mut self,
+        size_ty: &LlType,
+        instructions: &mut Vec<Instruction>,
+    ) -> Result<Option<Word>, String> {
+        let (Some([sx, sy]), Some(tptg)) = (
+            self.ir.imageblock_cell_scale_xy,
+            self.ir.imageblock_threads_per_threadgroup_param.clone(),
+        ) else {
+            return Ok(None);
+        };
+        let size_ty = self.resolve_type(size_ty)?;
+        let LlType::Vector(elem, 2) = &size_ty else {
+            return Ok(None);
+        };
+        let Some((tptg_id, tptg_ty)) = self.values.get(&tptg).cloned() else {
+            return Ok(None);
+        };
+        if tptg_ty != size_ty {
+            return Ok(None);
+        }
+        let lane = |v: u32| TypedValue { ty: (**elem).clone(), value: LlValue::Int(u64::from(v)) };
+        let scale = self.value_id_in(&LlValue::Vector(vec![lane(sx), lane(sy)]), &size_ty, instructions)?;
+        let ty = self.type_id(&size_ty)?;
+        let extent = self.fresh();
+        instructions.push(Self::inst(
+            Op::IMul,
+            Some(ty),
+            Some(extent),
+            vec![Operand::IdRef(tptg_id), Operand::IdRef(scale)],
+        ));
+        Ok(Some(extent))
+    }
+
     pub(in crate::native::emitter) fn function_call_arg_ids(
         &mut self,
         call: &LlCall,
@@ -485,8 +563,36 @@ impl Emitter {
             .map(|function| function.params.clone())
             .unwrap_or_default();
         if callee_params.is_empty() {
+            let texture_op = super::super::functions::is_air_texture_operation(&call.callee);
             let mut ids = Vec::with_capacity(call.args.len());
-            for arg in &call.args {
+            // a whole-imageblock slice write (size flag false, size undef) gets its extent spelled out and the flag
+            // set, so the slice writer copies that many cells instead of one
+            let whole_extent = if call.callee.starts_with("air.write_imageblock_slice_to_texture")
+                && call.args.len() > 4
+                && matches!(call.args[2].value, LlValue::Bool(false))
+                && matches!(call.args[4].value, LlValue::Undef)
+            {
+                self.whole_imageblock_extent(&call.args[4].ty, instructions)?
+            } else {
+                None
+            };
+            for (index, arg) in call.args.iter().enumerate() {
+                if let Some(extent) = whole_extent {
+                    if index == 2 {
+                        ids.push(self.value_id_in(&LlValue::Bool(true), &arg.ty, instructions)?);
+                        continue;
+                    }
+                    if index == 4 {
+                        ids.push(extent);
+                        continue;
+                    }
+                }
+                if texture_op {
+                    if let Some(id) = self.argument_buffer_sampler_arg_id(arg, instructions)? {
+                        ids.push(id);
+                        continue;
+                    }
+                }
                 ids.push(self.value_id_in(&arg.value, &arg.ty, instructions)?);
             }
             return Ok(ids);
@@ -1059,7 +1165,7 @@ fn decayed_global_call_arg_indices(
 }
 
 fn agreeing_constant_call_cursors(ir: &LlModule) -> HashSet<(String, usize)> {
-    let mut sites: HashMap<&str, Vec<(&str, &LlCall)>> = HashMap::new();
+    let mut sites: HashMap<&str, Vec<(&str, &LlCall)>> = HashMap::default();
     for function in &ir.functions {
         for instruction in function.carrier_insts() {
             if let Some(call) = instruction.alias_call() {
@@ -1070,7 +1176,7 @@ fn agreeing_constant_call_cursors(ir: &LlModule) -> HashSet<(String, usize)> {
             }
         }
     }
-    let mut agreeing = HashSet::new();
+    let mut agreeing = HashSet::default();
     for (callee, calls) in sites {
         let arity = calls
             .iter()
@@ -1088,7 +1194,7 @@ fn agreeing_constant_call_cursors(ir: &LlModule) -> HashSet<(String, usize)> {
         let Some(caller) = ir.functions.iter().find(|f| f.name == first_caller) else {
             continue;
         };
-        let mut definitions: HashMap<&str, &LlGep> = HashMap::new();
+        let mut definitions: HashMap<&str, &LlGep> = HashMap::default();
         for instruction in caller.carrier_insts() {
             if let (Some(result), Some(gep)) = (&instruction.result, instruction.gep().as_deref()) {
                 definitions.insert(result.as_str(), gep);
@@ -1135,4 +1241,8 @@ fn constant_cursor_key(name: &str, definitions: &HashMap<&str, &LlGep>) -> Strin
             .map(|index| &index.value)
             .collect::<Vec<_>>()
     )
+}
+
+fn argbuf_samplers_on() -> bool {
+    crate::argument_buffer_samplers_on()
 }

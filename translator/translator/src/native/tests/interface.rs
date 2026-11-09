@@ -8,13 +8,13 @@ use super::super::emitter::Emitter;
 use super::super::ir::{LlType, LlValue};
 use super::super::parse::{parse_type, parse_typed_value};
 use super::*;
+use crate::fxhash::{HashMap, HashSet};
 use crate::passes::{self, Stage};
 use crate::spirv_module::load_bytes;
 use crate::spirv_module::Operand;
 use crate::spirv_module::{Block, Instruction};
 use crate::{disassemble, meta, tools};
 use spirv::{BuiltIn, Capability, Decoration, Op, Scope, SelectionControl, StorageClass, Word};
-use std::collections::{HashMap, HashSet};
 
 fn shifted_descriptor_layout(set: u32, shift: u32) -> crate::reflect::DescriptorLayout {
     let shift_range =
@@ -163,8 +163,8 @@ entry:
     let vertex_locations = descriptor_locations(&load_bytes(&vertex_spv).expect("vertex SPIR-V"));
     let fragment_locations =
         descriptor_locations(&load_bytes(&fragment_spv).expect("fragment SPIR-V"));
-    assert_eq!(vertex_locations, HashSet::from([(2, 0)]));
-    assert_eq!(fragment_locations, HashSet::from([(2, 1000)]));
+    assert_eq!(vertex_locations, crate::fxhash::set_from([(2, 0)]));
+    assert_eq!(fragment_locations, crate::fxhash::set_from([(2, 1000)]));
     assert!(vertex_locations.is_disjoint(&fragment_locations));
 
     let (shifted_vertex_spv, shifted_vertex_reflection) =
@@ -349,7 +349,7 @@ attributes #0 = { nounwind }
 }
 
 #[test]
-fn native_fragment_stencil_return_declares_the_replacing_execution_mode() {
+fn native_fragment_stencil_return_is_lowered_to_a_per_bit_discard() {
     let ll = r#"
 source_filename = "synth_stencil"
 target datalayout = "e-p:64:64:64"
@@ -379,13 +379,14 @@ attributes #0 = { nounwind }
     let out = crate::translate_sanitized_native(ll, Stage::Fragment, &tmp).expect("translate");
     let asm = disassemble(&out).expect("disassemble transformed");
     let _ = std::fs::remove_dir_all(&tmp);
-    assert!(asm.contains("BuiltIn FragStencilRefEXT"), "{asm}");
-    assert!(asm.contains("OpCapability StencilExportEXT"), "{asm}");
-    assert!(
-        asm.contains(r#"OpExtension "SPV_EXT_shader_stencil_export""#),
-        "{asm}"
-    );
-    assert!(asm.contains("StencilRefReplacingEXT"), "{asm}");
+    // NVIDIA GPUs cannot export stencil: the value is kept, the shader discards unless (value & the pushed bit), and the
+    // driver replays the draw per write-mask bit (native::stencil_export). No stencil-export capability may remain.
+    assert!(!asm.contains("FragStencilRefEXT"), "{asm}");
+    assert!(!asm.contains("StencilExportEXT"), "{asm}");
+    assert!(!asm.contains("StencilRefReplacingEXT"), "{asm}");
+    assert!(asm.contains("Offset 160"), "the stencil bit is pushed at offset 160: {asm}");
+    assert!(asm.contains("PushConstant"), "{asm}");
+    assert!(asm.contains("OpKill"), "{asm}");
 }
 
 #[test]
@@ -2020,7 +2021,7 @@ entry:
         }
     };
     let reaches = |from: usize, to: usize| {
-        let mut seen = HashSet::new();
+        let mut seen = HashSet::default();
         let mut pending = vec![from];
         while let Some(block) = pending.pop() {
             if block == to {
@@ -2185,7 +2186,7 @@ target triple = "spirv-unknown-vulkan1.2"
     .collect::<Vec<_>>();
     let asm = disassemble(&out).expect("disassemble transformed");
     assert!(!asm.contains("OpUndef"), "{asm}");
-    let mut constants = std::collections::HashMap::new();
+    let mut constants = crate::fxhash::HashMap::default();
     for line in asm.lines().map(str::trim) {
         let Some((id, rest)) = line.split_once(" = Op") else {
             continue;
@@ -2228,7 +2229,7 @@ target triple = "spirv-unknown-vulkan1.2"
 }
 
 #[test]
-fn native_kernel_raster_rate_map_runtime_data_is_not_replaced_with_identity() {
+fn native_kernel_raster_rate_map_requires_explicit_no_maps_capability() {
     let ll = r#"
 target triple = "spirv-unknown-vulkan1.2"
 
@@ -2253,18 +2254,39 @@ declare <2 x float> @air.map_screen_to_physical_coordinates.v2f32.p2i8.i32(<2 x 
 !5 = !{i32 2, !"air.thread_position_in_grid", !"air.arg_type_name", !"uint2", !"air.arg_name", !"tid"}
 "#;
     let tmp = std::env::temp_dir().join(format!(
-        "metal2vulkan_rate_map_refusal_{}",
+        "metal2vulkan_rate_map_identity_{}",
         std::process::id()
     ));
     std::fs::create_dir_all(&tmp).expect("create isolated scratch");
     for direction in ["screen_to_physical", "physical_to_screen"] {
         let source = ll.replace("screen_to_physical", direction);
         let error = crate::translate_sanitized_native(&source, Stage::Kernel, &tmp)
-            .expect_err("runtime map data cannot be assumed to describe a uniform map");
-        assert!(
-            error.contains("rasterization-rate-map parameter data decoding"),
-            "{error}"
-        );
+            .expect_err("opaque runtime map data must still be refused by default");
+        assert!(error.contains("rasterization-rate-map parameter data decoding"), "{error}");
+        let options = crate::passes::TransformOptions {
+            no_rasterization_rate_maps: true,
+            ..Default::default()
+        };
+        let out = crate::translate_sanitized_native_with_options(&source, Stage::Kernel, &tmp, options)
+            .unwrap_or_else(|e| panic!("{direction}: {e}"));
+        crate::tools::spirv_val_bytes(&out, &tmp).expect("identity kernel must validate");
+        let asm = disassemble(&out).expect("disassemble");
+        let id_of = |op: &str| {
+            asm.lines()
+                .find(|l| l.contains(&format!(" = {op} ")))
+                .and_then(|l| l.split_once(" = ").map(|(id, _)| id.trim().to_string()))
+        };
+        let coord = id_of("OpConvertUToF").unwrap_or_else(|| panic!("no coordinate\n{asm}"));
+        let copy = id_of("OpCopyObject");
+        let stored = asm
+            .lines()
+            .filter(|l| l.trim_start().starts_with("OpStore "))
+            .any(|l| {
+                let v = l.split_whitespace().nth(2).unwrap_or("");
+                v == coord || Some(v.to_string()) == copy
+            });
+        assert!(stored, "{direction}: the coordinate is stored unchanged\n{asm}");
+        assert!(!asm.contains("OpFunctionCall"), "{direction}\n{asm}");
     }
     std::fs::remove_dir_all(&tmp).expect("remove isolated scratch");
 }

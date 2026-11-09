@@ -58,16 +58,17 @@ impl LlModule {
                 })
                 .collect::<HashSet<_>>();
             let mut direct_root_aliases = pointer_params.clone();
-            let mut sources: HashMap<String, HashSet<LlType>> = HashMap::new();
-            let mut byte_gep_aliases: HashMap<String, String> = HashMap::new();
-            let mut selected_roots: HashMap<String, HashSet<String>> = HashMap::new();
-            let mut byte_gep_selected_aliases: HashMap<String, HashSet<String>> = HashMap::new();
-            let mut byte_reinterpret_roots: HashSet<String> = HashSet::new();
-            let mut memcpy_source_roots: HashMap<String, HashSet<u64>> = HashMap::new();
-            let mut opaque_local_memcpy_sources: HashSet<String> = HashSet::new();
+            let mut sources: HashMap<String, HashSet<LlType>> = HashMap::default();
+            let mut byte_gep_aliases: HashMap<String, String> = HashMap::default();
+            let mut selected_roots: HashMap<String, HashSet<String>> = HashMap::default();
+            let mut byte_gep_selected_aliases: HashMap<String, HashSet<String>> =
+                HashMap::default();
+            let mut byte_reinterpret_roots: HashSet<String> = HashSet::default();
+            let mut memcpy_source_roots: HashMap<String, HashSet<u64>> = HashMap::default();
+            let mut opaque_local_memcpy_sources: HashSet<String> = HashSet::default();
             let mut memcpy_struct_copy_pairs: Vec<(String, String)> = Vec::new();
-            let mut vector_load_roots: HashMap<String, HashSet<LlType>> = HashMap::new();
-            let mut acceleration_structure_shadow_roots: HashSet<String> = HashSet::new();
+            let mut vector_load_roots: HashMap<String, HashSet<LlType>> = HashMap::default();
+            let mut acceleration_structure_shadow_roots: HashSet<String> = HashSet::default();
             let mut changed = true;
             while changed {
                 changed = false;
@@ -301,7 +302,7 @@ impl LlModule {
                         else {
                             continue;
                         };
-                        let mut arm_roots = HashSet::new();
+                        let mut arm_roots = HashSet::default();
                         if let Some(root) = roots.get(true_name) {
                             arm_roots.insert(root.clone());
                         }
@@ -338,7 +339,7 @@ impl LlModule {
                     self.raw_buffer_params.insert((f.name.clone(), param));
                 }
             }
-            let mut memcpy_raw_sources = HashSet::new();
+            let mut memcpy_raw_sources = HashSet::default();
             for (param, lengths) in &memcpy_source_roots {
                 if self.memcpy_source_implies_raw_bytes(sources.get(param), lengths) {
                     memcpy_raw_sources.insert(param.clone());
@@ -365,6 +366,10 @@ impl LlModule {
                 }
             }
             for (param, seen) in sources {
+                if seen.contains(&LlType::Int(8)) {
+                    self.byte_addressed_raw_params
+                        .insert((f.name.clone(), param.clone()));
+                }
                 let metadata_byte_buffer = self
                     .metadata_byte_buffer_params
                     .contains(&(f.name.clone(), param.clone()));
@@ -560,6 +565,7 @@ impl LlModule {
     pub(in crate::native) fn propagate_raw_buffer_params(&mut self) {
         let call_edges = self.raw_param_call_edges();
         Self::propagate_param_fact(&call_edges, &mut self.raw_buffer_params);
+        Self::propagate_param_fact(&call_edges, &mut self.byte_addressed_raw_params);
         Self::propagate_param_fact(&call_edges, &mut self.call_connected_raw_params);
         for edge in call_edges {
             let caller = (edge.caller_func, edge.caller_param);
@@ -604,7 +610,7 @@ impl LlModule {
     pub(in crate::native) fn raw_param_call_edges(&self) -> Vec<ParamCallEdge> {
         let funcs: HashMap<String, &LlFunction> =
             self.functions.iter().map(|f| (f.name.clone(), f)).collect();
-        let mut seen = HashSet::new();
+        let mut seen = HashSet::default();
         let mut edges = Vec::new();
         for f in &self.functions {
             let aliases = pointer_param_alias_roots(f);
@@ -656,7 +662,7 @@ impl LlModule {
     pub(in crate::native) fn param_call_edges(&self) -> Vec<ParamCallEdge> {
         let funcs: HashMap<String, &LlFunction> =
             self.functions.iter().map(|f| (f.name.clone(), f)).collect();
-        let mut seen = HashSet::new();
+        let mut seen = HashSet::default();
         let mut edges = Vec::new();
         for f in &self.functions {
             let caller_params = f
@@ -708,7 +714,7 @@ impl LlModule {
     }
 
     pub(in crate::native) fn param_is_dereferenced(&self, function: &str, param: &str) -> bool {
-        let mut seen = HashSet::new();
+        let mut seen = HashSet::default();
         self.param_is_dereferenced_seen(function, param, &mut seen)
     }
 
@@ -724,7 +730,7 @@ impl LlModule {
         let Some(f) = self.functions.iter().find(|f| f.name == function) else {
             return false;
         };
-        let mut aliases: HashSet<String> = HashSet::from([param.to_string()]);
+        let mut aliases: HashSet<String> = crate::fxhash::set_from([param.to_string()]);
         let mut changed = true;
         while changed {
             changed = false;

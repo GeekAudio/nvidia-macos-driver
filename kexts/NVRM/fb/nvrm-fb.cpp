@@ -1037,11 +1037,17 @@ bool NVRMNVDAFramebuffer::start(IOService *provider)
             return false;
         }
     }
-    fKms = (struct NvKmsKapiFunctionsTable *)(uintptr_t)propU64(provider, "nvkms-kapi");
+    struct NVRMDisplayPointers displayPtrs = {};
+    displayPtrs.version = NVRM_DISPLAY_PTRS_ABI_VERSION;
+    {
+        const OSSymbol *displayPtrsFn = OSSymbol::withCString(NVRM_DISPLAY_PTRS_FN);
+        if (displayPtrsFn) { provider->callPlatformFunction(displayPtrsFn, false, &displayPtrs, NULL, NULL, NULL); displayPtrsFn->release(); }
+    }
+    fKms = (struct NvKmsKapiFunctionsTable *)displayPtrs.kapi;
     fGpuId = (NvU32)propU64(provider, "gpu-id");
     fIndex = (unsigned)propU64(provider, "fb-index");
     if (fIndex == 0 && gFB != this) { retain(); gFB = this; }
-    fPhysForVa = (nvrm_phys_for_va_t)(uintptr_t)propU64(provider, "phys-for-va");
+    fPhysForVa = (nvrm_phys_for_va_t)displayPtrs.physForVa;
     if (!fKms || !fPhysForVa) { FBLOG("nub lacks nvkms-kapi/phys-for-va properties"); return false; }
     setProperty("IOFBDependentID", (unsigned long long)0x4E56524D00000001ull, 64);
     setProperty("IOFBDependentIndex", (unsigned long long)fIndex, 32);
@@ -1258,7 +1264,8 @@ bool NVRMNVDAFramebuffer::vramGrant(struct NVRMVramRequest *r)
 
     const SInt64 budget = (SInt64)(fBarLen >= (4ull << 30) ? fBarLen / 2 : NVRM_VRAM_BAR1_BUDGET);
     gVramBudgetBytes = budget;
-    SInt64 before = OSAddAtomic64((SInt64)want, &gVramMappedBytes) + gVramParkedBytes;
+    // parked blocks are unmapped when parked and no longer count against the BAR1 budget (see NVRMFB)
+    SInt64 before = OSAddAtomic64((SInt64)want, &gVramMappedBytes);
     if (before + (SInt64)want > budget) {
         OSAddAtomic64(-(SInt64)want, &gVramMappedBytes);
         FBLOG("nvAllocVram(%llu): REFUSED — BAR1 budget spent (%lld of %llu bytes). "
@@ -1294,7 +1301,8 @@ bool NVRMNVDAFramebuffer::vramGrant(struct NVRMVramRequest *r)
             if (gNParkedForever < (int)(sizeof gParkedForever / sizeof gParkedForever[0]) &&
                 gVramParkedBytes + (SInt64)want <= (SInt64)NVRM_VRAM_PARK_CEILING) {
                 gParkedForever[gNParkedForever].m = m;
-                gParkedForever[gNParkedForever].k = k;
+                fKms->unmapMemory(fDev, m, NVKMS_KAPI_MAPPING_TYPE_KERNEL, k);
+                gParkedForever[gNParkedForever].k = nullptr;
                 gParkedForever[gNParkedForever].n = want;
                 gNParkedForever++;
                 OSAddAtomic64((SInt64)want, &gVramParkedBytes);
@@ -1572,7 +1580,7 @@ IOReturn NVRMNVDAFramebuffer::getAttributeForConnection(IOIndex connectIndex, IO
     case kConnectionControllerDepthsSupported: if (value) *value = 0x00000002; return kIOReturnSuccess;
     case kConnectionColorMode:                 if (value) *value = 0x00000001; return kIOReturnSuccess;
     case kConnectionCheckEnable:               if (value) *value = 1; return kIOReturnSuccess;
-    case kConnectionDisplayFlags:              if (value) *value = 1; return kIOReturnSuccess;
+    case kConnectionDisplayFlags:              if (value) *value = 0; return kIOReturnSuccess;
     case kConnectionSupportsHLDDCSense: return fEdidSize >= 128 ? kIOReturnSuccess : kIOReturnUnsupported;
     case kConnectionSupportsAppleSense: case kConnectionSupportsLLDDCSense: case kConnectionDisplayParameterCount: case kConnectionDisplayParameters:
         return kIOReturnUnsupported;

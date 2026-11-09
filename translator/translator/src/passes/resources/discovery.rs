@@ -1,8 +1,8 @@
 use super::*;
 
 pub(in crate::passes) fn buffer_pointer_aliases(func: &Function, pid: Word) -> HashSet<Word> {
-    let mut aliases = HashSet::from([pid]);
-    let mut paths: HashMap<Word, HashMap<Vec<u32>, Word>> = HashMap::new();
+    let mut aliases = crate::fxhash::set_from([pid]);
+    let mut paths: HashMap<Word, HashMap<Vec<u32>, Word>> = HashMap::default();
     let mut changed = true;
     while changed {
         changed = false;
@@ -39,7 +39,7 @@ pub(in crate::passes) fn buffer_pointer_aliases(func: &Function, pid: Word) -> H
                     }
                 }
                 Op::CompositeConstruct => {
-                    let mut result_paths = HashMap::new();
+                    let mut result_paths = HashMap::default();
                     for (index, operand) in inst.operands.iter().enumerate() {
                         let Operand::IdRef(object) = operand else {
                             continue;
@@ -72,7 +72,7 @@ pub(in crate::passes) fn buffer_pointer_aliases(func: &Function, pid: Word) -> H
                     if composite_paths.contains_key(&path) && aliases.insert(result) {
                         changed = true;
                     }
-                    let mut result_paths = HashMap::new();
+                    let mut result_paths = HashMap::default();
                     for (alias_path, alias) in composite_paths {
                         if let Some(suffix) = path_suffix(alias_path, &path) {
                             if !suffix.is_empty() {
@@ -462,8 +462,8 @@ pub(in crate::passes) fn texture_dims(
 ) -> HashMap<Word, ImageShape> {
     let names = air_names(&ctx.module);
     let write_textures = write_texture_operands(ctx, entry_idx, &names);
-    let mut out = HashMap::new();
-    let mut direction_sampled: HashSet<Word> = HashSet::new();
+    let mut out = HashMap::default();
+    let mut direction_sampled: HashSet<Word> = HashSet::default();
     for blk in &ctx.module.functions[entry_idx].blocks {
         for inst in &blk.instructions {
             if inst.class.opcode != Op::FunctionCall {
@@ -554,7 +554,7 @@ fn write_texture_operands(
     entry_idx: usize,
     names: &HashMap<Word, String>,
 ) -> HashSet<Word> {
-    let mut out = HashSet::new();
+    let mut out = HashSet::default();
     for blk in &ctx.module.functions[entry_idx].blocks {
         for inst in &blk.instructions {
             if inst.class.opcode != Op::FunctionCall {
@@ -583,7 +583,7 @@ pub(in crate::passes) fn sampled_binding_required_operands(
     entry_idx: usize,
 ) -> HashSet<Word> {
     let names = air_names(&ctx.module);
-    let mut required = HashSet::new();
+    let mut required = HashSet::default();
     for instruction in ctx.module.functions[entry_idx]
         .blocks
         .iter()
@@ -625,7 +625,7 @@ pub(in crate::passes) fn write_texture_dims(
     entry_idx: usize,
 ) -> HashMap<Word, (Dim, bool, ImageFormat, ImageComp)> {
     let names = air_names(&ctx.module);
-    let mut out = HashMap::new();
+    let mut out = HashMap::default();
     for blk in &ctx.module.functions[entry_idx].blocks {
         for inst in &blk.instructions {
             if inst.class.opcode != Op::FunctionCall {
@@ -722,6 +722,13 @@ pub(in crate::passes) fn texture_arg_shape(name: &str) -> ImageShape {
 }
 
 fn texture_arg_storage(name: &str) -> Option<(Dim, bool, ImageFormat, ImageComp)> {
+    // Apple's OpenCL declares every image as texture2d<unknown, ...>: the element type is only in the write itself
+    // (air.write_texture_2d.u.v4i32 for write_imageui). Reading "unknown" as float made the storage image Rgba32f and
+    // refused every uint/int write ("unsupported texel shape": Geekbench 6 OpenCL Face Detection), so it is no hint
+    // and write_texture_dims decides.
+    if is_unknown_element(name) {
+        return None;
+    }
     let shape = crate::meta::texture_shape_from_name(name);
     let fmt = shape.storage_format?.to_spirv_format();
     Some((
@@ -730,6 +737,12 @@ fn texture_arg_storage(name: &str) -> Option<(Dim, bool, ImageFormat, ImageComp)
         fmt,
         shape.component.to_image_comp(),
     ))
+}
+
+fn is_unknown_element(name: &str) -> bool {
+    name.split_once('<')
+        .and_then(|(_, rest)| rest.split(|c: char| c == ',' || c == '>').next())
+        .is_some_and(|elem| elem.trim() == "unknown")
 }
 
 fn sample_dim(name: &str) -> (Dim, bool) {

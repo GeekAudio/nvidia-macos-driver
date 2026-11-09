@@ -1,5 +1,5 @@
+use crate::fxhash::{HashMap, HashSet};
 use spirv::Word;
-use std::collections::{HashMap, HashSet};
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct EmitSidecar {
@@ -20,6 +20,7 @@ pub(crate) struct EmitSidecar {
     pub(crate) buffer_pointer_dynamic_field_loads: Vec<BufferPointerDynamicFieldLoad>,
     pub(crate) buffer_pointer_heap_loads: Vec<BufferPointerHeapLoad>,
     pub(crate) device_handle_heap_loads: Vec<DeviceHandleHeapLoad>,
+    pub(crate) bda_pointer_addresses: Vec<BdaPointerAddress>,
     pub(crate) local_pointer_field_stores: Vec<LocalPointerFieldStore>,
     pub(crate) local_pointer_field_loads: Vec<LocalPointerFieldLoad>,
     pub(crate) local_pointer_dynamic_field_loads: Vec<LocalPointerDynamicFieldLoad>,
@@ -106,6 +107,21 @@ pub(crate) struct DeviceHandleHeapLoad {
     pub(crate) sampler: bool,
 }
 
+/// A device pointer the emitter replaced with its 64-bit ADDRESS.
+///
+/// Logical SPIR-V cannot hold a pointer loaded out of device memory, so for
+/// `%p = load ptr addrspace(1), ptr addrspace(1) %q` the emitter emits a ulong load for the ADDRESS and
+/// leaves the pointer-typed id undefined on purpose. `pointer` is that placeholder - in the value map,
+/// defined by nothing - and `address` is the real ulong instruction standing in for it. A pass handed
+/// the pointer id has to follow this to the address, which is exactly what the ray-query lowering needs:
+/// the game's acceleration structure arrives this way, and without this the pass reported
+/// "the acceleration structure operand %N has no definition in the entry function or the globals".
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct BdaPointerAddress {
+    pub(crate) pointer: Word,
+    pub(crate) address: Word,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct BufferPointerHeapLoad {
     pub(crate) id: Word,
@@ -179,6 +195,9 @@ impl EmitSidecar {
         for fact in &self.device_handle_heap_loads {
             ids.extend([fact.id, fact.slot]);
         }
+        for fact in &self.bda_pointer_addresses {
+            ids.extend([fact.pointer, fact.address]);
+        }
         for fact in &self.local_pointer_field_stores {
             ids.extend([fact.id, fact.source, fact.root]);
         }
@@ -242,6 +261,10 @@ impl EmitSidecar {
         for fact in &mut self.device_handle_heap_loads {
             replace(&mut fact.id);
             replace(&mut fact.slot);
+        }
+        for fact in &mut self.bda_pointer_addresses {
+            replace(&mut fact.pointer);
+            replace(&mut fact.address);
         }
         for fact in &mut self.local_pointer_field_stores {
             replace(&mut fact.id);
@@ -312,6 +335,41 @@ impl EmitSidecar {
 
     pub(crate) fn clone_inlined_facts(&mut self, remap: &HashMap<Word, Word>) {
         self.b78_remap_air_access_aligns(remap, true);
+        // A bindless texture or sampler handle read out of a device heap. Both the handle and the slot it
+        // masks out of the handle word live in the helper's body, so an inlined copy needs its own fact: the
+        // texture-array pass otherwise built the access chain on the ORIGINAL slot id, whose defining
+        // instruction left with the function it was inlined from, and the module was refused as invalid.
+        // Measured on a ray-tracing hit shader: ids 2904-2909 used, never defined.
+        let clones = self
+            .device_handle_heap_loads
+            .iter()
+            .filter_map(|fact| {
+                Some(DeviceHandleHeapLoad {
+                    // The handle is a PLACEHOLDER: the load emits no instruction, because the texture-array
+                    // pass replaces its use rather than its definition. So it is never in the remap, and
+                    // keying the clone on it dropped every one of these facts on inlining. The SLOT is a real
+                    // instruction and is remapped, so that is what says a copy was made; the copy keeps the
+                    // placeholder id, which the original no longer needs.
+                    id: remap.get(&fact.id).copied().unwrap_or(fact.id),
+                    slot: remap.get(&fact.slot).copied()?,
+                    sampler: fact.sampler,
+                })
+            })
+            .collect::<Vec<_>>();
+        self.device_handle_heap_loads.extend(clones);
+        // Same placeholder rule as above: the POINTER emits no instruction and is never in the
+        // remap, so the clone is keyed on the ADDRESS, which is a real ulong load.
+        let clones = self
+            .bda_pointer_addresses
+            .iter()
+            .filter_map(|fact| {
+                Some(BdaPointerAddress {
+                    pointer: remap.get(&fact.pointer).copied().unwrap_or(fact.pointer),
+                    address: remap.get(&fact.address).copied()?,
+                })
+            })
+            .collect::<Vec<_>>();
+        self.bda_pointer_addresses.extend(clones);
         let clones = self
             .buffer_access_offsets
             .iter()
@@ -464,7 +522,7 @@ mod b78_tcg_dw3d_tests {
             ..EmitSidecar::default()
         };
         for (arg, root) in [(101, 120), (201, 220)] {
-            let remap = HashMap::from([(10, arg), (20, root)]);
+            let remap = crate::fxhash::map_from([(10, arg), (20, root)]);
             sidecar.clone_inlined_facts(&remap);
             if old {
                 sidecar.remap_local_pointer_field_store_sources(&remap);
@@ -514,9 +572,9 @@ mod tests {
     #[test]
     fn inlining_clones_load_facts_and_remaps_store_sources() {
         let mut sidecar = EmitSidecar {
-            ordinary_plan_rejected_functions: HashSet::new(),
-            ownership_plan_rejected_functions: HashSet::new(),
-            post_lowering_cfg_construction_functions: HashSet::new(),
+            ordinary_plan_rejected_functions: HashSet::default(),
+            ownership_plan_rejected_functions: HashSet::default(),
+            post_lowering_cfg_construction_functions: HashSet::default(),
             buffer_access_offsets: vec![BufferAccessOffset {
                 id: 82,
                 root: 92,
@@ -553,7 +611,7 @@ mod tests {
             }],
             ..EmitSidecar::default()
         };
-        let remap = HashMap::from([
+        let remap = crate::fxhash::map_from([
             (20, 120),
             (30, 130),
             (40, 140),
@@ -677,17 +735,17 @@ mod tests {
         let mut sidecar = EmitSidecar {
             all_device_buffers_raw: false,
             construct_cross_binding_addresses: false,
-            ordinary_plan_rejected_functions: HashSet::new(),
-            ownership_plan_rejected_functions: HashSet::new(),
-            post_lowering_cfg_construction_functions: HashSet::new(),
+            ordinary_plan_rejected_functions: HashSet::default(),
+            ownership_plan_rejected_functions: HashSet::default(),
+            post_lowering_cfg_construction_functions: HashSet::default(),
             air_data_layout: None,
-            air_struct_offsets: HashMap::from([(5, vec![0, 16])]),
+            air_struct_offsets: crate::fxhash::map_from([(5, vec![0, 16])]),
             air_struct_layout_mappings: vec![AirStructLayoutMapping {
                 param_index: 2,
                 struct_ty: Some(5),
                 status: AirStructLayoutMappingStatus::MappedNatural,
             }],
-            flat_raw_buffer_params: HashSet::from([2]),
+            flat_raw_buffer_params: crate::fxhash::set_from([2]),
             buffer_address_words: vec![BufferAddressWord {
                 id: 10,
                 param_index: 2,
@@ -704,7 +762,7 @@ mod tests {
                 constant: 32,
                 terms: vec![(25, 48)],
             }],
-            buffer_root_source_types: HashMap::from([(18, 19)]),
+            buffer_root_source_types: crate::fxhash::map_from([(18, 19)]),
             buffer_pointer_field_loads: vec![BufferPointerFieldLoad {
                 id: 11,
                 root: 12,
@@ -726,6 +784,10 @@ mod tests {
                 id: 63,
                 slot: 64,
                 sampler: true,
+            }],
+            bda_pointer_addresses: vec![BdaPointerAddress {
+                pointer: 65,
+                address: 66,
             }],
             local_pointer_field_stores: vec![LocalPointerFieldStore {
                 id: 20,
@@ -751,9 +813,9 @@ mod tests {
                 indices: vec![1, 0],
             }],
             aliased_imageblock_staging: Some(51),
-            air_access_aligns: HashMap::new(),
+            air_access_aligns: HashMap::default(),
         };
-        let remap = HashMap::from([
+        let remap = crate::fxhash::map_from([
             (10, 110),
             (11, 111),
             (12, 112),
@@ -783,6 +845,8 @@ mod tests {
             (60, 160),
             (61, 161),
             (62, 162),
+            (65, 165),
+            (66, 166),
         ]);
 
         sidecar.remap_ids(&remap);
@@ -796,7 +860,16 @@ mod tests {
         );
         assert_eq!(
             sidecar.buffer_root_source_types,
-            HashMap::from([(118, 119)])
+            crate::fxhash::map_from([(118, 119)])
+        );
+        // A new id-carrying sidecar field is only covered once this test remaps it: the pointer is a
+        // placeholder no instruction defines, so nothing else would catch it being left behind.
+        assert_eq!(
+            sidecar.bda_pointer_addresses,
+            vec![BdaPointerAddress {
+                pointer: 165,
+                address: 166,
+            }]
         );
 
         assert_eq!(sidecar.air_struct_offsets.get(&105), Some(&vec![0, 16]));

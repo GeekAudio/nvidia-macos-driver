@@ -22,7 +22,7 @@ NVK  (Mesa's Vulkan driver for NVIDIA, with the NAK compiler)      [nvk/nvk-maco
 NVRM.kext  (NVIDIA's open GPU kernel modules, r610, ported to XNU) [kexts/NVRM]
         |  talks to the GPU's GSP firmware
         v
-GeForce RTX GPU  (GSP firmware from /Users/Shared/nvfw/nvidia/610.57.04)
+GeForce RTX GPU  (GSP firmware from /Library/NullMoth/nvfw/nvidia/615.78.08)
 ```
 
 Display and compositing run beside that path:
@@ -40,11 +40,15 @@ Linux's. At start it:
 1. claims the PCI device, maps its BARs, and places BAR1 (the GPU-visible window into video memory) outside the firmware
    console;
 2. holds the I/O registry busy so WindowServer does not start on the firmware screen;
-3. on its own thread, loads the GSP firmware from `/Users/Shared/nvfw/nvidia/610.57.04/` and boots the GPU with
+3. on its own thread, loads the GSP firmware from `/Library/NullMoth/nvfw/nvidia/615.78.08/` and boots the GPU with
    `rm_init_adapter()`;
 4. brings up NVKMS (NVIDIA's mode-setting) and releases the hold once the display is armed.
 
 The boot argument `-nvoff` makes NVRM leave the card alone. The recovery path below uses it.
+
+NVRM is also a power child of the GPU's PCI device: on system sleep it suspends NVKMS and puts RM in standby with all of
+video memory preserved, and on wake it restores the PCI state and resumes both. NVRMFB then does the wake work
+IOGraphics expects. [SLEEP-WAKE.md](SLEEP-WAKE.md) has the details.
 
 **NVRMFB.kext** is the macOS framebuffer (an `IOFramebuffer`). It publishes each NVKMS head as a display, reads real
 mode timings and EDIDs, and drives vblank from the GPU. **NVAccel.kext** is the `IOAccelerator` that WindowServer and
@@ -75,13 +79,17 @@ plugin's MPS convolution fast path is `plugin/nvconv.metal`.
 
 | Setting | Value | Why |
 |---|---|---|
-| `NVRAM > Add > 7C436110-…-FE41995C9F82 > boot-args` | `nvfb=1 nvaccel=1 nvfbheads=4 -nvkmsnosmooth amfi_get_out_of_my_way=0x1 amfi=0x80` | turns on the framebuffer and accelerator, 4 display heads; the AMFI arguments let WindowServer load the driver bundle |
+| `NVRAM > Add > 7C436110-…-FE41995C9F82 > boot-args` | `nvfb=1 nvaccel=1 nvfbheads=4 -nvkmsnosmooth amfi_get_out_of_my_way=0x1 amfi=0x80 ipc_control_port_options=0` | turns on the framebuffer and accelerator, 4 display heads; the AMFI arguments let WindowServer load the driver bundle |
 | `NVRAM > Add > … > csr-active-config` | `<430A0000>` | the SIP value the driver was tested with (its kexts are not Apple-signed) |
 | `Misc > Security > SecureBootModel` | `Disabled` | Apple Secure Boot refuses kexts Apple did not sign |
 | `UEFI > Quirks > ResizeGpuBars` | `13` | 8 GB BAR1 for full memory bandwidth; NVRM then moves BAR1 away from the boot screen (tested on the RTX 5060) |
 | `Booter > Quirks > ResizeAppleGpuBars` | `-1` | macOS sees the full BAR |
 | `Kernel > Block` | `com.apple.iokit.IONDRVSupport`, `Exclude` | otherwise the firmware framebuffer takes display index 0 from NVRMFB |
 | BIOS | Above 4G Decoding on, CSM off | the card maps memory above 4 GB |
+
+Optional boot arguments, for troubleshooting: `-nvrmnoflip` keeps NVAccel on the copy path (no zero-copy scan-out
+of the composited surface) and is the first thing to try when the desktop flashes or tears while the cursor moves;
+`-nvrmnogo` leaves the GPU idle until `nvrmctl go <pass>`; `-nvrmnobootscreen` skips the boot-screen snapshot.
 
 Installing macOS itself needs different values. The macOS installer has no NVIDIA driver, so it runs on the firmware's
 screen, which only survives macOS's PCI setup with a small BAR: `ResizeAppleGpuBars = 0`, `ResizeGpuBars = -1`, and
@@ -90,7 +98,8 @@ installs the driver.
 
 ## 5. The 1401 Mac app (installs the driver)
 
-`app/` builds **1401.app** (Swift + WebKit). The window is HTML/JS (`app/Resources/`). Every change to the system is
+**1401.app** lives in the [1401](https://github.com/nullmoth/1401) repository (`mac/`, Swift + WebKit; the window is
+HTML/JS in `mac/Resources/`). It installs a driver package with that package's own `install.sh`. Every change to the system is
 made by one root script, `nullmoth-setup.sh`, which the app runs through macOS's administrator prompt.
 
 **Finding OpenCore.** The script reads OpenCore's `boot-path` NVRAM variable, which names the partition OpenCore started
@@ -116,7 +125,7 @@ boot picker entry, and asks for a restart; the second run installs the driver an
 edits are undone. Then `uninstall.sh` removes the files and rebuilds the kernel collection.
 
 **The way back if the driver stops macOS starting.** Choosing *1401: Remove NVIDIA driver* in the boot picker runs
-`NullMothSafe.efi` (`app/efi-safe/`, Rust UEFI). It adds `-nvoff` to the boot arguments for the next start and sets the
+`NullMothSafe.efi` (1401's `mac/efi-safe/`, Rust UEFI). It adds `-nvoff` to the boot arguments for the next start and sets the
 NVRAM flag `nullmoth-remove=1`. macOS then starts without the driver, the LaunchDaemon `com.nullmoth.recover` sees the
 flag, runs `nullmoth-setup.sh --remove`, and restarts.
 
@@ -137,5 +146,7 @@ Nothing is sent; you can upload the file on the site yourself.
 
 ## 7. Building
 
-See the README, *Build from source*. The kexts need NVIDIA's `open-gpu-kernel-modules` at tag `610.57.04`; NVK needs
-Mesa `17ca6174` with `nvk/nvk-macos.patch`.
+See the README, *Build from source*. The kexts need NVIDIA's `open-gpu-kernel-modules` at tag `615.78.08`; NVK needs
+Mesa `17ca6174` with, in order, `nvk/nvk-macos.patch`, `nvk/nvk-fixes-after-def16.patch` and `nvk/nvk-620-kernel.patch`
+(`patch -p1` from the Mesa root). NVK compiles against the `open-gpu-kernel-modules` 610.57.04 headers with
+`nvk/ogkm-nvos-620.patch` applied to that tree; 620's `nv.h` does not compile in user space, so the rest stays 610.

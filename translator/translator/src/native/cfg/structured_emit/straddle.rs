@@ -140,13 +140,35 @@ fn privatize_direct_construct_tree_shared_continuations(
 ) -> Option<Vec<BodyBlock>> {
     const DIRECT_SHARED_ROUNDS: usize = 64;
     const DIRECT_SHARED_GROWTH_CAP: usize = 4_000;
+    // Privatizing one continuation must leave fewer shared ones to privatize. On MPS's depthwiseConv_3x3 every clone
+    // exposed more (58 candidates at 318 blocks, 319 at 4,155), each search took seconds at that size, and the
+    // function never finished translating: Vision's barcode reader hung and then aborted its app (#334), and the
+    // Geekbench Background Blur kernel ran past 180 s (#111). Rounds that do not lower the candidate count are not
+    // converging; after this many in a row the strategy keeps the graph from its last improving round (or none, so the
+    // caller's next emission path runs).
+    const DIRECT_SHARED_STALLED_ROUNDS: usize = 4;
     let mut cur = blocks.to_vec();
     let mut changed = false;
     let mut counter = 7_500_000usize;
     let max_blocks = blocks.len().saturating_add(DIRECT_SHARED_GROWTH_CAP);
+    let (mut fewest, mut stalled) = (usize::MAX, 0usize);
+    let mut best: Option<Vec<BodyBlock>> = None;
     for _ in 0..DIRECT_SHARED_ROUNDS {
         let mut next = None;
-        for (header, continuation) in clone_crossarm::find_deep_shared_continuations(&cur) {
+        let candidates = clone_crossarm::find_deep_shared_continuations(&cur);
+        if candidates.len() < fewest {
+            fewest = candidates.len();
+            stalled = 0;
+            if changed {
+                best = Some(cur.clone());
+            }
+        } else {
+            stalled += 1;
+            if stalled >= DIRECT_SHARED_STALLED_ROUNDS {
+                return best;
+            }
+        }
+        for (header, continuation) in candidates {
             let Some(cloned) = clone_crossarm::privatize_dominated_region(
                 &cur,
                 &header,
@@ -299,8 +321,11 @@ pub(in crate::native) fn structured_plan_inner8(
     let terminal_blocks = terminal
         .map(|plan| plan.blocks.as_slice())
         .unwrap_or(terminal_input);
-    let (base_lblocks, mut loop_merges) =
-        forest_loop_merges(terminal_blocks, converge_inloop, multi_exit_clone);
+    let (base_lblocks, mut loop_merges) = super::plan_cache::forest_loop_merges_cached(
+        terminal_blocks,
+        converge_inloop,
+        multi_exit_clone,
+    );
     let terminal_dispatch = if terminal_exit_selection {
         terminal_unreachable_selection_merges(&base_lblocks)
     } else {
@@ -314,7 +339,7 @@ pub(in crate::native) fn structured_plan_inner8(
         .as_ref()
         .map(|plan| plan.blocks.clone())
         .unwrap_or(base_lblocks);
-    let mut terminal_merges = HashMap::new();
+    let mut terminal_merges = HashMap::default();
     if let Some(plan) = terminal {
         terminal_merges.extend(plan.merges.clone());
     }
@@ -342,46 +367,59 @@ pub(in crate::native) fn structured_plan_inner8(
             return None;
         }
     }
-    let (mut sblocks, mut branch, mut branch_merges_by_header, switch) = if construct_tree_owned {
-        unique_selection_merges_with_construct_tree_ownership(
+    let (sblocks, mut branch, mut branch_merges_by_header, switch) =
+        super::plan_cache::selection_cached(
             &lblocks,
             &loop_merges,
+            &terminal_merges,
             break_aware,
             loop_exit_selection,
-            &terminal_merges,
-        )
-    } else {
-        unique_selection_merges_with_loop_exit_and_forced(
-            &lblocks,
-            &loop_merges,
-            break_aware,
-            loop_exit_selection,
-            &terminal_merges,
-        )
-    };
-    if !construct_tree_owned {
-        index_branch_merges_by_header(
-            &sblocks,
-            &loop_merges,
-            &branch,
-            &mut branch_merges_by_header,
+            construct_tree_owned,
+            || {
+                let (mut sblocks, mut branch, mut branch_merges_by_header, switch) =
+                    if construct_tree_owned {
+                        unique_selection_merges_with_construct_tree_ownership(
+                            &lblocks,
+                            &loop_merges,
+                            break_aware,
+                            loop_exit_selection,
+                            &terminal_merges,
+                        )
+                    } else {
+                        unique_selection_merges_with_loop_exit_and_forced(
+                            &lblocks,
+                            &loop_merges,
+                            break_aware,
+                            loop_exit_selection,
+                            &terminal_merges,
+                        )
+                    };
+                if !construct_tree_owned {
+                    index_branch_merges_by_header(
+                        &sblocks,
+                        &loop_merges,
+                        &branch,
+                        &mut branch_merges_by_header,
+                    );
+                }
+                normalize_continue_selection_merge_targets(
+                    &mut sblocks,
+                    &loop_merges,
+                    &mut branch_merges_by_header,
+                );
+                if !construct_tree_owned {
+                    branch = sblocks
+                        .iter()
+                        .filter_map(|block| {
+                            let (true_target, false_target) = conditional_branch_targets(block)?;
+                            let merge = branch_merges_by_header.get(&block.name)?;
+                            Some(((true_target, false_target), merge.clone()))
+                        })
+                        .collect();
+                }
+                (sblocks, branch, branch_merges_by_header, switch)
+            },
         );
-    }
-    normalize_continue_selection_merge_targets(
-        &mut sblocks,
-        &loop_merges,
-        &mut branch_merges_by_header,
-    );
-    if !construct_tree_owned {
-        branch = sblocks
-            .iter()
-            .filter_map(|block| {
-                let (true_target, false_target) = conditional_branch_targets(block)?;
-                let merge = branch_merges_by_header.get(&block.name)?;
-                Some(((true_target, false_target), merge.clone()))
-            })
-            .collect();
-    }
     if selection_synth_growth_exceeds_ladder_cap(lblocks.len(), sblocks.len()) {
         spi_reject!(format!(
             "selection-synth-growth nblk={} from={}",
@@ -394,7 +432,7 @@ pub(in crate::native) fn structured_plan_inner8(
     let forest = analyze(&sblocks);
     let loop_headers: HashSet<&str> = forest.loops.iter().map(|l| l.header.as_str()).collect();
     let names: HashSet<&str> = sblocks.iter().map(|b| b.name.as_str()).collect();
-    let mut header_merge: HashMap<String, String> = HashMap::new();
+    let mut header_merge: HashMap<String, String> = HashMap::default();
     for (h, info) in &loop_merges {
         header_merge.insert(h.clone(), info.merge.clone());
     }
@@ -589,7 +627,7 @@ fn conflicting_phi_predecessor_reason(blocks: &[BodyBlock]) -> Option<String> {
             let Some((_, incoming)) = inst.phi_incoming() else {
                 continue;
             };
-            let mut value_by_predecessor = HashMap::new();
+            let mut value_by_predecessor = HashMap::default();
             for (value, predecessor) in incoming {
                 if value_by_predecessor
                     .insert(predecessor.as_str(), value)
@@ -629,7 +667,7 @@ pub(in crate::native) fn restructure_straddle_loop_merges_with(
     let forest = analyze(&sblocks);
     let loop_headers: HashSet<&str> = forest.loops.iter().map(|l| l.header.as_str()).collect();
     let names: HashSet<&str> = sblocks.iter().map(|b| b.name.as_str()).collect();
-    let mut header_merge: HashMap<String, String> = HashMap::new();
+    let mut header_merge: HashMap<String, String> = HashMap::default();
     for (h, info) in &loop_merges {
         header_merge.insert(h.clone(), info.merge.clone());
     }
@@ -891,7 +929,7 @@ fn append_straddle_witness_lines(
         .iter()
         .map(|block| (block.name.as_str(), block))
         .collect();
-    let mut header_merge: HashMap<String, String> = HashMap::new();
+    let mut header_merge: HashMap<String, String> = HashMap::default();
     for (h, info) in &loop_merges {
         header_merge.insert(h.clone(), info.merge.clone());
     }
@@ -1092,7 +1130,7 @@ fn straddle_closure_stats(
     owner_merge: &str,
 ) -> StraddleClosureStats {
     let names: HashSet<&str> = blocks.iter().map(|block| block.name.as_str()).collect();
-    let mut preds: HashMap<String, Vec<String>> = HashMap::new();
+    let mut preds: HashMap<String, Vec<String>> = HashMap::default();
     for block in blocks {
         for succ in block_successors(block) {
             if names.contains(succ.as_str()) {
@@ -1101,7 +1139,7 @@ fn straddle_closure_stats(
         }
     }
 
-    let mut reaches_loop_merge = HashSet::new();
+    let mut reaches_loop_merge = HashSet::default();
     let mut stack = vec![loop_merge.to_string()];
     while let Some(node) = stack.pop() {
         if !reaches_loop_merge.insert(node.clone()) {
@@ -1115,7 +1153,7 @@ fn straddle_closure_stats(
     let loop_body: HashSet<&str> = loop_body.iter().map(String::as_str).collect();
     let mut owner_arm_blocks = 0usize;
     let mut merge_tail_blocks = 0usize;
-    let mut closure = HashSet::new();
+    let mut closure = HashSet::default();
     for block in blocks {
         let name = block.name.as_str();
         let in_owner_arm = forest.dominates(owner, name)
@@ -1400,7 +1438,7 @@ pub(in crate::native) fn find_synthesized_cross_arm_shared(
     let forest = analyze(&sblocks);
     let loop_headers: HashSet<&str> = forest.loops.iter().map(|l| l.header.as_str()).collect();
     let names: HashSet<&str> = sblocks.iter().map(|b| b.name.as_str()).collect();
-    let mut header_merge: HashMap<String, String> = HashMap::new();
+    let mut header_merge: HashMap<String, String> = HashMap::default();
     for (h, info) in &loop_merges {
         header_merge.insert(h.clone(), info.merge.clone());
     }

@@ -220,6 +220,12 @@ pub(in crate::passes) enum ParamBinding {
         var: Word,
         specialized_state: Option<StaticSamplerState>,
     },
+    /// `array<sampler, N>` arrives byval as `[N x ptr addrspace(2)]`; the whole parameter is one
+    /// Vulkan descriptor array of `OpTypeSampler`, and `materialize_sampler_array_loads` retypes
+    /// each element load to a sampler value.
+    SamplerArray {
+        var: Word,
+    },
     Buffer { var: Word, wrap: BufWrap },
     StageInput {
         var: Word,
@@ -250,27 +256,6 @@ fn declared_descriptor_counts(
     let mut declared = counts.iter().collect::<Vec<_>>();
     declared.sort();
     for (&idx, &count) in declared {
-        let is_sampler = match stage {
-            Stage::Fragment => matches!(
-                frag.and_then(|m| m.role_of(idx)),
-                Some(FragRole::Sampler(_))
-            ),
-            Stage::Vertex => matches!(
-                vert.and_then(|m| m.role_of(idx)),
-                Some(VertRole::Sampler(_))
-            ),
-            Stage::Kernel => matches!(
-                kern.and_then(|m| m.role_of(idx)),
-                Some(KernRole::Sampler(_))
-            ),
-        };
-        if is_sampler {
-            return Err(format!(
-                "entry parameter {idx} is an array of {count} samplers, which this translator has \
-                 no descriptor-array lowering for; emitting the module would sample with a \
-                 synthesized default sampler instead of the one the shader selected"
-            ));
-        }
         let texture_type_name = match stage {
             Stage::Fragment => frag.and_then(|m| m.texture_type_name(idx)),
             Stage::Vertex => vert.and_then(|m| m.texture_type_name(idx)),
@@ -494,6 +479,8 @@ pub(super) fn build_stage_input(
                 Some(VertRole::Sampler(_)) => s == "sampler",
                 Some(VertRole::VertexId) => s == "vertex_id",
                 Some(VertRole::InstanceId) => s == "instance_id",
+                Some(VertRole::BaseVertex) => s == "base_vertex",
+                Some(VertRole::BaseInstance) => s == "base_instance",
                 Some(VertRole::PatchControlPoints) => s == "patch_control_points",
                 Some(VertRole::PatchInput(_)) => s == "patch_input",
                 Some(VertRole::PositionInPatch) => s == "position_in_patch",
@@ -743,6 +730,13 @@ pub(super) fn build_stage_input(
             )?;
             decorate_binding(&mut ctx.module, var, descriptor_layout.set, binding);
             ctx.interface_buffer_var(var);
+            if !wtex_dims.contains_key(pid) && dim != Dim::DimBuffer {
+                // the per-draw table holds slots for texture indices 0..128; an array_ref's length is unknown
+                // (its count is that ceiling), so it reaches the indices left from its base
+                if let Some(base) = metal_texture_index.filter(|base| *base < 128) {
+                    ctx.image_array_base.insert(var, (base, descriptor_count.min(128 - base)));
+                }
+            }
             bindings.push((
                 *pid,
                 ParamBinding::ImageArray {
@@ -848,7 +842,9 @@ pub(super) fn build_stage_input(
                 vec![Operand::StorageClass(StorageClass::UniformConstant)],
             ));
             let binding = required_resource_binding(*pid, resource_binding)?;
-            decorate_binding(&mut ctx.module, var, descriptor_layout.set, binding);
+            // set 3: the driver binds the open pass's colour views there for each fetching draw, apart from the per-draw
+            // resource sets 0/1, so every pipeline of a pass keeps compatible layouts for sets 0-2
+            decorate_binding(&mut ctx.module, var, crate::reflect::INPUT_ATTACHMENT_SET, binding);
             decorate_input_attachment_index(&mut ctx.module, var, color_index);
             ctx.interface_buffer_var(var);
             bindings.push((
@@ -861,18 +857,6 @@ pub(super) fn build_stage_input(
                 },
             ));
         } else if role_is("sampler") {
-            let sty = ctx.ty_sampler();
-            let pptr = ctx.ty_ptr(StorageClass::UniformConstant, sty);
-            let var = ctx.module.fresh_id();
-            ctx.new_globals.push(Instruction::new(
-                Op::Variable,
-                Some(pptr),
-                Some(var),
-                vec![Operand::StorageClass(StorageClass::UniformConstant)],
-            ));
-            let binding = required_resource_binding(*pid, resource_binding)?;
-            decorate_binding(&mut ctx.module, var, descriptor_layout.set, binding);
-            ctx.interface_buffer_var(var);
             let metal_index = match stage {
                 Stage::Fragment => frag.and_then(|meta| match meta.role_of(idx) {
                     Some(FragRole::Sampler(index)) => Some(*index),
@@ -888,19 +872,80 @@ pub(super) fn build_stage_input(
                 }),
             }
             .ok_or_else(|| format!("sampler parameter {pid} has no Metal sampler index"))?;
-            let specialized_state = usize::try_from(metal_index)
-                .ok()
-                .and_then(|index| ctx.runtime_sampler_states.get(index))
-                .copied()
-                .flatten()
-                .map(RuntimeSamplerState::lowering_state);
-            bindings.push((
-                *pid,
-                ParamBinding::Sampler {
-                    var,
-                    specialized_state,
-                },
-            ));
+            let declared_count = match stage {
+                Stage::Fragment => frag.and_then(|meta| meta.declared_descriptor_count(idx)),
+                Stage::Vertex => vert.and_then(|meta| meta.declared_descriptor_count(idx)),
+                Stage::Kernel => kern.and_then(|meta| meta.declared_descriptor_count(idx)),
+            };
+            // `array<sampler, N>` arrives byval as `[N x ptr addrspace(2)]`: every element is its
+            // own descriptor, at its own sampler index. The plugin's layout declares one sampler
+            // per binding (count 1), so the elements become N sampler variables at consecutive
+            // bindings, and the resource pass turns each constant element load into a load of its
+            // variable. One `[N x sampler]` variable at the first binding compiled, but on NVK its
+            // element 1 read past that count-1 binding and sampled with the wrong sampler (GPU
+            // probe 10-28: linear sampler in slot 1 returned the nearest result).
+            let array_count = declared_count.filter(|count| *count > 1);
+            if let Some(count) = array_count {
+                let pointee = ptr_pointee(&defs, *pty).ok_or_else(|| {
+                    format!("sampler array parameter {pid} type {pty} is not a pointer")
+                })?;
+                let llvm_count = array_type(&defs, pointee).map(|(_, length)| length);
+                if llvm_count != Some(count) {
+                    return Err(format!(
+                        "entry parameter {idx} occupies {count} sampler descriptors per \
+                         `air.location_index`, but its type states {llvm_count:?}; emitting the \
+                         module would size the descriptor array from an ABI its type contradicts"
+                    ));
+                }
+                // every element is a variable and a binding of its own: the count comes from the shader,
+                // so it is held to the sampler indices a stage has
+                if metal_index.checked_add(count).is_none_or(|end| end > crate::reflect::SAMPLER_ARGUMENT_COUNT) {
+                    return Err(format!(
+                        "entry parameter {idx} is an array of {count} samplers from index {metal_index}, \
+                         past the {} sampler indices a stage has",
+                        crate::reflect::SAMPLER_ARGUMENT_COUNT
+                    ));
+                }
+            }
+            let sty = ctx.ty_sampler();
+            let pptr = ctx.ty_ptr(StorageClass::UniformConstant, sty);
+            let binding = required_resource_binding(*pid, resource_binding)?;
+            let mut elements = Vec::new();
+            for element in 0..array_count.unwrap_or(1) {
+                let var = ctx.module.fresh_id();
+                ctx.new_globals.push(Instruction::new(
+                    Op::Variable,
+                    Some(pptr),
+                    Some(var),
+                    vec![Operand::StorageClass(StorageClass::UniformConstant)],
+                ));
+                decorate_binding(&mut ctx.module, var, descriptor_layout.set, binding + element);
+                ctx.interface_buffer_var(var);
+                elements.push(var);
+            }
+            let var = elements[0];
+            match array_count {
+                Some(_) => {
+                    // the parameter is spliced to element 0; the element loads name it as their root
+                    ctx.sampler_array_vars.insert(var, elements);
+                    bindings.push((*pid, ParamBinding::SamplerArray { var }));
+                }
+                None => {
+                    let specialized_state = usize::try_from(metal_index)
+                        .ok()
+                        .and_then(|index| ctx.runtime_sampler_states.get(index))
+                        .copied()
+                        .flatten()
+                        .map(RuntimeSamplerState::lowering_state);
+                    bindings.push((
+                        *pid,
+                        ParamBinding::Sampler {
+                            var,
+                            specialized_state,
+                        },
+                    ));
+                }
+            }
         } else if is_threadgroup_buffer {
             let pointee = ptr_pointee(&defs, *pty)
                 .ok_or_else(|| format!("threadgroup param {pid} type {pty} is not a pointer"))?;
@@ -1523,9 +1568,16 @@ pub(super) fn build_stage_input(
                     },
                 ));
             }
-        } else if role_is("vertex_id") || role_is("instance_id") {
+        } else if role_is("vertex_id") || role_is("instance_id") || role_is("base_vertex") || role_is("base_instance") {
+            // Metal's vertex_id / instance_id already include the base, like Vulkan's VertexIndex / InstanceIndex, so the
+            // bases map one to one. WAS: base_vertex / base_instance had no lowering and every pipeline using them was
+            // refused (Blender 4.2's specialized UI shaders: the app crashed at startup, 10-09).
             let builtin = if role_is("vertex_id") {
                 BuiltIn::VertexIndex
+            } else if role_is("base_vertex") {
+                BuiltIn::BaseVertex
+            } else if role_is("base_instance") {
+                BuiltIn::BaseInstance
             } else {
                 BuiltIn::InstanceIndex
             };
@@ -2063,7 +2115,7 @@ pub(super) fn build_stage_input(
             all_defs.entry(id).or_insert_with(|| g.clone());
         }
     }
-    let mut block_decorated: HashSet<Word> = HashSet::new();
+    let mut block_decorated: HashSet<Word> = HashSet::default();
     for (var, struct_ty) in &buffer_structs {
         if block_decorated.insert(*struct_ty) {
             decorate_block_struct(ctx, *struct_ty, &all_defs);
@@ -2109,7 +2161,7 @@ pub(super) fn build_stage_input(
         );
     }
     lower_patch_control_point_calls(ctx, entry_idx, vert, &all_defs)?;
-    lower_buffer_address_facts(ctx, entry_idx, kern)?;
+    lower_buffer_address_facts(ctx, entry_idx, BufferAddressRoles { kern, vert, frag })?;
 
     Ok(defs)
 }
@@ -2699,7 +2751,7 @@ impl Ctx {
         ty: Word,
         defs: &HashMap<Word, Instruction>,
     ) -> Word {
-        let mut memo = HashMap::new();
+        let mut memo = HashMap::default();
         self.clone_type_for_record_array_element_inner(ty, defs, &mut memo)
     }
 
@@ -2763,7 +2815,7 @@ mod tests {
 
     #[test]
     fn typed_buffer_alias_elements_include_numeric_vectors() {
-        let defs = HashMap::from([
+        let defs = crate::fxhash::map_from([
             (
                 1,
                 Instruction::new(
@@ -2803,7 +2855,7 @@ mod tests {
 
     #[test]
     fn tess_coord_binding_preserves_float3_and_only_truncates_float2() {
-        let mut defs = HashMap::new();
+        let mut defs = HashMap::default();
         defs.insert(1, ty(Op::TypeFloat, 1, vec![Operand::LiteralBit32(32)]));
         defs.insert(
             2,
@@ -2837,7 +2889,7 @@ mod tests {
 
     #[test]
     fn fragment_input_needs_flat_only_for_integer_and_double() {
-        let mut defs = HashMap::new();
+        let mut defs = HashMap::default();
         defs.insert(
             1,
             ty(
@@ -2882,7 +2934,7 @@ mod tests {
 
     #[test]
     fn type_contains_bool_descends_through_vectors() {
-        let mut defs = HashMap::new();
+        let mut defs = HashMap::default();
         defs.insert(1, ty(Op::TypeBool, 1, vec![]));
         defs.insert(2, ty(Op::TypeFloat, 2, vec![Operand::LiteralBit32(32)]));
         defs.insert(
@@ -2910,7 +2962,7 @@ mod tests {
 
     #[test]
     fn layout_types_reachable_from_walks_nested_struct_and_array_members() {
-        let mut defs = HashMap::new();
+        let mut defs = HashMap::default();
         defs.insert(
             1,
             ty(

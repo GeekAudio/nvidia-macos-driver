@@ -167,8 +167,8 @@ pub(in crate::passes) fn validate_descriptor_binding_classes_with_ray_table(
         .iter()
         .filter_map(|instruction| instruction.result_id.map(|result| (result, instruction)))
         .collect::<HashMap<_, _>>();
-    let mut sets = HashMap::<Word, u32>::new();
-    let mut bindings = HashMap::<Word, u32>::new();
+    let mut sets = HashMap::<Word, u32>::default();
+    let mut bindings = HashMap::<Word, u32>::default();
     for annotation in &module.annotations {
         if annotation.class.opcode != Op::Decorate {
             continue;
@@ -310,7 +310,8 @@ pub(in crate::passes) fn validate_descriptor_binding_classes_with_ray_table(
                 || (binding == crate::reflect::BINDLESS_STORAGE_BINDING && class == DescriptorClass::StorageImage)
                 || (binding == crate::reflect::BINDLESS_UTEXEL_BINDING && class == DescriptorClass::UniformTexelBuffer)
                 || (binding == crate::reflect::BINDLESS_STEXEL_BINDING && class == DescriptorClass::StorageTexelBuffer));
-        if !bindless_heap && (set != layout.set || !allowed) {
+        let input_attachment = set == crate::reflect::INPUT_ATTACHMENT_SET && class == DescriptorClass::InputAttachment && allowed;
+        if !bindless_heap && !input_attachment && (set != layout.set || !allowed) {
             return Err(format!(
                 "descriptor variable {} has class {class:?} at set {set} binding {binding}, outside its ABI band",
                 label(id)

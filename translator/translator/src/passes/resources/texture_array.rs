@@ -1,5 +1,5 @@
-use std::collections::HashMap;
-use std::collections::HashSet;
+use crate::fxhash::HashMap;
+use crate::fxhash::HashSet;
 
 use crate::spirv_module::Instruction;
 use crate::spirv_module::Operand;
@@ -13,7 +13,7 @@ pub(crate) fn materialize_texture_array_loads(ctx: &mut Ctx, entry_idx: usize) {
     }
     let names = air_names(&ctx.module);
 
-    let mut defs: HashMap<Word, Instruction> = HashMap::new();
+    let mut defs: HashMap<Word, Instruction> = HashMap::default();
     for blk in &ctx.module.functions[entry_idx].blocks {
         for inst in &blk.instructions {
             if let Some(rid) = inst.result_id {
@@ -59,7 +59,7 @@ pub(crate) fn materialize_texture_array_loads(ctx: &mut Ctx, entry_idx: usize) {
             alias = *source;
         }
     }
-    let mut local_table_handles = HashMap::new();
+    let mut local_table_handles = HashMap::default();
     for fact in &ctx.emit_sidecar.local_pointer_dynamic_field_loads {
         let resolved = local_table_array_elements(ctx, &defs, fact, &fixed_handles);
         if let Some(resolved) = resolved {
@@ -98,10 +98,10 @@ pub(crate) fn materialize_texture_array_loads(ctx: &mut Ctx, entry_idx: usize) {
 
     let mut candidates: Vec<(Word, Word)> = Vec::new();
     let mut table_candidates = Vec::new();
-    let mut handles: HashMap<Word, (Word, Word)> = HashMap::new();
+    let mut handles: HashMap<Word, (Word, Word)> = HashMap::default();
     let mut handle_order: Vec<Word> = Vec::new();
-    let mut handle_preludes: HashMap<Word, Vec<Instruction>> = HashMap::new();
-    let mut seen: std::collections::HashSet<Word> = std::collections::HashSet::new();
+    let mut handle_preludes: HashMap<Word, Vec<Instruction>> = HashMap::default();
+    let mut seen: crate::fxhash::HashSet<Word> = crate::fxhash::HashSet::default();
     let device_texture_slots: HashMap<Word, Word> = ctx
         .emit_sidecar
         .device_handle_heap_loads
@@ -251,8 +251,8 @@ pub(crate) fn materialize_texture_array_loads(ctx: &mut Ctx, entry_idx: usize) {
         return;
     }
 
-    let mut new_access_chains: HashMap<Word, Instruction> = HashMap::new();
-    let mut retyped_load_ptr: HashMap<Word, (Word, Word)> = HashMap::new();
+    let mut new_access_chains: HashMap<Word, Instruction> = HashMap::default();
+    let mut retyped_load_ptr: HashMap<Word, (Word, Word)> = HashMap::default();
     let mut dead_roots: Vec<Word> = Vec::new();
     for &handle in &handle_order {
         let (arrayvar, idx) = handles[&handle];
@@ -296,8 +296,10 @@ pub(crate) fn materialize_texture_array_loads(ctx: &mut Ctx, entry_idx: usize) {
     }
     dead_roots.extend(handle_order.iter().map(|handle| handles[handle].0));
 
-    let mut placeholder_uses: HashMap<(usize, usize), (Instruction, Instruction, Word)> =
-        HashMap::new();
+    // chain, load, image, and the handle the three came from: the handle names the prelude that computes the
+    // heap index, and without it the chain references an index no instruction defines.
+    let mut placeholder_uses: HashMap<(usize, usize), (Instruction, Instruction, Word, Word)> =
+        HashMap::default();
     let mut placeholder_specs = Vec::new();
     for (block_idx, block) in ctx.module.functions[entry_idx].blocks.iter().enumerate() {
         for (inst_idx, inst) in block.instructions.iter().enumerate() {
@@ -313,10 +315,10 @@ pub(crate) fn materialize_texture_array_loads(ctx: &mut Ctx, entry_idx: usize) {
             if defs.contains_key(handle) {
                 continue;
             }
-            placeholder_specs.push((block_idx, inst_idx, arrayvar, idx));
+            placeholder_specs.push((block_idx, inst_idx, arrayvar, idx, *handle));
         }
     }
-    for (block_idx, inst_idx, arrayvar, idx) in placeholder_specs {
+    for (block_idx, inst_idx, arrayvar, idx, handle) in placeholder_specs {
         let &(image_ty, dim, comp, multisampled) = ctx.image_array_vars.get(&arrayvar).unwrap();
         let ptr_image = ctx.ty_ptr(StorageClass::UniformConstant, image_ty);
         let pointer = ctx.module.fresh_id();
@@ -346,7 +348,7 @@ pub(crate) fn materialize_texture_array_loads(ctx: &mut Ctx, entry_idx: usize) {
                 ctx.register_runtime_storage_image_value(image, metal_index, Some(state));
             }
         }
-        placeholder_uses.insert((block_idx, inst_idx), (chain, load, image));
+        placeholder_uses.insert((block_idx, inst_idx), (chain, load, image, handle));
     }
 
     let func = &mut ctx.module.functions[entry_idx];
@@ -354,7 +356,16 @@ pub(crate) fn materialize_texture_array_loads(ctx: &mut Ctx, entry_idx: usize) {
         let mut rebuilt: Vec<Instruction> =
             Vec::with_capacity(blk.instructions.len() + handles.len());
         for (inst_idx, inst) in blk.instructions.clone().into_iter().enumerate() {
-            if let Some((chain, load, image)) = placeholder_uses.remove(&(block_idx, inst_idx)) {
+            if let Some((chain, load, image, handle)) =
+                placeholder_uses.remove(&(block_idx, inst_idx))
+            {
+                // The index this chain reads is defined by the handle's prelude. The other path below already
+                // emits it; this one did not, so a ray-tracing hit shader's bindless texture - a handle with no
+                // defining instruction of its own in the entry - built a chain on an undefined id and the whole
+                // module was refused as invalid.
+                if let Some(prelude) = handle_preludes.remove(&handle) {
+                    rebuilt.extend(prelude);
+                }
                 rebuilt.push(chain);
                 rebuilt.push(load);
                 let mut call = inst;
@@ -386,8 +397,170 @@ pub(crate) fn materialize_texture_array_loads(ctx: &mut Ctx, entry_idx: usize) {
     ctx.emit_sidecar
         .local_pointer_dynamic_field_loads
         .retain(|fact| !handles.contains_key(&fact.id));
+    // A handle this run materialized is spent: its heap-slot computation is retired with it. This pass runs
+    // more than once, and leaving the fact behind made the second run rebuild the access chain on a slot id
+    // the first run had already removed - an index no instruction defines, and the module refused as invalid.
+    // The entry's own textures survived because their first run resolved them; a ray-tracing hit shader's did
+    // not, which is why it took a ray-tracing kernel to show this.
+    ctx.emit_sidecar
+        .device_handle_heap_loads
+        .retain(|fact| !handles.contains_key(&fact.id));
 
     retire_dead_pointer_projections(ctx, entry_idx, dead_roots.iter().copied());
+}
+
+/// Element `i` of a sampled `array<texture, N>` entry parameter reads the texture bound at Metal index
+/// `base + i` the way a single texture does under bindless-all: its heap slot from the per-draw table,
+/// then the heap. The plugin declares every texture index as its own count-1 binding, so the
+/// `[N x image]` variable at the first binding read element 1 past that binding: a probe sampling two
+/// depth maps through `array<depth2d<float>, 2>` compared element 1 against map 0 (RTX 5060, 10-28;
+/// an M1 Pro reads map 1). The table holds a slot for every index the app bound, constant or dynamic
+/// `i` alike. Runs after every pass that recognises the array variable's own access chains.
+pub(crate) fn route_texture_array_elements_through_heap(ctx: &mut Ctx, entry_idx: usize) {
+    if ctx.image_array_base.is_empty()
+        || !super::bindless_all_on()
+        || !super::address_table_usable(ctx)
+    {
+        return;
+    }
+    let mut sites: Vec<(usize, usize, Word, Word, Word, Word, u32, u32)> = Vec::new();
+    for (block_idx, block) in ctx.module.functions[entry_idx].blocks.iter().enumerate() {
+        for (inst_idx, inst) in block.instructions.iter().enumerate() {
+            if !matches!(inst.class.opcode, Op::AccessChain | Op::InBoundsAccessChain) {
+                continue;
+            }
+            let [Operand::IdRef(var), Operand::IdRef(idx)] = inst.operands.as_slice() else {
+                continue;
+            };
+            let (Some(&(base, count)), Some(result), Some(result_ty)) =
+                (ctx.image_array_base.get(var), inst.result_id, inst.result_type)
+            else {
+                continue;
+            };
+            sites.push((block_idx, inst_idx, result, result_ty, *var, *idx, base, count));
+        }
+    }
+    if sites.is_empty() {
+        return;
+    }
+    let Ok((table, word_ptr_ty, wide)) = super::ensure_address_table(ctx) else {
+        return;
+    };
+    let uint_ty = ctx.ty_uint();
+    let c0 = ctx.const_uint(0);
+    let mask = ctx.const_uint(crate::reflect::BINDLESS_HEAP_SLOTS - 1);
+    let local_types: HashMap<Word, Word> = ctx.module.functions[entry_idx]
+        .blocks
+        .iter()
+        .flat_map(|block| block.instructions.iter())
+        .filter_map(|inst| Some((inst.result_id?, inst.result_type?)))
+        .collect();
+    let mut replacements: HashMap<(usize, usize), Vec<Instruction>> = HashMap::default();
+    for (block_idx, inst_idx, result, result_ty, var, idx, base, count) in sites {
+        let &(elem_ty, dims, comp, _) = ctx.image_array_vars.get(&var).unwrap();
+        let mut out = Vec::new();
+        // the element index as a 32-bit unsigned value: AIR's dynamic indices are 64-bit (a GEP index), a
+        // signed 32-bit one is reinterpreted; an index whose type cannot be read leaves the chain as it was
+        let index_ty = local_types.get(&idx).copied().or_else(|| value_result_type(ctx, idx));
+        let width = index_ty.and_then(|ty| type_def_of(ctx, ty)).and_then(|def| {
+            (def.class.opcode == Op::TypeInt).then(|| match def.operands.first() {
+                Some(Operand::LiteralBit32(width)) => Some(*width),
+                _ => None,
+            })?
+        });
+        let index = match (index_ty, width) {
+            (Some(ty), _) if ty == uint_ty => idx,
+            (Some(_), Some(32)) => {
+                let cast = ctx.module.fresh_id();
+                out.push(Instruction::new(Op::Bitcast, Some(uint_ty), Some(cast), vec![Operand::IdRef(idx)]));
+                cast
+            }
+            (Some(_), Some(64)) => {
+                let narrow = ctx.module.fresh_id();
+                out.push(Instruction::new(Op::UConvert, Some(uint_ty), Some(narrow), vec![Operand::IdRef(idx)]));
+                narrow
+            }
+            _ => continue,
+        };
+        // an index past the array reads its last element instead of another table word (a buffer address)
+        let last = ctx.const_uint(count.saturating_sub(1));
+        let clamped = ctx.module.fresh_id();
+        let glsl = ctx.glsl();
+        out.push(Instruction::new(
+            Op::ExtInst,
+            Some(uint_ty),
+            Some(clamped),
+            vec![
+                Operand::IdRef(glsl),
+                Operand::LiteralExtInstInteger(spirv::GlslStd450Op::UMin as u32),
+                Operand::IdRef(index),
+                Operand::IdRef(last),
+            ],
+        ));
+        let first = ctx.const_uint(super::TEXTURE_INDEX_BASE + base);
+        let cel = ctx.module.fresh_id();
+        out.push(Instruction::new(
+            Op::IAdd,
+            Some(uint_ty),
+            Some(cel),
+            vec![Operand::IdRef(first), Operand::IdRef(clamped)],
+        ));
+        let wptr = ctx.module.fresh_id();
+        let word = ctx.module.fresh_id();
+        if let Some(u64_ty) = wide {
+            out.push(Instruction::new(
+                Op::AccessChain,
+                Some(word_ptr_ty),
+                Some(wptr),
+                vec![Operand::IdRef(table), Operand::IdRef(c0), Operand::IdRef(cel)],
+            ));
+            let wide_v = ctx.module.fresh_id();
+            out.push(Instruction::new(Op::Load, Some(u64_ty), Some(wide_v), vec![Operand::IdRef(wptr)]));
+            out.push(Instruction::new(Op::UConvert, Some(uint_ty), Some(word), vec![Operand::IdRef(wide_v)]));
+        } else {
+            out.push(Instruction::new(
+                Op::AccessChain,
+                Some(word_ptr_ty),
+                Some(wptr),
+                vec![
+                    Operand::IdRef(table),
+                    Operand::IdRef(c0),
+                    Operand::IdRef(cel),
+                    Operand::IdRef(c0),
+                ],
+            ));
+            out.push(Instruction::new(Op::Load, Some(uint_ty), Some(word), vec![Operand::IdRef(wptr)]));
+        }
+        let slot = ctx.module.fresh_id();
+        out.push(Instruction::new(
+            Op::BitwiseAnd,
+            Some(uint_ty),
+            Some(slot),
+            vec![Operand::IdRef(word), Operand::IdRef(mask)],
+        ));
+        let heap = crate::passes::stage_input::bindless_heap_var(ctx, elem_ty, dims, comp);
+        out.push(Instruction::new(
+            Op::AccessChain,
+            Some(result_ty),
+            Some(result),
+            vec![Operand::IdRef(heap), Operand::IdRef(slot)],
+        ));
+        replacements.insert((block_idx, inst_idx), out);
+    }
+    let function = &mut ctx.module.functions[entry_idx];
+    for (block_idx, block) in function.blocks.iter_mut().enumerate() {
+        if !replacements.keys().any(|(b, _)| *b == block_idx) {
+            continue;
+        }
+        let mut rebuilt = Vec::with_capacity(block.instructions.len() + 8);
+        for (inst_idx, inst) in block.instructions.drain(..).enumerate() {
+            match replacements.remove(&(block_idx, inst_idx)) {
+                Some(seq) => rebuilt.extend(seq),
+                None => rebuilt.push(inst),
+            }
+        }
+        block.instructions = rebuilt;
+    }
 }
 
 pub(crate) fn sink_loop_header_texture_array_loads(ctx: &mut Ctx, entry_idx: usize) {
@@ -396,8 +569,8 @@ pub(crate) fn sink_loop_header_texture_array_loads(ctx: &mut Ctx, entry_idx: usi
     }
 
     let function = &ctx.module.functions[entry_idx];
-    let mut defs: HashMap<Word, (usize, usize, Instruction)> = HashMap::new();
-    let mut uses: HashMap<Word, Vec<(usize, usize)>> = HashMap::new();
+    let mut defs: HashMap<Word, (usize, usize, Instruction)> = HashMap::default();
+    let mut uses: HashMap<Word, Vec<(usize, usize)>> = HashMap::default();
     for (block_idx, block) in function.blocks.iter().enumerate() {
         for (inst_idx, inst) in block.instructions.iter().enumerate() {
             if let Some(id) = inst.result_id {
@@ -423,8 +596,8 @@ pub(crate) fn sink_loop_header_texture_array_loads(ctx: &mut Ctx, entry_idx: usi
         })
         .map(|(block_idx, _)| block_idx)
         .collect();
-    let mut insertions: HashMap<(usize, usize), Vec<Instruction>> = HashMap::new();
-    let mut removals = HashSet::new();
+    let mut insertions: HashMap<(usize, usize), Vec<Instruction>> = HashMap::default();
+    let mut removals = HashSet::default();
 
     for (&load_id, &(load_block, _, ref load)) in &defs {
         if load.class.opcode != Op::Load || load.operands.len() != 1 {
@@ -768,7 +941,7 @@ pub(in crate::passes) fn retire_dead_pointer_projections(
         )
     };
     let mut candidates = roots.into_iter().collect::<HashSet<_>>();
-    let mut removed = HashSet::new();
+    let mut removed = HashSet::default();
     loop {
         let additions = ctx.module.functions[entry_idx]
             .blocks
@@ -790,7 +963,7 @@ pub(in crate::passes) fn retire_dead_pointer_projections(
         candidates.extend(additions);
     }
     loop {
-        let mut used: std::collections::HashSet<Word> = std::collections::HashSet::new();
+        let mut used: crate::fxhash::HashSet<Word> = crate::fxhash::HashSet::default();
         for f in &ctx.module.functions {
             for blk in &f.blocks {
                 for inst in &blk.instructions {
@@ -938,7 +1111,7 @@ mod tests {
         let poison = ctx.module.fresh_id();
         let aggregate = ctx.module.fresh_id();
         let extracted = ctx.module.fresh_id();
-        let defs = HashMap::from([
+        let defs = crate::fxhash::map_from([
             (
                 alias,
                 Instruction::new(Op::Bitcast, None, Some(alias), vec![Operand::IdRef(root)]),

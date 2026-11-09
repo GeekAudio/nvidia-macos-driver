@@ -11,6 +11,7 @@ mod emitter;
 mod emit_tiers;
 mod imageblock;
 mod inline;
+mod inline_sampler;
 pub(crate) mod ir;
 mod lex;
 mod opaque_image_select;
@@ -18,6 +19,8 @@ mod owned_cfg;
 mod parse;
 mod private_vector_word;
 mod psb;
+mod ptr_phi_load;
+mod ptr_table_offsets;
 mod psb_value_select;
 pub(crate) mod ray_intersection;
 mod reloop_nest;
@@ -25,6 +28,11 @@ mod relooper;
 mod render;
 mod rewrites;
 mod vec_scalar_merge;
+mod atomic_image_format;
+mod copy_memory_logical;
+mod stencil_export;
+mod punned_access_chain;
+mod short_access_chain;
 mod wg_atomic;
 
 mod tir;
@@ -34,6 +42,17 @@ use crate::spirv_module::Instruction;
 use crate::spirv_module::Module;
 use crate::spirv_module::Operand;
 pub(crate) fn lower_air_text(san_ll: &str) -> std::borrow::Cow<'_, str> {
+    // first: older toolchains write a constexpr sampler as an integer in the call, which reflection and the sampler pass
+    // only know in the metadata form
+    match inline_sampler::lower_inline_sampler_constants(san_ll) {
+        std::borrow::Cow::Borrowed(borrowed) => lower_air_text_rest(borrowed),
+        std::borrow::Cow::Owned(owned) => {
+            std::borrow::Cow::Owned(lower_air_text_rest(&owned).into_owned())
+        }
+    }
+}
+
+fn lower_air_text_rest(san_ll: &str) -> std::borrow::Cow<'_, str> {
     let lowered = match cl_constant::lower_cl_constant_args(san_ll) {
         std::borrow::Cow::Borrowed(borrowed) => async_copy::lower_simdgroup_async_copy(borrowed),
         std::borrow::Cow::Owned(owned) => std::borrow::Cow::Owned(async_copy::lower_simdgroup_async_copy_owned(owned)),
@@ -52,6 +71,25 @@ pub(crate) fn lower_air_text(san_ll: &str) -> std::borrow::Cow<'_, str> {
             std::borrow::Cow::Owned(atomicrmw_text::lower_raw_atomicrmw_owned(owned))
         }
     };
+    // a private table of pointers into one buffer cannot live in Function memory, so it keeps indices
+    let lowered = match lowered {
+        std::borrow::Cow::Borrowed(borrowed) => ptr_table_offsets::offset_pointer_tables(borrowed),
+        std::borrow::Cow::Owned(owned) => {
+            std::borrow::Cow::Owned(ptr_table_offsets::offset_pointer_tables_owned(owned))
+        }
+    };
+    // a Function-storage pointer phi has no legal form under Logical addressing, so the input is rewritten
+    // instead: the phi's single load is hoisted into each predecessor and the phi carries the VALUES
+    // NVMTL_NO_PTR_PHI_LOAD=1 skips this rewrite (diagnostic: it changes 46 Cyberpunk material shaders against the
+    // translator that renders the game correctly).
+    let lowered = if std::env::var_os("NVMTL_NO_PTR_PHI_LOAD").is_some() {
+        lowered
+    } else { match lowered {
+        std::borrow::Cow::Borrowed(borrowed) => ptr_phi_load::sink_pointer_phi_loads(borrowed),
+        std::borrow::Cow::Owned(owned) => {
+            std::borrow::Cow::Owned(ptr_phi_load::sink_pointer_phi_loads_owned(owned))
+        }
+    } };
     match lowered {
         std::borrow::Cow::Borrowed(borrowed) => inline::forward_builder_pointer_fields(borrowed),
         std::borrow::Cow::Owned(owned) => match inline::forward_builder_pointer_fields(&owned) {
@@ -62,12 +100,18 @@ pub(crate) fn lower_air_text(san_ll: &str) -> std::borrow::Cow<'_, str> {
 }
 
 pub(crate) fn lower_air_text_owned(san_ll: String) -> String {
-    let lowered = atomicrmw_text::lower_raw_atomicrmw_owned(dynamic_memcpy::lower_dynamic_length_memcpy_owned(
-        async_copy::lower_simdgroup_async_copy_owned(match cl_constant::lower_cl_constant_args(&san_ll) {
-            std::borrow::Cow::Borrowed(_) => san_ll,
-            std::borrow::Cow::Owned(lowered) => lowered,
-        }),
-    ));
+    let san_ll = match inline_sampler::lower_inline_sampler_constants(&san_ll) {
+        std::borrow::Cow::Borrowed(_) => san_ll,
+        std::borrow::Cow::Owned(lowered) => lowered,
+    };
+    let lowered = ptr_phi_load::sink_pointer_phi_loads_owned(ptr_table_offsets::offset_pointer_tables_owned(atomicrmw_text::lower_raw_atomicrmw_owned(
+        dynamic_memcpy::lower_dynamic_length_memcpy_owned(async_copy::lower_simdgroup_async_copy_owned(
+            match cl_constant::lower_cl_constant_args(&san_ll) {
+                std::borrow::Cow::Borrowed(_) => san_ll,
+                std::borrow::Cow::Owned(lowered) => lowered,
+            },
+        )),
+    )));
     match inline::forward_builder_pointer_fields(&lowered) {
         std::borrow::Cow::Borrowed(_) => lowered,
         std::borrow::Cow::Owned(forwarded) => forwarded,
@@ -100,7 +144,7 @@ use ir::LlModule;
 
 pub(crate) fn inline_direct_function_pointer_consumers(
     san_ll: &str,
-    direct_functions: &std::collections::HashSet<String>,
+    direct_functions: &crate::fxhash::HashSet<String>,
 ) -> String {
     inline::inline_direct_function_pointer_consumers(san_ll, direct_functions)
 }
@@ -119,15 +163,18 @@ pub(crate) use rewrites::{
     construct_interface_cross_binding_pointer_merges_module,
     construct_interface_cross_binding_pointer_phis_module,
     construct_interface_cross_binding_pointer_values_module, construct_opaque_image_selects_module,
+    construct_atomic_storage_image_formats_module,
+    split_mismatched_copy_memory_module,
+    construct_composite_atomic_pointer_lvalues_module,
     construct_physical_atomic_pointer_lvalues_module, construct_workgroup_atomic_floats_module,
     eliminate_dead_pointer_values_module, eliminate_dead_values_module,
     lower_unobserved_bda_aggregate_pointer_fields_module, prune_constant_branches_module,
     prune_constant_cfg_module_if_changed, prune_unused_null_and_undef_constants_module,
     unowned_selection_header_labels,
 };
+use crate::fxhash::{HashMap, HashSet};
 pub use rewrites::{BOUNDED_RELOOPER_MAX_BLOCKS, CFG_EMIT_RELOOPER_MAX_BLOCKS};
 use spirv::{Capability, Op, StorageClass, Word};
-use std::collections::{HashMap, HashSet};
 
 fn add_native_module_capabilities(module: &mut Module) {
     crate::spirv_variable_ptr::lower_storage_buffer_pointer_phis(module);
@@ -181,4 +228,24 @@ pub(crate) fn requires_device_address_model_for_source(
     let san_ll = inline::inline_pointer_select_consumers(&san_ll, entry).source;
     ir::LlModule::parse_with_stage_meta(&san_ll, kern, entry)
         .is_ok_and(|parsed| emit_tiers::requires_device_address_model(&parsed))
+}
+
+/// See inline::inline_and_forward_object_fields: the retry form of a module that failed as written.
+pub(crate) fn inline_and_forward_object_fields(san_ll: &str) -> Option<String> {
+    inline::inline_and_forward_object_fields(san_ll)
+}
+
+/// See stencil_export: a fragment stencil export lowered to a per-bit discard the driver replays.
+pub(crate) fn lower_stencil_export_module(module: &mut crate::spirv_module::Module) -> bool {
+    stencil_export::lower_stencil_export(module)
+}
+
+/// See short_access_chain: an access chain that stops short of its result pointee by first-member descent only.
+pub(crate) fn decay_short_access_chains_module(module: &mut crate::spirv_module::Module) -> usize {
+    short_access_chain::decay_short_access_chains(module)
+}
+
+/// See punned_access_chain: a chain landing on a member whose scalar type differs from its result pointee.
+pub(crate) fn retype_punned_access_chains_module(module: &mut crate::spirv_module::Module) -> usize {
+    punned_access_chain::retype_punned_access_chains(module)
 }

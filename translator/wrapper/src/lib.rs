@@ -34,7 +34,27 @@ fn threadgroup_lengths() -> Vec<(u32, u32)> {
     })
 }
 
+// The pipeline's raster sample count, for air.get_num_samples (fragment shaders read it; ANGLE's WebGL shaders do).
+// WAS: never set by the driver, so every such shader failed to translate ("requires TransformOptions::raster_sample_count")
+// and WebGL pages said the browser has no WebGL. 0 = the plugin did not say: one sample, which is every pipeline without
+// MSAA. The plugin can name the real count for an MSAA pipeline with nvmtl_translate_set_raster_sample_count.
+thread_local! { static RSC: std::cell::Cell<u32> = const { std::cell::Cell::new(0) }; }
+#[no_mangle]
+pub extern "C" fn nvmtl_translate_set_raster_sample_count(n: u32) { RSC.with(|c| c.set(n)); }
+fn apply_rsc(mut o: metal2vulkan::passes::TransformOptions) -> metal2vulkan::passes::TransformOptions {
+    if o.raster_sample_count.is_none() {
+        let n = RSC.with(|c| c.get());
+        o.raster_sample_count = Some(if matches!(n, 1 | 2 | 4 | 8 | 16 | 32 | 64) { n } else { 1 });
+    }
+    o
+}
+
 fn apply_tg(mut o: metal2vulkan::passes::TransformOptions) -> metal2vulkan::passes::TransformOptions {
+    o = apply_rsc(o);
+    // Bit 2 is an explicit guarantee from the plugin: no rate map can be created or bound.
+    o.no_rasterization_rate_maps = CAPS.load(Ordering::Relaxed) & 4 != 0;
+    // Bit 3: the plugin reserved heap slots 1..5 for typed dummies, so a null resource id may be redirected to them.
+    o.typed_dummy_slots = CAPS.load(Ordering::Relaxed) & 8 != 0;
     for (index, length) in threadgroup_lengths() {
         match o.with_threadgroup_memory_length(index, length) {
             Ok(next) => o = next,
@@ -61,6 +81,80 @@ fn formatless_options(ll: &str, st: Stage, caps: u32) -> Option<metal2vulkan::pa
     Some(o)
 }
 fn translate_one(ll: &str, st: Stage) -> Result<Vec<u8>, String> {
+    // one parse per distinct text for the whole translation, its retries included
+    metal2vulkan::with_parse_cache(|| translate_with_pointer_retry(ll, |ll| translate_one_as_written(ll, st)))
+}
+
+// Keep the same translation options on both attempts. In particular, the
+// sampler-specialized path must retain pixel coordinates and A8 outputs.
+fn translate_with_pointer_retry(
+    ll: &str, translate: impl Fn(&str) -> Result<Vec<u8>, String>,
+) -> Result<Vec<u8>, String> {
+    match translate(ll) {
+        Ok(v) => Ok(v),
+        // A future loop-edge pointer load can refer to the same immutable local
+        // object field as an earlier load. Before scalar replacement its source
+        // is not yet emitted, so pointer-phi construction cannot recover that
+        // identity. Inline the helpers and forward only fields whose sole store
+        // dominates the reads and whose complete address-use graph is known.
+        Err(e) if e.contains("pointer merge storage mismatch")
+            || (e.contains("pointer phi") && e.contains("differing structural sources")) =>
+        {
+            let Some(inlined) = metal2vulkan::inline_and_forward_object_fields(ll) else { return Err(e) };
+            if let Some(path) = std::env::var_os("NVMTL_DUMP_RETRY_LL") {
+                let _ = std::fs::write(path, &inlined);
+            }
+            translate(&inlined)
+                .map_err(|retry| format!("{e}; retry with immutable local pointer fields forwarded: {retry}"))
+        }
+        // A module whose pointers (a sampler's address in an argument buffer, a threadgroup array's address) reach their use
+        // only through a local object's fields gets one retry with its helpers inlined and those fields forwarded, and
+        // samplers in argument buffers read from the sampler heap. Only a failure gets here, so a module that translates as
+        // written never changes.
+        //
+        // A sampler in an argument buffer that also holds buffer pointers ("is not a sampler"), or in an array of samplers
+        // there ("exact sampler state was not recovered"), fails the same way with no helper to inline: it gets the retry
+        // on its text as written, its argument-buffer samplers read from the sampler heap.
+        Err(e) if e.contains("sampler operand is a pointer") || e.contains("pointer placeholder")
+            || e.contains("missing pointer storage") || e.contains("sampler operand is not a sampler")
+            || e.contains("runtime sampler specialization cannot recover an exact state after pointer selection")
+            // ANGLE's user main left as a call takes the uniform-buffer pointer as an argument, which the emitter types
+            // two ways (#406's "owned IAdd operands", #419; patch by eisda); inlined, the pointer never crosses a call
+            || e.contains("owned OpFunctionCall argument type disagrees") || e.contains("owned IAdd operands do not match")
+            || (e.contains("owned AccessChain") && e.contains("references undefined id")) =>
+        {
+            let inlined = metal2vulkan::inline_and_forward_object_fields(ll);
+            if inlined.is_none() && !e.contains("sampler operand") { return Err(e) }
+            let retry = inlined.as_deref().unwrap_or(ll);
+            // NVMTL_DUMP_RETRY_LL=<file>: the retry's input text, to inspect what inlining and forwarding produced
+            if let Some(path) = std::env::var_os("NVMTL_DUMP_RETRY_LL") {
+                let _ = std::fs::write(path, retry);
+            }
+            let how = if inlined.is_some() { "with helpers inlined and object fields forwarded" }
+                      else { "with argument-buffer samplers from the sampler heap" };
+            // The call-crossing failures hold no argument-buffer sampler; in the sampler-heap mode their inlined
+            // uniform-buffer read came out as a null constant (#419), so the ordinary translation goes first for them.
+            let call_crossing = e.contains("owned OpFunctionCall argument type disagrees")
+                || e.contains("owned IAdd operands do not match") || e.contains("references undefined id");
+            if call_crossing {
+                if let Some(text) = inlined.as_deref() {
+                    if let Ok(v) = translate(text) { return Ok(v); }
+                }
+            }
+            metal2vulkan::with_argument_buffer_samplers(|| translate(retry))
+                // Forwarding can hand the entry's own [[sampler]] straight to the sample call, the shape Metal's inliner
+                // leaves; such a module reads no sampler from an argument buffer, so it gets the ordinary translation.
+                .or_else(|e2| match inlined.as_deref() {
+                    Some(text) => translate(text).map_err(|e3| format!("{e2}; as ordinary samplers: {e3}")),
+                    None => Err(e2),
+                })
+                .map_err(|e2| format!("{e}; retry {how}: {e2}"))
+        }
+        Err(e) => Err(e),
+    }
+}
+
+fn translate_one_as_written(ll: &str, st: Stage) -> Result<Vec<u8>, String> {
     let caps = CAPS.load(Ordering::Relaxed);
     if let Some(o) = if caps != 0 { formatless_options(ll, st, caps) } else { None } {
         match metal2vulkan::translate_native_no_retry_constructed_with_options(ll, st, apply_tg(o)) {
@@ -97,7 +191,20 @@ pub extern "C" fn nvmtl_translate(
             std::mem::forget(b);
             0
         }
-        Err(e) => { set_err(&e); -1 }
+        Err(e) => { dump_failed(ll, st, &e); set_err(&e); -1 }
+    }
+}
+
+// A kernel that fails inside an app (Geekbench's OpenCL convolve) cannot be reproduced offline without its AIR.
+// NVMTL_DUMP_FAILED_DIR=<dir> writes the input and the error beside it; unset, this costs one env read on failure only.
+fn dump_failed(ll: &str, st: Stage, e: &str) {
+    let Some(dir) = std::env::var_os("NVMTL_DUMP_FAILED_DIR") else { return };
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    ll.hash(&mut h);
+    let base = std::path::Path::new(&dir).join(format!("{:016x}-{:?}", h.finish(), st));
+    if let Err(w) = std::fs::write(base.with_extension("ll"), ll).and_then(|_| std::fs::write(base.with_extension("err"), e)) {
+        eprintln!("nvmtl_translate: NVMTL_DUMP_FAILED_DIR write failed: {w}");
     }
 }
 
@@ -378,7 +485,22 @@ pub extern "C" fn nvmtl_translate_fc(
         Ok(v) => v,
         Err(e) => { set_err(&format!("AIR specialization: {e}")); return -1; }
     };
-    match translate_one(specialized.as_ref(), st) {
+    // A library may declare `[[visible]]` function references that only a function-constant-disabled
+    // path calls. The pre-emit refusal is a TEXT search for `.MTL_VISIBLE_FN_REF`, so it fired on such a
+    // module even once the constants had folded the caller away, and every system process that ships one
+    // lost the pipeline (loginwindow, Spotlight, icon services, Dock, measured on GA102 and GB206 10-17).
+    // Closing the graph against an EMPTY linkage renames each unsupplied stub off `.MTL_VISIBLE_FN_REF`,
+    // so a dead reference folds away here and a LIVE one is still refused at emission, by name. That is
+    // the contract batch 51 already uses for a partly supplied pipeline; a pipeline that really links
+    // functions arrives through nvmtl_translate_linked and does not reach this path.
+    let specialized = match metal2vulkan::linked_functions::specialize_visible_function_references(
+        specialized.as_ref(),
+        &metal2vulkan::linked_functions::LinkedFunctionLinkage::default(),
+    ) {
+        Ok(v) => v,
+        Err(e) => { set_err(&format!("visible function reference: {e}")); return -1; }
+    };
+    match translate_one(specialized.as_str(), st) {
         Ok(spv) => {
             let mut b = spv.into_boxed_slice();
             unsafe { *out = b.as_mut_ptr(); *out_len = b.len(); }
@@ -471,6 +593,58 @@ mod align_guard;
 mod table_ubo;
 mod g2_inline;
 mod linearize;
+mod uniform_cbuf;
+
+// Pipeline-local GL optimization. The caller identifies the Metal slot from AIR;
+// failure leaves its already compiled physical-address pipeline available.
+#[no_mangle]
+pub unsafe extern "C" fn nvmtl_promote_gl_uniform(
+    data: *const u8, len: usize, binding: u32, limit: u32,
+    out: *mut *mut u8, out_len: *mut usize, extent: *mut u32,
+    err: *mut c_char, err_len: usize,
+) -> i32 {
+    if data.is_null() || out.is_null() || out_len.is_null() || extent.is_null() { return -1; }
+    *out = std::ptr::null_mut(); *out_len = 0; *extent = 0;
+    match uniform_cbuf::promote(std::slice::from_raw_parts(data, len), binding, limit) {
+        Ok((v, size)) => {
+            let mut b = v.into_boxed_slice();
+            *out = b.as_mut_ptr(); *out_len = b.len(); *extent = size;
+            std::mem::forget(b); 0
+        }
+        Err(e) => {
+            if !err.is_null() && err_len > 0 {
+                let n = e.len().min(err_len - 1);
+                std::ptr::copy_nonoverlapping(e.as_ptr(), err.cast(), n); *err.add(n) = 0;
+            }
+            -1
+        }
+    }
+}
+
+#[cfg(test)]
+mod gl_translation_tests {
+    use super::*;
+    use spirv_tools::val::Validator;
+
+    #[test]
+    fn minecraft_uniform_and_sampler_shaders_validate_through_address_lowering() {
+        for ll in [
+            include_str!("../../translator/tests/fixtures/gl/ivec3_uniform_through_float_gep.ll"),
+            include_str!("../../translator/tests/fixtures/gl/sampler2d_param_chosen_by_constant.ll"),
+        ] {
+            let spv = translate_one(ll, Stage::Vertex).expect("GL vertex shader translates");
+            let lowered = buffer_addresses::lower(&spv).expect("buffer-address lowering");
+            let uniform = table_ubo::convert(&lowered).expect("dynamic uniform address table");
+            for bytes in [&spv, &lowered, &uniform] {
+                let words: Vec<u32> = bytes.chunks_exact(4).map(|w| u32::from_le_bytes(w.try_into().unwrap())).collect();
+                let mut options = spirv_tools::val::ValidatorOptions::default();
+                options.scalar_block_layout = true;
+                spirv_tools::val::create(Some(spirv_tools::TargetEnv::Vulkan_1_2))
+                    .validate(&words, Some(options)).expect("GL shader remains valid Vulkan 1.2 SPIR-V");
+            }
+        }
+    }
+}
 
 #[cfg(test)]
 mod storage_caps_tests {
@@ -517,6 +691,17 @@ pub unsafe extern "C" fn nvmtl_lower_buffer_addresses(
 ) -> i32 {
     if data.is_null() || out.is_null() || out_len.is_null() { return -1; }
     match buffer_addresses::lower(std::slice::from_raw_parts(data,len)) {
+        Ok(v) => { let mut b=v.into_boxed_slice(); *out=b.as_mut_ptr(); *out_len=b.len(); std::mem::forget(b); 0 }
+        Err(e) => { if !err.is_null() && err_len>0 { let n=e.len().min(err_len-1); std::ptr::copy_nonoverlapping(e.as_ptr(),err.cast(),n); *err.add(n)=0; } -1 }
+    }
+}
+#[no_mangle]
+pub unsafe extern "C" fn nvmtl_table_to_uniform(
+    data: *const u8, len: usize, out: *mut *mut u8, out_len: *mut usize,
+    err: *mut c_char, err_len: usize,
+) -> i32 {
+    if data.is_null() || out.is_null() || out_len.is_null() { return -1; }
+    match table_ubo::convert(std::slice::from_raw_parts(data,len)) {
         Ok(v) => { let mut b=v.into_boxed_slice(); *out=b.as_mut_ptr(); *out_len=b.len(); std::mem::forget(b); 0 }
         Err(e) => { if !err.is_null() && err_len>0 { let n=e.len().min(err_len-1); std::ptr::copy_nonoverlapping(e.as_ptr(),err.cast(),n); *err.add(n)=0; } -1 }
     }
@@ -574,14 +759,19 @@ pub unsafe extern "C" fn nvmtl_translate_samplers(
         let reflection=metal2vulkan::reflect_sanitized(ll,st,metal2vulkan::passes::TransformOptions::default())?;
         let states:std::collections::BTreeMap<u32,metal2vulkan::reflect::RuntimeSamplerState>=serde_json::from_value(j["samplers"].clone()).map_err(|e|e.to_string())?;
         let mut opts=formatless_options(ll,st,CAPS.load(Ordering::Relaxed)).unwrap_or_default();
+        let a8=j["a8_targets"].as_u64().unwrap_or(0) as u32;   // Metal A8Unorm colour attachments, bit per location
+        opts=opts.with_a8_render_targets(a8);
         let mut used=0;
         for (idx,state) in states {
             if reflection.bindings.iter().any(|b| b.kind==metal2vulkan::reflect::ResourceKind::Sampler && b.metal_index==idx) {
                 opts=opts.with_runtime_sampler(idx,state)?;used+=1;
             }
         }
-        if used==0{return translate_one(ll,st)}
-        metal2vulkan::translate_native_no_retry_constructed_with_options(ll,st,opts)
+        if used==0 && a8==0{return translate_one(ll,st)}
+        let opts=apply_tg(opts);
+        translate_with_pointer_retry(ll, |ll| {
+            metal2vulkan::translate_native_no_retry_constructed_with_options(ll,st,opts)
+        })
     })();
     match result {
         Ok(bytes)=>{let mut b=bytes.into_boxed_slice();*out=b.as_mut_ptr();*out_len=b.len();std::mem::forget(b);0}
@@ -649,5 +839,80 @@ mod threadgroup_configuration_tests {
         rendezvous.wait();
         for handle in handles { handle.join().expect("worker configuration"); }
         assert!(main_lengths.is_empty());
+    }
+
+    // A kernel that binds a sampler takes the sampler path, which used to drop the threadgroup lengths: the Workgroup
+    // array kept its 512-element default, so a kernel asking for 16384 bytes of float4 (VideoToolbox's scaler) got half.
+    const SAMPLER_AND_THREADGROUP_KERNEL: &str = r#"
+target triple = "spirv-unknown-vulkan1.2"
+
+define void @k(ptr addrspace(1) %texture, ptr addrspace(2) %sampler, ptr addrspace(3) %temp, ptr addrspace(1) %out, i32 %i) {
+entry:
+  %sample = call { <4 x float>, i8 } @air.sample_texture_2d.v4f32(ptr addrspace(1) %texture, ptr addrspace(2) %sampler, <2 x float> zeroinitializer, i1 false, <2 x i32> zeroinitializer, i1 false, float 0.000000e+00, float 0.000000e+00, i32 0)
+  %color = extractvalue { <4 x float>, i8 } %sample, 0
+  %idx = zext i32 %i to i64
+  %slot = getelementptr inbounds <4 x float>, ptr addrspace(3) %temp, i64 %idx
+  store <4 x float> %color, ptr addrspace(3) %slot, align 16
+  %back = load <4 x float>, ptr addrspace(3) %slot, align 16
+  store <4 x float> %back, ptr addrspace(1) %out, align 16
+  ret void
+}
+
+declare { <4 x float>, i8 } @air.sample_texture_2d.v4f32(ptr addrspace(1), ptr addrspace(2), <2 x float>, i1, <2 x i32>, i1, float, float, i32)
+
+!air.kernel = !{!0}
+!0 = !{ptr @k, !1, !2}
+!1 = !{}
+!2 = !{!3, !4, !5, !6, !7}
+!3 = !{i32 0, !"air.texture", !"air.location_index", i32 0, i32 1, !"air.sample", !"air.arg_type_name", !"texture2d<float, sample>", !"air.arg_name", !"texture"}
+!4 = !{i32 1, !"air.sampler", !"air.location_index", i32 0, i32 1, !"air.arg_type_name", !"sampler", !"air.arg_name", !"sampler"}
+!5 = !{i32 2, !"air.buffer", !"air.location_index", i32 0, i32 1, !"air.read_write", !"air.address_space", i32 3, !"air.arg_type_size", i32 16, !"air.arg_type_align_size", i32 16, !"air.arg_type_name", !"float4", !"air.arg_name", !"temp"}
+!6 = !{i32 3, !"air.buffer", !"air.location_index", i32 0, i32 1, !"air.write", !"air.address_space", i32 1, !"air.arg_type_size", i32 16, !"air.arg_type_align_size", i32 16, !"air.arg_type_name", !"float4", !"air.arg_name", !"out"}
+!7 = !{i32 4, !"air.thread_position_in_threadgroup", !"air.arg_type_name", !"uint", !"air.arg_name", !"i"}
+"#;
+
+    fn workgroup_array_elements_after_sampler_translation(tg_bytes: Option<u32>) -> u32 {
+        match tg_bytes {
+            Some(bytes) => nvmtl_translate_set_threadgroup_lengths(&bytes, 1),
+            None => nvmtl_translate_set_threadgroup_lengths(std::ptr::null(), 0),
+        }
+        let ll = std::ffi::CString::new(SAMPLER_AND_THREADGROUP_KERNEL).unwrap();
+        let stage = std::ffi::CString::new("kernel").unwrap();
+        let state = serde_json::json!({"min_filter":"Nearest","mag_filter":"Nearest","mip_filter":"None","address_mode_s":"ClampToEdge","address_mode_t":"ClampToEdge","address_mode_r":"ClampToEdge","coordinates":"Normalized","compare_function":"None","max_anisotropy":1,"lod_min_clamp":0.0,"lod_max_clamp":1000.0,"border_color":"TransparentBlack","reduction":"WeightedAverage","lod_bias":0.0});
+        let json = std::ffi::CString::new(serde_json::json!({"samplers":{"0":state},"constants":{}}).to_string()).unwrap();
+        let (mut out, mut len) = (std::ptr::null_mut(), 0usize);
+        let mut err = [0 as c_char; 2048];
+        let rc = unsafe { nvmtl_translate_samplers(ll.as_ptr(), stage.as_ptr(), json.as_ptr(), &mut out, &mut len, err.as_mut_ptr(), err.len()) };
+        nvmtl_translate_set_threadgroup_lengths(std::ptr::null(), 0);
+        assert_eq!(rc, 0, "{}", unsafe { CStr::from_ptr(err.as_ptr()) }.to_string_lossy());
+        let spv = unsafe { std::slice::from_raw_parts(out, len) }.to_vec();
+        nvmtl_translate_free(out, len);
+        let module = rspirv::dr::load_bytes(&spv).expect("load spv");
+        let constants: std::collections::HashMap<u32, u32> = module.types_global_values.iter()
+            .filter(|i| i.class.opcode == rspirv::spirv::Op::Constant)
+            .filter_map(|i| match (i.result_id, i.operands.first()) {
+                (Some(id), Some(rspirv::dr::Operand::LiteralBit32(v))) => Some((id, *v)),
+                _ => None,
+            }).collect();
+        // the Workgroup variable's pointee array, found through the variable rather than by "the only array"
+        let workgroup_pointee = module.types_global_values.iter().find_map(|i| {
+            (i.class.opcode == rspirv::spirv::Op::Variable
+                && i.operands.first() == Some(&rspirv::dr::Operand::StorageClass(rspirv::spirv::StorageClass::Workgroup)))
+                .then(|| i.result_type)
+        }).flatten().expect("a Workgroup variable");
+        let array = module.types_global_values.iter().find(|i| i.result_id == Some(workgroup_pointee))
+            .and_then(|ptr| match ptr.operands.get(1) { Some(rspirv::dr::Operand::IdRef(t)) => Some(*t), _ => None })
+            .expect("the pointer's pointee");
+        let length_id = module.types_global_values.iter().find(|i| i.result_id == Some(array))
+            .and_then(|a| match a.operands.get(1) { Some(rspirv::dr::Operand::IdRef(c)) => Some(*c), _ => None })
+            .expect("an array type");
+        constants[&length_id]
+    }
+
+    #[test]
+    fn sampler_specialization_keeps_the_threadgroup_length() {
+        assert_eq!(workgroup_array_elements_after_sampler_translation(None), 512, "no length: the default");
+        assert_eq!(workgroup_array_elements_after_sampler_translation(Some(16384)), 1024, "16384 bytes of float4");
+        assert_eq!(workgroup_array_elements_after_sampler_translation(Some(4096)), 256, "4096 bytes of float4");
     }
 }

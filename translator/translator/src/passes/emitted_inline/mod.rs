@@ -138,7 +138,7 @@ pub(super) fn inline_selected_helpers(
 ) -> Result<InlineStats, String> {
     let air_ids: HashSet<Word> = air_names(&ctx.module).keys().copied().collect();
     let mut stats = InlineStats::default();
-    let mut processed_helpers = HashSet::new();
+    let mut processed_helpers = HashSet::default();
     let mut pointer_types = collect_pointer_types(ctx);
     let mut guard = 0;
     loop {
@@ -178,6 +178,17 @@ pub(super) fn inline_selected_helpers(
         let Some((bi, ii, callee_id)) = target else {
             break;
         };
+        // A helper that calls itself never runs out of calls to splice: the loop used to spin to its budget (20 s on
+        // MPS's depthwise convolution linked with a visible function that forwards to its own name) and only then fail.
+        if ctx.module.functions.iter().any(|f| {
+            f.def.as_ref().and_then(|d| d.result_id) == Some(callee_id)
+                && f.blocks.iter().flat_map(|b| &b.instructions).any(|i| {
+                    i.class.opcode == Op::FunctionCall
+                        && i.operands.first() == Some(&Operand::IdRef(callee_id))
+                })
+        }) {
+            return Err(format!("inliner: helper %{callee_id} calls itself, so it cannot be inlined"));
+        }
         inline_one_call(ctx, entry_idx, bi, ii, callee_id, &mut pointer_types)?;
         stats.splices += 1;
         processed_helpers.insert(callee_id);
@@ -192,20 +203,69 @@ pub(super) fn prune_unreferenced_functions(ctx: &mut Ctx, entry_idx: usize) {
         .def
         .as_ref()
         .and_then(|d| d.result_id);
-    let mut called: HashSet<Word> = HashSet::new();
-    for blk in &ctx.module.functions[entry_idx].blocks {
-        for inst in &blk.instructions {
-            if inst.class.opcode == Op::FunctionCall {
-                if let Some(Operand::IdRef(c)) = inst.operands.first() {
-                    called.insert(*c);
-                }
-            }
+    // Reachability, not just the entry's own call list. A function the ENTRY does not call can still be
+    // live: a linked ray-tracing shader is reached through the generated table dispatcher, so a one-level
+    // scan pruned every hit and miss shader in the pipeline and left the module referring to what it had
+    // just removed.
+    let calls_of = |f: &Function| -> Vec<Word> {
+        f.blocks
+            .iter()
+            .flat_map(|blk| blk.instructions.iter())
+            .filter(|inst| inst.class.opcode == Op::FunctionCall)
+            .filter_map(|inst| match inst.operands.first() {
+                Some(Operand::IdRef(c)) => Some(*c),
+                _ => None,
+            })
+            .collect()
+    };
+    let mut called: HashSet<Word> = HashSet::default();
+    let mut frontier: Vec<Word> = calls_of(&ctx.module.functions[entry_idx]);
+    while let Some(id) = frontier.pop() {
+        if !called.insert(id) {
+            continue;
         }
+        let Some(f) = ctx
+            .module
+            .functions
+            .iter()
+            .find(|f| f.def.as_ref().and_then(|d| d.result_id) == Some(id))
+        else {
+            continue;
+        };
+        frontier.extend(calls_of(f));
     }
-    ctx.module.functions.retain(|f| {
-        let id = f.def.as_ref().and_then(|d| d.result_id);
-        id == entry_id || id.map(|i| called.contains(&i)).unwrap_or(false)
-    });
+    let keeps: Vec<bool> = ctx
+        .module
+        .functions
+        .iter()
+        .map(|f| {
+            let id = f.def.as_ref().and_then(|d| d.result_id);
+            id == entry_id || id.map(|i| called.contains(&i)).unwrap_or(false)
+        })
+        .collect();
+    // Ids that leave with the functions. A sidecar fact can name an instruction with no instruction user -
+    // a bindless heap slot is masked out of the handle word and only the fact points at it - so dropping the
+    // function silently leaves the fact pointing at nothing, and materialize_texture_array_loads then built a
+    // texture access chain on an index no instruction defines. Measured on a ray-tracing hit shader, where
+    // the sampling lives in a helper this prune removes.
+    let gone: HashSet<Word> = ctx
+        .module
+        .functions
+        .iter()
+        .zip(&keeps)
+        .filter(|(_, keep)| !**keep)
+        .flat_map(|(f, _)| f.all_inst_iter())
+        .filter_map(|inst| inst.result_id)
+        .collect();
+    let mut keep_iter = keeps.iter();
+    ctx.module
+        .functions
+        .retain(|_| *keep_iter.next().unwrap_or(&true));
+    if !gone.is_empty() {
+        ctx.emit_sidecar
+            .device_handle_heap_loads
+            .retain(|fact| !gone.contains(&fact.id) && !gone.contains(&fact.slot));
+    }
 }
 
 enum MergePatch {
@@ -445,7 +505,7 @@ fn plan_byte_view_reinterprets(
     remap: &HashMap<Word, Word>,
     result_types: &HashMap<Word, Word>,
 ) -> HashMap<Word, ByteViewPlan> {
-    let mut plan = HashMap::new();
+    let mut plan = HashMap::default();
     let defs = type_defs_with_new_globals(ctx);
     for blk in &callee.blocks {
         for inst in &blk.instructions {
@@ -815,7 +875,7 @@ pub(super) fn compose_chained_access_chains(ctx: &mut Ctx, entry_idx: usize) {
         }
         let defs = type_defs_with_new_globals(ctx);
         let result_types = collect_result_types(ctx);
-        let mut chains: HashMap<Word, Instruction> = HashMap::new();
+        let mut chains: HashMap<Word, Instruction> = HashMap::default();
         for blk in &ctx.module.functions[entry_idx].blocks {
             for inst in &blk.instructions {
                 if is_member_access_chain(inst.class.opcode) {
@@ -1019,7 +1079,7 @@ fn inline_one_call(
         (inst.result_id, args)
     };
 
-    let mut remap: HashMap<Word, Word> = HashMap::new();
+    let mut remap: HashMap<Word, Word> = HashMap::default();
     for (p, a) in callee.parameters.iter().zip(args.iter()) {
         if let Some(pid) = p.result_id {
             remap.insert(pid, *a);
@@ -1049,7 +1109,7 @@ fn inline_one_call(
             Some((result, resolve_copy_object_source(*source, &definitions)))
         })
         .collect::<HashMap<_, _>>();
-    let mut elided_aggregate_extracts = HashSet::new();
+    let mut elided_aggregate_extracts = HashSet::default();
     for instruction in callee.blocks.iter().flat_map(|block| &block.instructions) {
         if instruction.class.opcode != Op::CompositeExtract {
             continue;
@@ -1247,7 +1307,7 @@ fn resolve_inserted_object(
     mut path: &[u32],
     definitions: &HashMap<Word, &Instruction>,
 ) -> Option<Word> {
-    let mut visited = HashSet::new();
+    let mut visited = HashSet::default();
     while visited.insert(aggregate) {
         let definition = definitions.get(&aggregate)?;
         match definition.class.opcode {
@@ -1287,7 +1347,7 @@ fn resolve_inserted_object(
 }
 
 fn resolve_copy_object_source(mut value: Word, definitions: &HashMap<Word, &Instruction>) -> Word {
-    let mut visited = HashSet::new();
+    let mut visited = HashSet::default();
     while visited.insert(value) {
         let Some(definition) = definitions.get(&value) else {
             break;
@@ -1633,7 +1693,7 @@ fn split_inlined_selection_merge(ctx: &mut Ctx, entry_idx: usize, header_id: Wor
         return;
     };
 
-    let mut redirected_preds = HashSet::new();
+    let mut redirected_preds = HashSet::default();
     {
         let func = &mut ctx.module.functions[entry_idx];
         for block in &mut func.blocks {
@@ -1751,7 +1811,7 @@ fn block_index_by_label(blocks: &[Block], label_id: Word) -> Option<usize> {
 
 fn construct_label_ids(blocks: &[Block], header_id: Word, merge_id: Word) -> HashSet<Word> {
     let successors = block_successors_by_label(blocks);
-    let mut seen = HashSet::new();
+    let mut seen = HashSet::default();
     let mut stack = vec![header_id];
     while let Some(label) = stack.pop() {
         if label == merge_id || !seen.insert(label) {
@@ -1827,7 +1887,7 @@ fn redirect_terminator_target(block: &mut Block, from: Word, to: Word) -> bool {
 }
 
 fn collect_result_types(ctx: &Ctx) -> HashMap<Word, Word> {
-    let mut result_types = HashMap::new();
+    let mut result_types = HashMap::default();
     for inst in ctx
         .module
         .ext_inst_imports

@@ -13,7 +13,7 @@ impl LlModule {
                 .map(|name| (name.clone(), name.clone()))
                 .collect();
             let mut alias_roots: HashMap<String, String> = roots.clone();
-            let mut sources: HashMap<String, HashSet<LlType>> = HashMap::new();
+            let mut sources: HashMap<String, HashSet<LlType>> = HashMap::default();
             let mut changed = true;
             while changed {
                 changed = false;
@@ -225,7 +225,7 @@ impl LlModule {
     }
 
     pub(in crate::native) fn local_allocas(&self, f: &LlFunction) -> HashMap<String, LlType> {
-        let mut allocas = HashMap::new();
+        let mut allocas = HashMap::default();
         for inst in f.carrier_insts() {
             let (Some(name), Some(ty)) = (&inst.result, &inst.alloca_ty()) else {
                 continue;
@@ -243,6 +243,9 @@ impl LlModule {
         let original = self.resolve_known_type(original);
         let candidate = self.resolve_known_type(candidate);
         if self.type_contains_pointer(&original) || self.type_contains_pointer(&candidate) {
+            return false;
+        }
+        if matches!(&original, LlType::Struct(fields) if fields.as_slice() == std::slice::from_ref(&candidate)) {
             return false;
         }
         let Some((original_size, _)) = self.native_memcpy_type_size_align(&original) else {

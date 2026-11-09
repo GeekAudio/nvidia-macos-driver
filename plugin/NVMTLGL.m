@@ -173,7 +173,82 @@ static BOOL nvmtl_sel1_idle(int *r) { return __atomic_load_n(r, __ATOMIC_ACQUIRE
 - (void)setLineWidth:(float)w { nvmtl_vk_cmd_set_line_width(&_cb->_c, w); }
 - (void)setDepthCleared {}
 - (void)setStencilCleared {}
+// Apple's GL renderer turns primitive restart off (GL's default) through this call, at the start of each render pass.
+// Restart is per-draw dynamic state here already (strips only; Vulkan list topologies never restart), so this records
+// GL's choice for the strips. Vulkan restarts only at the all-ones index of the bound index type.
+- (void)setPrimitiveRestartEnabled:(BOOL)enabled index:(NSUInteger)index {
+    _cb->_c.restart_off = !enabled;
+    if (enabled && index != 0xffffu && index != 0xffffffffu) {
+        static int said; if (!said++) nvlog("GL: primitive restart index 0x%lx requested - Vulkan restarts only at the all-ones index", (unsigned long)index);
+    }
+}
+// Apple's GL renderer sends this (1 = GL's last-vertex convention, 0 = first) at the start of each render pass, once
+// its device profile says the encoder takes it; see nvmtl_gl_caps_enable below.
+- (void)setProvokingVertexMode:(NSUInteger)mode {
+    if (mode > 1) { static int said; if (!said++) nvlog("GL: setProvokingVertexMode:%lu is not first (0) or last (1) - first used", (unsigned long)mode); }
+    nvmtl_vk_cmd_set_provoking_last(&_cb->_c, mode == 1);
+}
 @end
+
+// Apple's GL renderer (GLDDeviceRec::initWithDisplayMask) takes a device profile by vendor name; "NVIDIA" gets the
+// table written for the Kepler Macs, whose first byte lacks 0x8: "the render encoder takes setProvokingVertexMode:".
+// Without that bit the renderer emulates GL's last-vertex convention itself, rewriting the index buffer of every
+// indexed draw with its fixIndexBuffer compute kernel: a compute dispatch (and its descriptor sets) per draw call.
+// Once the Vulkan device can make the last vertex provoke, the bit is set in that table, in this process only. The
+// renderer copies the table after it has created its Metal device (this plugin's device init); a renderer loaded
+// later is caught by the dyld callback. A table that does not hold the bytes it held on macOS 15.8.1 is left alone.
+#include <dlfcn.h>
+#include <mach-o/dyld.h>
+#include <mach-o/loader.h>
+#include <mach-o/nlist.h>
+#include <mach/mach.h>
+static const char kGLRendererSuffix[] = "/AppleMetalOpenGLRenderer.bundle/Contents/MacOS/AppleMetalOpenGLRenderer";
+static const char kGLNvidiaCaps[] = "__ZZN12GLDDeviceRec19initWithDisplayMaskEjE6nvidia";
+static const uint8_t kGLNvidiaCaps1581[20] = { 0x40, 0x01, 0, 0, 0, 0, 0, 0, 0, 0, 0x80, 0x42, 0, 0, 0x80, 0x41, 0, 0, 0, 0 };
+enum { NVMTL_GL_CAP_PROVOKING_VERTEX = 0x08 };
+
+static uint8_t *nvmtl_gl_local_symbol(const struct mach_header_64 *mh, const char *name) {
+    const struct load_command *lc = (const struct load_command *)(mh + 1);
+    const struct segment_command_64 *text = NULL, *linkedit = NULL; const struct symtab_command *st = NULL;
+    for (uint32_t i = 0; i < mh->ncmds; i++, lc = (const struct load_command *)((const char *)lc + lc->cmdsize)) {
+        if (lc->cmd == LC_SEGMENT_64) {
+            const struct segment_command_64 *sg = (const struct segment_command_64 *)lc;
+            if (!strcmp(sg->segname, SEG_TEXT)) text = sg;
+            else if (!strcmp(sg->segname, SEG_LINKEDIT)) linkedit = sg;
+        } else if (lc->cmd == LC_SYMTAB) st = (const struct symtab_command *)lc;
+    }
+    if (!text || !linkedit || !st) return NULL;
+    const intptr_t slide = (intptr_t)mh - (intptr_t)text->vmaddr;
+    const char *base = (const char *)(slide + linkedit->vmaddr - linkedit->fileoff);
+    const struct nlist_64 *sym = (const struct nlist_64 *)(base + st->symoff);
+    const char *strs = base + st->stroff;
+    for (uint32_t i = 0; i < st->nsyms; i++)
+        if (!(sym[i].n_type & N_STAB) && sym[i].n_value && !strcmp(strs + sym[i].n_un.n_strx, name))
+            return (uint8_t *)(sym[i].n_value + slide);
+    return NULL;
+}
+static void nvmtl_gl_caps_patch(const struct mach_header *mh) {
+    Dl_info info; const char *path = dladdr(mh, &info) ? info.dli_fname : NULL;
+    size_t n = path ? strlen(path) : 0, k = sizeof kGLRendererSuffix - 1;
+    if (n < k || strcmp(path + n - k, kGLRendererSuffix) || mh->magic != MH_MAGIC_64) return;
+    uint8_t *caps = nvmtl_gl_local_symbol((const struct mach_header_64 *)mh, kGLNvidiaCaps);
+    if (!caps) { nvlog("GL: renderer has no %s - provoking vertex left to its index rewrite", kGLNvidiaCaps); return; }
+    if (caps[0] & NVMTL_GL_CAP_PROVOKING_VERTEX) return;
+    if (memcmp(caps, kGLNvidiaCaps1581, sizeof kGLNvidiaCaps1581)) {
+        nvlog("GL: the renderer's NVIDIA profile is not the macOS 15.8.1 one - provoking vertex left to its index rewrite"); return;
+    }
+    const vm_address_t page = (vm_address_t)caps & ~(vm_address_t)(vm_page_size - 1);
+    kern_return_t kr = vm_protect(mach_task_self(), page, vm_page_size, FALSE, VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY);
+    if (kr != KERN_SUCCESS) { nvlog("GL: profile page not writable (%d) - provoking vertex left to its index rewrite", kr); return; }
+    caps[0] |= NVMTL_GL_CAP_PROVOKING_VERTEX;
+    vm_protect(mach_task_self(), page, vm_page_size, FALSE, VM_PROT_READ);   // data only on this page (__TEXT,__const)
+}
+static void nvmtl_gl_image_added(const struct mach_header *mh, intptr_t slide) { (void)slide; nvmtl_gl_caps_patch(mh); }
+void nvmtl_gl_caps_enable(void) {
+    if (!nvmtl_vk_have_provoking_last()) return;
+    static dispatch_once_t once;   // the callback also runs at once for every image already loaded
+    dispatch_once(&once, ^{ _dyld_register_func_for_add_image(nvmtl_gl_image_added); });
+}
 @implementation NVMTLFunction (NVMTLSel1)
 - (NSArray *)importedLibraries { return nil; }
 @end
@@ -190,7 +265,6 @@ static BOOL nvmtl_sel1_idle(int *r) { return __atomic_load_n(r, __ATOMIC_ACQUIRE
 - (void)setTileIntersectionFunctionTable:(id)t atBufferIndex:(NSUInteger)i {}
 - (void)dispatchThreadsPerTile:(MTLSize)s {}
 - (void)setThreadgroupMemoryLength:(NSUInteger)l offset:(NSUInteger)o atIndex:(NSUInteger)i {}
-- (void)setDepthTestMinBound:(float)lo maxBound:(float)hi {}
 @end
 @implementation NVMTLComputeCommandEncoder (NVMTLSel2)
 - (void)setImageblockWidth:(NSUInteger)w height:(NSUInteger)h {}
@@ -224,10 +298,32 @@ static BOOL nvmtl_sel1_idle(int *r) { return __atomic_load_n(r, __ATOMIC_ACQUIRE
 }
 @end
 
+// Apple's GL/OpenCL-on-Metal layer reads reflection objects through MTLArgument/MTLType getters that change between
+// macOS builds. Geekbench's OpenCL build aborted on an unimplemented one three times (10-07 twice, then a 1.2.0 RTX 3060
+// report on 10-09), each time after the previous getters were added. The build that worked had a forwarding net that
+// answered ZERO to every getter it did not implement; this is that net. respondsToSelector: still says NO, so code
+// that asks first is unchanged; a direct send gets 0 / nil / NO and the selector is logged, so it can be implemented.
+static NSMethodSignature *nvgl_zero_sig(SEL s) {
+    char types[48] = "Q@:";  // integer-class return: 0 in rax answers NSUInteger, BOOL, enums and nil alike
+    int args = 0;
+    for (const char *c = sel_getName(s); *c; c++) args += *c == ':';
+    for (int i = 0; i < args && i < 16; i++) strcat(types, "Q");
+    return [NSMethodSignature signatureWithObjCTypes:types];
+}
+static void nvgl_zero(NSInvocation *inv, const char *cls) {
+    nvlog("GL: %s asked -%s (answered 0)", cls, sel_getName(inv.selector));
+    char zero[64] = {0};
+    NSUInteger len = inv.methodSignature.methodReturnLength;
+    if (len && len <= sizeof zero) [inv setReturnValue:zero];
+}
+#define NVGL_ZERO_NET(cls) \
+- (NSMethodSignature *)methodSignatureForSelector:(SEL)s { return [super methodSignatureForSelector:s] ?: nvgl_zero_sig(s); } \
+- (void)forwardInvocation:(NSInvocation *)inv { nvgl_zero(inv, #cls); }
+
 @interface NVMTLGLPointerType : MTLPointerType {
   @public MTLDataType _elem; MTLBindingAccess _access; NSUInteger _size, _align; } @end
 @implementation NVMTLGLPointerType
-- (void)doesNotRecognizeSelector:(SEL)s { nvlog("GL: NVMTLGLPointerType asked -%s (NOT IMPLEMENTED)", sel_getName(s)); [super doesNotRecognizeSelector:s]; }
+NVGL_ZERO_NET(NVMTLGLPointerType)
 - (MTLDataType)dataType { return MTLDataTypePointer; }
 - (MTLDataType)elementType { return _elem; }
 - (MTLBindingAccess)access { return _access; }
@@ -262,11 +358,11 @@ static BOOL nvmtl_sel1_idle(int *r) { return __atomic_load_n(r, __ATOMIC_ACQUIRE
     return (MTLPointerType *)p;
 }
 - (id)dataTypeDescription { return _type == MTLBindingTypeBuffer ? (id)[self bufferPointerType] : nil; }
-// 10-07 (studio, Screen Sharing "Both Displays" = tiled garbage): these getters answered real-looking values (2D, length 1,
+// (Screen Sharing "Both Displays" = tiled garbage): these getters answered real-looking values (2D, length 1,
 // stride = size, Pointer/Texture, the binding index) and Apple's GL/OpenCL layer laid out its clImage*Scale kernel arguments
 // from them. The working build never implemented them: its forwarding net answered ZERO. They stay implemented (no abort)
 // and answer exactly that zero.
-// 10-07 (user crash report NM-W8WHES8G): Geekbench's OpenCL build aborted in -[NVMTLGLBinding doesNotRecognizeSelector:]
+// 10-07 (a user's crash report): Geekbench's OpenCL build aborted in -[NVMTLGLBinding doesNotRecognizeSelector:]
 // under GLDComputeProgramRec::buildComputeProgram. Apple's GL-on-Metal layer reads reflection through the older MTLArgument
 // / MTLType getters; measured on its binary (selector refs): arrayLength, textureType, alignment, dataSize, members,
 // elementTypeDescription. A buffer binding answers each with what MTLArgument gives for a buffer.
@@ -282,7 +378,7 @@ static BOOL nvmtl_sel1_idle(int *r) { return __atomic_load_n(r, __ATOMIC_ACQUIRE
 - (BOOL)active { return NO; }
 - (NSUInteger)threadgroupMemoryAlignment { return 0; }
 - (NSUInteger)threadgroupMemoryDataSize { return 0; }
-// 10-07 (NM-P0NWBY60, RTX 3050 on driver 1.0.3): Geekbench's OpenCL build still aborted here. The renderer's selector
+// 10-07 (RTX 3050 on driver 1.0.3): Geekbench's OpenCL build still aborted here. The renderer's selector
 // list (AppleMetalOpenGLRenderer, macOS 15.8.1) also names dataType, offset, stride and argumentIndex, which a buffer
 // binding did not answer. A buffer reads as a pointer at offset 0, one element of its own size, at its own index.
 - (MTLDataType)dataType { return MTLDataTypeNone; }
@@ -293,7 +389,7 @@ static BOOL nvmtl_sel1_idle(int *r) { return __atomic_load_n(r, __ATOMIC_ACQUIRE
 - (id)elementStructType { return nil; }
 - (id)elementArrayType { return nil; }
 - (id)elementPointerType { return nil; }
-- (void)doesNotRecognizeSelector:(SEL)s { nvlog("GL: NVMTLGLBinding asked -%s (NOT IMPLEMENTED)", sel_getName(s)); [super doesNotRecognizeSelector:s]; }
+NVGL_ZERO_NET(NVMTLGLBinding)
 - (NSString *)description { return [NSString stringWithFormat:@"<NVMTLGLBinding %@ type %ld access %ld index %lu size %lu>",
                                      _name, (long)_type, (long)_access, (unsigned long)_index, (unsigned long)_size]; }
 @end
@@ -313,7 +409,7 @@ static BOOL nvmtl_sel1_idle(int *r) { return __atomic_load_n(r, __ATOMIC_ACQUIRE
 - (BOOL)isDepthTexture { return NO; }
 - (BOOL)depthTexture { return NO; }
 - (NSUInteger)arrayLength { return 1; }
-// same older getters as NVMTLGLBinding (10-07), with what MTLArgument gives for a texture
+// same older getters as NVMTLGLBinding, with what MTLArgument gives for a texture
 - (NSUInteger)alignment { return 0; }
 - (NSUInteger)dataSize { return 0; }
 - (NSArray *)members { return nil; }
@@ -326,12 +422,12 @@ static BOOL nvmtl_sel1_idle(int *r) { return __atomic_load_n(r, __ATOMIC_ACQUIRE
 - (MTLDataType)bufferDataType { return MTLDataTypeNone; }
 - (NSUInteger)threadgroupMemoryAlignment { return 0; }
 - (NSUInteger)threadgroupMemoryDataSize { return 0; }
-// same four getters as NVMTLGLBinding (10-07): a texture is MTLDataTypeTexture at offset 0, at its own index
+// same four getters as NVMTLGLBinding: a texture is MTLDataTypeTexture at offset 0, at its own index
 - (MTLDataType)dataType { return MTLDataTypeNone; }
 - (NSUInteger)offset { return 0; }
 - (NSUInteger)stride { return 0; }
 - (NSUInteger)argumentIndex { return 0; }
-- (void)doesNotRecognizeSelector:(SEL)s { nvlog("GL: NVMTLGLTexBinding asked -%s (NOT IMPLEMENTED)", sel_getName(s)); [super doesNotRecognizeSelector:s]; }
+NVGL_ZERO_NET(NVMTLGLTexBinding)
 - (NSString *)description { return [NSString stringWithFormat:@"<NVMTLGLTexBinding %@ access %ld index %lu textureType %lu>", _name, (long)_access, (unsigned long)_index, (unsigned long)_ttype]; }
 @end
 @interface NVMTLGLFunctionReflection : NSObject { @public NSArray *_args; } @end
@@ -342,7 +438,7 @@ static BOOL nvmtl_sel1_idle(int *r) { return __atomic_load_n(r, __ATOMIC_ACQUIRE
 - (NSArray *)tags { return @[]; }
 - (NSData *)pluginReturnData { return nil; }
 - (NSUInteger)primitiveKind { return 0; }
-- (void)doesNotRecognizeSelector:(SEL)s { nvlog("GL: NVMTLGLFunctionReflection asked -%s (NOT IMPLEMENTED)", sel_getName(s)); [super doesNotRecognizeSelector:s]; }
+NVGL_ZERO_NET(NVMTLGLFunctionReflection)
 @end
 
 static NSArray *nvmtl_gl_cl_bindings(NSString *ll) {
@@ -373,6 +469,7 @@ static NSArray *nvmtl_gl_cl_bindings(NSString *ll) {
         NSString *t = [b substringFromIndex:NSMaxRange(r)]; NSRange q = [t rangeOfString:@"\""]; return q.location == NSNotFound ? nil : [t substringToIndex:q.location]; };
     for (NSString *a in [argList componentsSeparatedByString:@", "]) {
         NSString *b = md[[a substringFromIndex:1]]; if (!b) continue;
+        if (getenv("NVMTL_CL_REFL_TRACE")) nvlog("GL: OpenCL argument metadata: %s", b.UTF8String);
         BOOL buf = [b rangeOfString:@"!\"air.buffer\""].location != NSNotFound, cst = [b rangeOfString:@"!\"air.constant\""].location != NSNotFound;
         if ([b rangeOfString:@"!\"air.texture\""].location != NSNotFound) {
             NVMTLGLTexBinding *t = [NVMTLGLTexBinding new]; t->_name = str(b, @"air.arg_name") ?: @"";
@@ -385,9 +482,12 @@ static NSArray *nvmtl_gl_cl_bindings(NSString *ll) {
                       : [tn hasPrefix:@"texture_buffer"] ? MTLTextureTypeTextureBuffer : MTLTextureType2D;
             [out addObject:t]; continue;
         }
-        if (!buf && !cst) continue;
+        if (!buf && !cst) { nvlog("GL: OpenCL argument not reflected: %s", b.UTF8String); continue; }
         NVMTLGLBinding *x = [NVMTLGLBinding new];
-        x->_name = str(b, @"air.arg_name") ?: @""; x->_type = cst ? (MTLBindingType)22 : MTLBindingTypeBuffer;
+        // an OpenCL __local pointer is an air.buffer in address space 3: OpenCL sets it with a size and no cl_mem, and
+        // refused it as a buffer (CL_INVALID_ARG_SIZE) until it was reflected as threadgroup memory
+        x->_name = str(b, @"air.arg_name") ?: @"";
+        x->_type = cst ? (MTLBindingType)22 : num(b, @"air.address_space") == 3 ? MTLBindingTypeThreadgroupMemory : MTLBindingTypeBuffer;
         x->_access = [b rangeOfString:@"!\"air.read_write\""].location != NSNotFound ? MTLBindingAccessReadWrite
                    : [b rangeOfString:@"!\"air.write\""].location != NSNotFound ? MTLBindingAccessWriteOnly : MTLBindingAccessReadOnly;
         NSInteger li = num(b, @"air.location_index"); x->_index = li >= 0 ? (NSUInteger)li : 0;
@@ -400,7 +500,13 @@ static NSArray *nvmtl_gl_cl_bindings(NSString *ll) {
 }
 @implementation NVMTLFunction (NVMTLGLRefl)
 - (id)reflectionWithOptions:(NSUInteger)o {
-    if (_spirv || ![_air containsString:@"\"air.constant\""]) return nil;
+    // Apple's OpenCL builds its argument table from this reflection (GLDComputeProgramRec::buildComputeProgram reads
+    // reflectionWithOptions: -> arguments). It answered nil whenever the function already had SPIR-V - which is always,
+    // since library entries translate when they are made - or had no air.constant argument, so OpenCL saw 0 arguments:
+    // every clSetKernelArg returned -49 and Geekbench's OpenCL run stopped at its first workload.
+    if (getenv("NVMTL_CL_REFL_TRACE")) nvlog("GL: reflectionWithOptions: %s options 0x%lx spirv %lu B air %lu B kernel-list %d", _fname.UTF8String, (unsigned long)o, (unsigned long)_spirv.length, (unsigned long)_air.length, [_air containsString:@"!air.kernel"]);
+    // A kernel is translated when its library entry is made, so _spirv is always set by now; only the AIR decides.
+    if (!_air.length || ![_air containsString:@"!air.kernel"]) return nil;
     NSArray *args = nvmtl_gl_cl_bindings(_air);
     if (!args) { nvlog("GL: reflectionWithOptions: %s - no air.kernel argument list in its AIR", _fname.UTF8String); return nil; }
     NVMTLGLFunctionReflection *r = [NVMTLGLFunctionReflection new]; r->_args = args;

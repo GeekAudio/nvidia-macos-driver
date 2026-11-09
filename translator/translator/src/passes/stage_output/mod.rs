@@ -195,6 +195,29 @@ fn value_for_store(
     bitcast_for_store(ctx, stores, value, src_ty, dst_ty)
 }
 
+/// An A8Unorm colour attachment is an R8 image on Vulkan: broadcast the output's alpha to every lane so the red lane,
+/// the only one the target keeps, holds the alpha Metal would have stored. Scalar and non-float outputs pass through.
+fn a8_splat_alpha(ctx: &mut Ctx, stores: &mut Vec<Instruction>, value: Word, ty: Word) -> Word {
+    if float_component_shape_live(ctx, ty) != Some((32, 4)) {
+        return value;
+    }
+    let splat = ctx.module.fresh_id();
+    stores.push(Instruction::new(
+        Op::VectorShuffle,
+        Some(ty),
+        Some(splat),
+        vec![
+            Operand::IdRef(value),
+            Operand::IdRef(value),
+            Operand::LiteralBit32(3),
+            Operand::LiteralBit32(3),
+            Operand::LiteralBit32(3),
+            Operand::LiteralBit32(3),
+        ],
+    ));
+    splat
+}
+
 fn float_component_shape_live(ctx: &Ctx, ty: Word) -> Option<(u32, u32)> {
     let def = type_def_of(ctx, ty)?;
     let (scalar_ty, lanes) = if def.class.opcode == Op::TypeVector {
@@ -661,6 +684,11 @@ pub(in crate::passes) fn rewrite_return(
                 }
             };
             let value = value_for_store(ctx, &mut stores, value, src_ty, dst_ty);
+            let value = if ctx.a8_output_vars.contains(&var) {
+                a8_splat_alpha(ctx, &mut stores, value, dst_ty)
+            } else {
+                value
+            };
             stores.push(Instruction::new(
                 Op::Store,
                 None,
@@ -671,8 +699,21 @@ pub(in crate::passes) fn rewrite_return(
         }
     }
 
+    // Input layout and local-pointer materialization can clone a buffer record
+    // also used by the entry's return aggregate. Resolve the current type IDs,
+    // including deferred globals, before constructing the output interface.
+    let mut output_defs = defs.clone();
+    for instruction in ctx.module.types_global_values.iter().chain(ctx.new_globals.iter()) {
+        if let Some(id) = instruction.result_id {
+            output_defs.insert(id, instruction.clone());
+        }
+    }
+    let defs = &output_defs;
     let mut outputs: Vec<OutputWrite> = vec![];
     let rdef = defs.get(&ret_ty).cloned();
+    if rdef.is_none() && matches!(stage, Stage::Vertex | Stage::Fragment) {
+        return Err(format!("stage output return type {ret_ty} has no current definition"));
+    }
 
     let unmodelled = match stage {
         Stage::Fragment => frag.map(|meta| meta.unmodelled_output_members.as_slice()),
@@ -798,6 +839,12 @@ pub(in crate::passes) fn rewrite_return(
                         match kind {
                             OutKind::Location(location) => {
                                 decorate_location(&mut ctx.module, var, location);
+                                if location < 32
+                                    && (ctx.a8_render_target_mask >> location) & 1 == 1
+                                    && !frag.is_some_and(|meta| meta.is_dual_source_member(mi as u32))
+                                {
+                                    ctx.a8_output_vars.insert(var);
+                                }
                                 if frag.is_some_and(|meta| meta.is_dual_source_member(mi as u32)) {
                                     ctx.module.annotations.push(Instruction::new(
                                         Op::Decorate,
@@ -874,6 +921,9 @@ pub(in crate::passes) fn rewrite_return(
                         let output_ty = fragment_output_type(ctx, frag, 0, ret_ty, defs);
                         let var = make_output_var(ctx, output_ty);
                         decorate_location(&mut ctx.module, var, location);
+                        if location < 32 && (ctx.a8_render_target_mask >> location) & 1 == 1 {
+                            ctx.a8_output_vars.insert(var);
+                        }
                         ctx.interface.push(var);
                         outputs.push(OutputWrite::Direct {
                             var,
@@ -1196,7 +1246,7 @@ mod tests {
     fn scalar_bool_fragment_output_uses_uint_interface_and_select() {
         let mut ctx = Ctx::new(Module::new());
         let bool_ty = ctx.ty_bool();
-        let defs = combined_type_defs(&ctx, &HashMap::new());
+        let defs = combined_type_defs(&ctx, &HashMap::default());
 
         let output_ty = fragment_output_type(&mut ctx, None, 0, bool_ty, &defs);
         assert_eq!(output_ty, ctx.ty_uint());

@@ -21,7 +21,7 @@ fn needed_variable_pointer_capabilities(ctx: &Ctx) -> (bool, bool) {
 }
 
 fn defined_ids(module: &Module) -> HashSet<Word> {
-    let mut s = HashSet::new();
+    let mut s = HashSet::default();
     for inst in &module.types_global_values {
         if let Some(id) = inst.result_id {
             s.insert(id);
@@ -56,7 +56,7 @@ fn defined_ids(module: &Module) -> HashSet<Word> {
 }
 
 pub(super) fn function_referenced_ids(module: &Module) -> HashSet<Word> {
-    let mut s = HashSet::new();
+    let mut s = HashSet::default();
     for f in &module.functions {
         for b in &f.blocks {
             for inst in &b.instructions {
@@ -171,7 +171,7 @@ pub(super) fn gc_dead_globals(ctx: &mut Ctx) {
         }
     };
 
-    let mut live = HashSet::new();
+    let mut live = HashSet::default();
     live.extend(
         ctx.emit_sidecar
             .local_pointer_field_stores
@@ -220,7 +220,7 @@ pub(super) fn gc_dead_globals(ctx: &mut Ctx) {
         let Some(definition) = definitions.get(&id) else {
             continue;
         };
-        let mut dependencies = HashSet::new();
+        let mut dependencies = HashSet::default();
         collect(definition, &mut dependencies);
         for dependency in dependencies {
             if live.insert(dependency) {
@@ -286,7 +286,7 @@ pub(crate) fn drop_unreferenced_scalar_types(module: &mut Module) {
     if scalars.is_empty() {
         return;
     }
-    let mut referenced: HashSet<Word> = HashSet::new();
+    let mut referenced: HashSet<Word> = HashSet::default();
     for instruction in module.all_inst_iter() {
         if matches!(
             instruction.class.opcode,
@@ -312,8 +312,8 @@ pub(crate) fn drop_unreferenced_scalar_types(module: &mut Module) {
 }
 
 pub(crate) fn drop_unrequired_capabilities(module: &mut Module) {
-    let mut required: HashSet<spirv::Capability> = HashSet::new();
-    let mut required_extensions: HashSet<&'static str> = HashSet::new();
+    let mut required: HashSet<spirv::Capability> = HashSet::default();
+    let mut required_extensions: HashSet<&'static str> = HashSet::default();
     for instruction in module.all_inst_iter() {
         if matches!(instruction.class.opcode, Op::Capability | Op::Extension) {
             continue;
@@ -415,16 +415,26 @@ pub(super) fn drop_unused_variable_pointer_capabilities(ctx: &mut Ctx) -> (bool,
 pub(super) fn add_needed_capabilities(ctx: &mut Ctx, variable_pointer_requirements: (bool, bool)) {
     use spirv::Capability;
     let mut want: Vec<Capability> = vec![];
-    let formatless_storage_types: HashSet<Word> = ctx.module.types_global_values.iter()
-        .filter(|i| i.class.opcode == Op::TypeImage
-            && i.operands.get(5) == Some(&Operand::LiteralBit32(2))
-            && i.operands.get(6) == Some(&Operand::ImageFormat(spirv::ImageFormat::Unknown)))
+    let formatless_storage_types: HashSet<Word> = ctx
+        .module
+        .types_global_values
+        .iter()
+        .filter(|i| {
+            i.class.opcode == Op::TypeImage
+                && i.operands.get(5) == Some(&Operand::LiteralBit32(2))
+                && i.operands.get(6) == Some(&Operand::ImageFormat(spirv::ImageFormat::Unknown))
+        })
         .filter_map(|i| i.result_id)
         .collect();
-    let value_types: HashMap<Word, Word> = ctx.module.all_inst_iter()
+    let value_types: HashMap<Word, Word> = ctx
+        .module
+        .all_inst_iter()
         .filter_map(|i| Some((i.result_id?, i.result_type?)))
         .collect();
-    for instruction in ctx.module.functions.iter()
+    for instruction in ctx
+        .module
+        .functions
+        .iter()
         .flat_map(|f| &f.blocks)
         .flat_map(|b| &b.instructions)
     {
@@ -433,8 +443,12 @@ pub(super) fn add_needed_capabilities(ctx: &mut Ctx, variable_pointer_requiremen
             Op::ImageWrite => Capability::StorageImageWriteWithoutFormat,
             _ => continue,
         };
-        let Some(Operand::IdRef(image)) = instruction.operands.first() else { continue; };
-        if value_types.get(image).is_some_and(|ty| formatless_storage_types.contains(ty))
+        let Some(Operand::IdRef(image)) = instruction.operands.first() else {
+            continue;
+        };
+        if value_types
+            .get(image)
+            .is_some_and(|ty| formatless_storage_types.contains(ty))
             && !want.contains(&capability)
         {
             want.push(capability);
@@ -481,6 +495,20 @@ pub(super) fn add_needed_capabilities(ctx: &mut Ctx, variable_pointer_requiremen
     }
     if image_dim(Dim::DimBuffer, true) {
         want.push(Capability::ImageBuffer);
+    }
+    let cube_array = |storage: bool| {
+        ctx.module.types_global_values.iter().any(|i| {
+            i.class.opcode == Op::TypeImage
+                && i.operands.get(1) == Some(&Operand::Dim(Dim::DimCube))
+                && i.operands.get(3) == Some(&Operand::LiteralBit32(1))
+                && (i.operands.get(5) == Some(&Operand::LiteralBit32(2))) == storage
+        })
+    };
+    if cube_array(false) {
+        want.push(Capability::SampledCubeArray);
+    }
+    if cube_array(true) {
+        want.push(Capability::ImageCubeArray);
     }
     let has_input_attachment_type = ctx.module.types_global_values.iter().any(|i| {
         i.class.opcode == Op::TypeImage
@@ -586,6 +614,18 @@ pub(super) fn add_needed_capabilities(ctx: &mut Ctx, variable_pointer_requiremen
     });
     if has_stencil_export {
         want.push(Capability::StencilExportEXT);
+    }
+    let has_draw_parameters = ctx.module.annotations.iter().any(|instruction| {
+        instruction.class.opcode == Op::Decorate
+            && instruction.operands.get(1) == Some(&Operand::Decoration(Decoration::BuiltIn))
+            && matches!(
+                instruction.operands.get(2),
+                Some(&Operand::BuiltIn(BuiltIn::BaseVertex))
+                    | Some(&Operand::BuiltIn(BuiltIn::BaseInstance))
+            )
+    });
+    if has_draw_parameters {
+        want.push(Capability::DrawParameters);
     }
     let has_query = ctx
         .module
@@ -732,8 +772,7 @@ pub(super) fn add_needed_capabilities(ctx: &mut Ctx, variable_pointer_requiremen
                     | Op::GroupNonUniformBitwiseAnd
                     | Op::GroupNonUniformBitwiseOr
                     | Op::GroupNonUniformBitwiseXor
-            )
-            && !i.operands.iter().any(|o| {
+            ) && !i.operands.iter().any(|o| {
                 matches!(
                     o,
                     Operand::GroupOperation(spirv::GroupOperation::ClusteredReduce)
@@ -823,6 +862,9 @@ pub(super) fn add_needed_capabilities(ctx: &mut Ctx, variable_pointer_requiremen
     if want.contains(&Capability::FragmentBarycentricKHR) {
         let ext = "SPV_KHR_fragment_shader_barycentric";
         require_extension(ctx, ext);
+    }
+    if want.contains(&Capability::DrawParameters) {
+        require_extension(ctx, "SPV_KHR_shader_draw_parameters");
     }
     if want.contains(&Capability::StencilExportEXT) {
         let ext = "SPV_EXT_shader_stencil_export";
@@ -1294,7 +1336,7 @@ mod tests {
 
         assert!(drop_unreferenced_global_variables(&mut module));
 
-        assert_eq!(variable_ids(&module), HashSet::from([LIVE_VARIABLE]));
+        assert_eq!(variable_ids(&module), crate::fxhash::set_from([LIVE_VARIABLE]));
         let interface = module.entry_points[0].operands[3..]
             .iter()
             .filter_map(|operand| match operand {
@@ -1302,7 +1344,7 @@ mod tests {
                 _ => None,
             })
             .collect::<HashSet<_>>();
-        assert_eq!(interface, HashSet::from([LIVE_VARIABLE]));
+        assert_eq!(interface, crate::fxhash::set_from([LIVE_VARIABLE]));
         assert!(!ids_named_by(&module.annotations).contains(&STRANDED_VARIABLE));
         assert!(!ids_named_by(&module.debug_names).contains(&STRANDED_VARIABLE));
         assert!(ids_named_by(&module.annotations).contains(&LIVE_VARIABLE));

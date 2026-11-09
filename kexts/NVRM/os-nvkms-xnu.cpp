@@ -33,6 +33,31 @@ SYSCTL_QUAD(_debug, OID_AUTO, nvrm_kms_timer_max_depth, CTLFLAG_RD, &gKmsTimerMa
 SYSCTL_QUAD(_debug, OID_AUTO, nvrm_kms_timer_executed, CTLFLAG_RD, &gKmsTimerExecuted, "completed NVKMS timer callbacks");
 static void kms_timer_drain(thread_call_param_t, thread_call_param_t);
 
+// System sleep, the part nvkms_pm_lock does in nvidia-modeset-linux.c. nvkms_xnu_suspend() moves NVKMS to SUSPENDED
+// under gKmsLock before RM puts the GPU in standby, and nvkms_xnu_resume() moves it back once RM has resumed it (LOST
+// when the resume failed). While NVKMS is not RUNNING nothing may reach the display engine: a push to the core channel
+// of a GPU that lost power spins in nvEvoMakeRoom forever.
+enum { kKmsPmRunning = 0, kKmsPmSuspended = 1, kKmsPmLost = 2 };
+static int gKmsPmState = kKmsPmRunning;
+static const uint32_t kKmsPmWaitMs = 30000;
+static const char *const kKmsPmName[] = { "running", "suspended", "lost" };
+
+// Called with gKmsLock held. True once NVKMS may touch the GPU. tryOnly fails at once while suspended (the flips,
+// like nvkms_ioctl_from_kapi_try_pmlock); otherwise wait up to waitMs for the resume (0 = no limit). LOST never waits.
+static bool kms_pm_wait_locked(bool tryOnly, uint32_t waitMs)
+{
+    if (gKmsPmState == kKmsPmRunning) return true;
+    if (tryOnly || gKmsPmState == kKmsPmLost) return false;
+    uint64_t deadline = 0;
+    if (waitMs) clock_interval_to_deadline(waitMs, kMillisecondScale, &deadline);
+    while (gKmsPmState == kKmsPmSuspended) {
+        int wr = waitMs ? IOLockSleepDeadline(gKmsLock, &gKmsPmState, deadline, THREAD_UNINT)
+                        : IOLockSleep(gKmsLock, &gKmsPmState, THREAD_UNINT);
+        if (wr == THREAD_TIMED_OUT) break;
+    }
+    return gKmsPmState == kKmsPmRunning;
+}
+
 struct nvkms_per_open {
     void *data;
     enum NvKmsClientType type;
@@ -80,7 +105,8 @@ static struct nvkms_per_open *kms_open_common(enum NvKmsClientType type, struct 
 static void kms_close_common(struct nvkms_per_open *popen)
 {
     IOLockLock(gKmsLock);
-    nvKmsClose(popen->data);
+    if (kms_pm_wait_locked(false, kKmsPmWaitMs)) nvKmsClose(popen->data);
+    else kprintf("NVRM-xnu: NVKMS close while the GPU is %s: per-open state left allocated\n", kKmsPmName[gKmsPmState]);
     popen->data = NULL;
     popen->closing = true;
     if (popen->eventCall && popen->eventBusy) {
@@ -92,12 +118,49 @@ static void kms_close_common(struct nvkms_per_open *popen)
     nvkms_free(popen, sizeof *popen);
 }
 
-static NvBool kms_ioctl_common(struct nvkms_per_open *popen, NvU32 cmd, NvU64 address, size_t size)
+// Where an ioctl from the kernel client was refused. NVKMS reports a rejected request through the reply status, and
+// the KAPI layer turns that status into a flip result: a refusal that happens BEFORE NVKMS writes a status (no open
+// device, the GPU not running, a failure inside the ioctl after validation) leaves the status at "success" and shows
+// up one layer up as "accepted 0, flipResult 0". This names that case.
+// Positions in enum NvKmsIoctlCommand: NVKMS_IOCTL_SET_MODE is 9, NVKMS_IOCTL_FLIP is 15.
+enum { kKmsCmdSetMode = 9, kKmsCmdFlip = 15 };
+enum { kKmsRefuseNone = 0, kKmsRefuseNoOpen, kKmsRefusePmTry, kKmsRefusePmWait, kKmsRefuseIoctl };
+static int kms_ioctl_refusal(bool haveOpen, bool pmReady, bool tryPm, bool ioctlOk)
+{
+    if (!haveOpen) return kKmsRefuseNoOpen;
+    if (!pmReady) return tryPm ? kKmsRefusePmTry : kKmsRefusePmWait;
+    return ioctlOk ? kKmsRefuseNone : kKmsRefuseIoctl;
+}
+static const char *const kKmsRefuseName[] = {
+    "ok", "no open NVKMS device", "GPU not running (try-lock: refused at once)", "GPU not running (waited for the resume)",
+    "NVKMS ioctl returned false"
+};
+// The first 8 refusals, then every 64th: a flip refused in a loop must not fill the log.
+static bool kms_refusal_logworthy(unsigned n) { return n <= 8 || (n % 64) == 0; }
+
+static NvBool kms_ioctl_common(struct nvkms_per_open *popen, NvU32 cmd, NvU64 address, size_t size, bool tryPm = false)
 {
     NvBool ret = NV_FALSE;
+    bool haveOpen = false, pmReady = false;
+    int pmState = kKmsPmRunning;
+    const uint64_t t0 = mach_absolute_time();
     IOLockLock(gKmsLock);
-    if (popen->data) ret = nvKmsIoctl(popen->data, cmd, address, size);
+    haveOpen = popen->data != NULL;
+    if (haveOpen && (pmReady = kms_pm_wait_locked(tryPm, kKmsPmWaitMs))) ret = nvKmsIoctl(popen->data, cmd, address, size);
+    pmState = gKmsPmState;
     IOLockUnlock(gKmsLock);
+    if (!ret) {
+        // Mode sets count apart: a flood of refused flips or cursor images must not use up the lines for the one
+        // refusal that leaves WindowServer without a display.
+        static volatile SInt32 refused[2];
+        const unsigned n = (unsigned)OSIncrementAtomic(&refused[cmd == kKmsCmdSetMode ? 0 : 1]) + 1;
+        if (kms_refusal_logworthy(n)) {
+            uint64_t ns; absolutetime_to_nanoseconds(mach_absolute_time() - t0, &ns);
+            kprintf("NVRM-xnu: NVKMS ioctl %u refused (#%u): %s; pm %s; after %llu us\n", (unsigned)cmd, n,
+                    kKmsRefuseName[kms_ioctl_refusal(haveOpen, pmReady, tryPm, false)],
+                    kKmsPmName[pmState], (unsigned long long)(ns / 1000));
+        }
+    }
     return ret;
 }
 
@@ -126,13 +189,31 @@ NvBool nvkms_xnu_load(void)
     if (nvkms_enumerate_gpus(info) == 1) { nvKmsKapiProbe(&info[0]); kprintf("NVRM-xnu: nvKmsKapiProbe gpu_id 0x%x\n", info[0].gpu_id); }
     return NV_TRUE;
 }
-struct nvkms_per_open *nvkms_xnu_open(int pid) { return gKmsLoaded ? kms_open_common(NVKMS_CLIENT_KERNEL_SPACE, NULL, pid) : NULL; }
-void nvkms_xnu_close(struct nvkms_per_open *popen) { if (popen) kms_close_common(popen); }
-int nvkms_xnu_ioctl(struct nvkms_per_open *popen, NvU32 cmd, void *params, size_t size)
+// nvkms_suspend() / nvkms_resume() of nvidia-modeset-linux.c. Suspend runs before rm_power_management(STANDBY) and
+// shuts every head down while the GPU still answers; resume runs after rm_power_management(RESUME). gpuOk false
+// leaves NVKMS LOST: every later ioctl and timer is refused instead of pushing to a core channel nobody serves.
+void nvkms_xnu_suspend(NvU32 gpuId)
 {
-    return kms_ioctl_common(popen, cmd, (NvU64)(uintptr_t)params, size) ? 0 : -1;
+    if (!gKmsLoaded) return;
+    nvKmsKapiSuspendResume(NV_TRUE);
+    IOLockLock(gKmsLock);
+    const bool wasRunning = gKmsPmState == kKmsPmRunning;
+    gKmsPmState = kKmsPmSuspended;
+    if (wasRunning) nvKmsSuspend(gpuId);
+    IOLockUnlock(gKmsLock);
+    kprintf("NVRM-xnu: NVKMS suspended (gpu 0x%x, was %s)\n", gpuId, wasRunning ? "running" : "not running");
 }
-int nvkms_xnu_events_available(struct nvkms_per_open *popen) { return popen ? popen->eventsAvailable : 0; }
+void nvkms_xnu_resume(NvU32 gpuId, NvBool gpuOk)
+{
+    if (!gKmsLoaded) return;
+    IOLockLock(gKmsLock);
+    if (gpuOk && gKmsPmState == kKmsPmSuspended) nvKmsResume(gpuId);
+    gKmsPmState = gpuOk ? kKmsPmRunning : kKmsPmLost;
+    IOLockWakeup(gKmsLock, &gKmsPmState, false);
+    IOLockUnlock(gKmsLock);
+    if (gpuOk) nvKmsKapiSuspendResume(NV_FALSE);
+    kprintf("NVRM-xnu: NVKMS %s (gpu 0x%x)\n", gpuOk ? "resumed" : "left LOST: the GPU did not resume", gpuId);
+}
 static struct NvKmsKapiFunctionsTable gKapiTable;
 void *nvkms_xnu_kapi_table(void)
 {
@@ -149,9 +230,29 @@ enum NvKmsFrlRateForce nvkms_force_frl_rate(void) { return NVKMS_FRL_RATE_FORCE_
 NvBool nvkms_conceal_vrr_caps(void)             { return NV_FALSE; }
 NvBool nvkms_enhanced_pcon_support(void)        { return NV_FALSE; }
 NvBool nvkms_output_rounding_fix(void)          { return NV_TRUE; }
+// NVIDIA 620: gates a NEW single-GPU multi-head fliplock path (Linux default true). 615, which every shipped driver
+// used, returned before enabling fliplock on one GPU; false keeps that scan-out behaviour exactly. Turning it on
+// changes what the heads flip on, so it needs its own WindowServer gate first.
+NvBool nvkms_opportunistic_flip_sync(void)      { return NV_FALSE; }
 NvBool nvkms_disable_hdmi_frl(void)             { return NV_FALSE; }
 NvBool nvkms_disable_vrr_memclk_switch(void)    { return NV_FALSE; }
 NvBool nvkms_hdmi_deepcolor(void)               { return NV_TRUE; }
+// The most bits per colour NVKMS may send: NVIDIA's max_output_color_depth module parameter, here the boot-arg
+// nvmaxbpc. NVIDIA's default is 10 (DisplayPort and HDMI deep colour up to 10); nvmaxbpc=12 allows 615's 12-bit
+// HDMI deep colour on displays that report it, 8 and 6 cap lower.
+NvU32 nvkms_max_output_color_bpc(void)
+{
+    static NvU32 bpc = 0;
+    if (bpc == 0) {
+        uint32_t want = 10;
+        PE_parse_boot_argn("nvmaxbpc", &want, sizeof want);
+        bpc = (want == 6 || want == 8 || want == 12) ? want : 10;
+    }
+    return bpc;
+}
+// 615 reports HDMI and HDMI-audio plug state to Linux's extcon framework; macOS has none.
+void nvkms_extcon_report_hdmi(NvBool)            { }
+void nvkms_extcon_report_hdmi_audio(NvBool)      { }
 NvBool nvkms_opportunistic_display_sync(void)   { return NV_TRUE; }
 enum NvKmsDebugForceColorSpace nvkms_debug_force_color_space(void) { return NVKMS_DEBUG_FORCE_COLOR_SPACE_NONE; }
 NvBool nvkms_enable_overlay_layers(void)        { return NV_TRUE; }
@@ -161,17 +262,24 @@ static bool gKmsTraceRm = true;
 void nvkms_call_rm(void *ops)
 {
     nvidia_kernel_rmapi_ops_t *o = (nvidia_kernel_rmapi_ops_t *)ops;
-    rm_kernel_rmapi_op(NULL, ops);
+    {
+        // KAPI allocations for NVRMFB/NVAccel (WindowServer) reach RM here without an NVKMS ioctl: hold them while the
+        // GPU is in standby. NVKMS's own suspend and resume run on the PM thread, which the gate lets through.
+        NvXnuPmUse pmUse;
+        rm_kernel_rmapi_op(NULL, ops);
+    }
+    // Only failures are logged: WindowServer duplicates objects and binds context DMAs for every surface, and logging
+    // the successful ones filled the system log on a busy desktop (#242).
     if (!gKmsTraceRm) return;
     switch (o->op) {
     case NV04_ALLOC:          if (o->params.alloc.status) kprintf("NVKMS-rm: ALLOC class 0x%x parent 0x%x -> status 0x%x\n", o->params.alloc.hClass, o->params.alloc.hObjectParent, o->params.alloc.status); break;
     case NV04_CONTROL:        if (o->params.control.status) kprintf("NVKMS-rm: CONTROL obj 0x%x cmd 0x%x -> status 0x%x\n", o->params.control.hObject, o->params.control.cmd, o->params.control.status); break;
-    case NV04_DUP_OBJECT:     kprintf("NVKMS-rm: DUP_OBJECT src client 0x%x obj 0x%x -> status 0x%x\n", o->params.dupObject.hClientSrc, o->params.dupObject.hObjectSrc, o->params.dupObject.status); break;
+    case NV04_DUP_OBJECT:     if (o->params.dupObject.status) kprintf("NVKMS-rm: DUP_OBJECT src client 0x%x obj 0x%x -> status 0x%x\n", o->params.dupObject.hClientSrc, o->params.dupObject.hObjectSrc, o->params.dupObject.status); break;
     case NV04_MAP_MEMORY_DMA: if (o->params.mapMemoryDma.status) kprintf("NVKMS-rm: MAP_MEMORY_DMA -> status 0x%x\n", o->params.mapMemoryDma.status); break;
     case NV04_MAP_MEMORY:     if (o->params.mapMemory.status) kprintf("NVKMS-rm: MAP_MEMORY -> status 0x%x\n", o->params.mapMemory.status); break;
     case NV01_FREE:           if (o->params.free.status) kprintf("NVKMS-rm: FREE obj 0x%x -> status 0x%x\n", o->params.free.hObjectOld, o->params.free.status); break;
-    case NV04_ALLOC_CONTEXT_DMA: kprintf("NVKMS-rm: ALLOC_CONTEXT_DMA class 0x%x flags 0x%x mem 0x%x limit 0x%llx -> status 0x%x\n", o->params.allocContextDma2.hClass, o->params.allocContextDma2.flags, o->params.allocContextDma2.hMemory, (unsigned long long)o->params.allocContextDma2.limit, o->params.allocContextDma2.status); break;
-    case NV04_BIND_CONTEXT_DMA:  kprintf("NVKMS-rm: BIND_CONTEXT_DMA chan 0x%x dma 0x%x -> status 0x%x\n", o->params.bindContextDma.hChannel, o->params.bindContextDma.hCtxDma, o->params.bindContextDma.status); break;
+    case NV04_ALLOC_CONTEXT_DMA: if (o->params.allocContextDma2.status) kprintf("NVKMS-rm: ALLOC_CONTEXT_DMA class 0x%x flags 0x%x mem 0x%x limit 0x%llx -> status 0x%x\n", o->params.allocContextDma2.hClass, o->params.allocContextDma2.flags, o->params.allocContextDma2.hMemory, (unsigned long long)o->params.allocContextDma2.limit, o->params.allocContextDma2.status); break;
+    case NV04_BIND_CONTEXT_DMA:  if (o->params.bindContextDma.status) kprintf("NVKMS-rm: BIND_CONTEXT_DMA chan 0x%x dma 0x%x -> status 0x%x\n", o->params.bindContextDma.hChannel, o->params.bindContextDma.hCtxDma, o->params.bindContextDma.status); break;
     case NV04_VID_HEAP_CONTROL: if (o->params.pVidHeapControl && o->params.pVidHeapControl->status) kprintf("NVKMS-rm: VID_HEAP_CONTROL fn %u -> status 0x%x\n", o->params.pVidHeapControl->function, o->params.pVidHeapControl->status); break;
     default: break;
     }
@@ -192,14 +300,19 @@ size_t nvkms_strlen(const char *s) { return strlen(s); }
 int    nvkms_strcmp(const char *s1, const char *s2) { return strcmp(s1, s2); }
 void   nvkms_usleep(NvU64 usec) { if (usec < 1000) IODelay((unsigned)usec); else IOSleep((unsigned)((usec + 999) / 1000)); }
 NvU64  nvkms_get_usec(void) { uint64_t ns; absolutetime_to_nanoseconds(mach_absolute_time(), &ns); return ns / 1000; }
+// These copy between the kernel and the calling process only, like NVIDIA's own copy_from_user/copy_to_user versions.
+// Was: an address with the top bit set was treated as a kernel pointer and copied with memcpy, so any value a caller
+// placed in an NVKMS request became an arbitrary kernel read or write. NVKMS calls these only from its user-space
+// client hooks (prepUser/doneUser and the clientType == USER_SPACE branches); kernel clients use nvkms_memcpy, so
+// nothing legitimate ever passes a kernel address here.
 int nvkms_copyin(void *kptr, NvU64 uaddr, size_t n)
 {
-    if (uaddr >> 63) { nvu_memcpy(kptr, (const void *)(uintptr_t)uaddr, n); return 0; }
+    if (uaddr >> 63) return -14;
     return copyin((user_addr_t)uaddr, kptr, n) ? -14 : 0;
 }
 int nvkms_copyout(NvU64 uaddr, const void *kptr, size_t n)
 {
-    if (uaddr >> 63) { nvu_memcpy((void *)(uintptr_t)uaddr, kptr, n); return 0; }
+    if (uaddr >> 63) return -14;
     return copyout(kptr, (user_addr_t)uaddr, n) ? -14 : 0;
 }
 void nvkms_yield(void) { IOSleep(1); }
@@ -245,9 +358,13 @@ static void kms_timer_execute(struct nvkms_timer_t *t)
 {
     void *dataPtr;
     IOLockLock(gKmsLock);
+    // As nvkms_kthread_q_callback: hold timers (DP IRQs, hot-plug) until the resume. On a GPU that never came back
+    // the callback is skipped but the timer completes as usual: NVKMS still owns a plain timer's handle and frees it
+    // with nvkms_free_timer(), so it must not be treated as cancelled (and freed) here.
+    const bool gpuUp = kms_pm_wait_locked(false, 0);
     if (t->isRefPtr) { dataPtr = nvkms_dec_ref((struct nvkms_ref_ptr *)t->dataPtr); if (!dataPtr) t->cancel = NV_TRUE; }
     else dataPtr = t->dataPtr;
-    if (!t->cancel) { t->proc(dataPtr, t->dataU32); t->complete = NV_TRUE; }
+    if (!t->cancel) { if (gpuUp) t->proc(dataPtr, t->dataU32); t->complete = NV_TRUE; }
     NvBool freeIt = t->isRefPtr || t->cancel;
     IOLockUnlock(gKmsLock);
     if (freeIt) kms_timer_release(t);
@@ -344,8 +461,39 @@ NvU32 nvkms_enumerate_gpus(nv_gpu_info_t *gpu_info)
 NvBool nvkms_open_gpu(NvU32 gpuId, NvBool) { nv_state_t *nv = nv_xnu_gpu_state(); return nv && nv->gpu_id == gpuId; }
 void nvkms_close_gpu(NvU32, NvBool) {}
 
-struct nvkms_backlight_device *nvkms_register_backlight(NvU32, NvU32, void *, NvU32) { return NULL; }
-void nvkms_unregister_backlight(struct nvkms_backlight_device *) {}
+// NVKMS reports a backlight-capable internal panel here (nvRmRegisterBacklight); nvidia-modeset-linux.c
+// turns it into a Linux backlight device. Kept so NVRMFB can set the panel's brightness through
+// NVRM::callPlatformFunction("NVRMBacklight") -> nvkms_xnu_backlight().
+struct nvkms_backlight_device { NvU32 gpu_id, display_id; void *drv_priv; };
+static struct nvkms_backlight_device gKmsBacklight;
+static NvBool gKmsBacklightRegistered;
+struct nvkms_backlight_device *nvkms_register_backlight(NvU32 gpu_id, NvU32 display_id, void *drv_priv, NvU32 current_brightness)
+{
+    if (gKmsBacklightRegistered || !drv_priv) return NULL;
+    gKmsBacklight = { gpu_id, display_id, drv_priv };
+    gKmsBacklightRegistered = NV_TRUE;
+    kprintf("NVRM-xnu: backlight registered: gpu 0x%x display 0x%x at %u%%\n", gpu_id, display_id, current_brightness);
+    return &gKmsBacklight;
+}
+void nvkms_unregister_backlight(struct nvkms_backlight_device *bd)
+{
+    if (bd != &gKmsBacklight) return;
+    gKmsBacklightRegistered = NV_FALSE;
+    kprintf("NVRM-xnu: backlight unregistered\n");
+}
+// Panel brightness in percent (0-100), read or set under the NVKMS lock like nvkms_get_backlight_brightness()
+// and nvkms_update_backlight_status() in nvidia-modeset-linux.c. Not for callers that hold gKmsLock.
+NvBool nvkms_xnu_backlight(NvBool set, NvU32 *percent)
+{
+    if (!percent || !gKmsLock) return NV_FALSE;
+    if (set && *percent > 100) *percent = 100;   // NVKMS takes percent; never pass more than full brightness
+    IOLockLock(gKmsLock);
+    NvBool ok = gKmsBacklightRegistered && kms_pm_wait_locked(true, 0) &&
+                (set ? nvKmsSetBacklight(gKmsBacklight.display_id, gKmsBacklight.drv_priv, *percent)
+                     : nvKmsGetBacklight(gKmsBacklight.display_id, gKmsBacklight.drv_priv, percent));
+    IOLockUnlock(gKmsLock);
+    return ok;
+}
 
 struct nvkms_per_open *nvkms_open_from_kapi(struct NvKmsKapiDevice *device) { return kms_open_common(NVKMS_CLIENT_KERNEL_SPACE, device, 0); }
 void nvkms_close_from_kapi(struct nvkms_per_open *popen) { kms_close_common(popen); }
@@ -355,7 +503,7 @@ NvBool nvkms_ioctl_from_kapi(struct nvkms_per_open *popen, NvU32 cmd, void *para
 }
 NvBool nvkms_ioctl_from_kapi_try_pmlock(struct nvkms_per_open *popen, NvU32 cmd, void *params, const size_t size)
 {
-    return kms_ioctl_common(popen, cmd, (NvU64)(uintptr_t)params, size);
+    return kms_ioctl_common(popen, cmd, (NvU64)(uintptr_t)params, size, true);
 }
 
 nvkms_sema_handle_t *nvkms_sema_alloc(void)

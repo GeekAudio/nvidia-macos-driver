@@ -5,7 +5,12 @@
  */
 
 #import <Foundation/Foundation.h>
+#import <IOKit/IOKitLib.h>   // the decode service finds the GPU in the I/O registry (#175)
 #import <Metal/Metal.h>
+#import <MetalFX/MetalFX.h>
+#ifdef I
+#undef I
+#endif
 #import <objc/runtime.h>
 #import <objc/message.h>
 #import <mach/mach.h>
@@ -21,7 +26,22 @@
 #include <time.h>
 #include "nvmtl_sample_positions.h"
 #include "nvmtl_log_failure.h"
+#include "nvmtl_env_knobs.h"
+#include "nvmtl_app_profile.h"
+#import "nvmtl_osver_install.h"
+#include "nvmtl_claims.h"
+// The application profile matched for this process (nvmtl_app_profile.h), or NULL. Set once by nvmtl_conf_settle
+// (NVMTLObjects.m), which reads nvrm610.conf and applies the profile before any knob is read.
+static const nvmtl_app_profile *g_app_profile;
+static void nvmtl_conf_settle(void);
+// Set by the last compute pipeline creation on this thread: 1 when the profile's kernel edit was applied to its module.
+static __thread int g_app_edit_last;
+// Marks a pipeline state whose module carried the kernel edit, so a variant later built for it can say what it did.
+static char g_app_edit_ps_key;
+#include <CommonCrypto/CommonDigest.h>
 #include <sys/sysctl.h>
+#import <libproc.h>
+#import <mach-o/dyld.h>
 #ifndef NVMTL_RELEASE
 #define NVMTL_RELEASE 0
 #endif
@@ -31,10 +51,18 @@ static inline int nvmtl_rel_devpath(const char *p) {
 }
 static inline int nvmtl_rel_access(const char *p, int m) { return nvmtl_rel_devpath(p) ? -1 : access(p, m); }
 static inline FILE *nvmtl_rel_fopen(const char *p, const char *m) { return nvmtl_rel_devpath(p) ? NULL : fopen(p, m); }
-#define access nvmtl_rel_access
-#define fopen nvmtl_rel_fopen
+// Function-like on purpose: an object-like `#define access` also renamed every Objective-C `-access` method in this
+// one-TU plugin, so release builds answered -[MTLBinding access] with nothing (selector nvmtl_rel_access in the
+// shipped binary). Apple's OpenCL then read every image as read-only and refused write-only images (-38).
+#define access(p, m) nvmtl_rel_access(p, m)
+#define fopen(p, m) nvmtl_rel_fopen(p, m)
 #endif
 int nvmtl_vk_init(void);
+static uint32_t nvmtl_gl_uniform_index(id function);
+static void nvmtl_gl_uniform_inherit(id function, id source);
+void nvmtl_gl_caps_enable(void);
+uint16_t nvmtl_vk_set_accelerator(mach_port_t accelerator);
+uint16_t nvmtl_vk_vendor(void);
 const char *nvmtl_vk_device_name(void);
 void nvmtl_vk_counts(uint64_t *bm, uint64_t *bg, uint64_t *im, uint64_t *ig, size_t *bytes);
 void nvmtl_vk_cmd_counts(uint64_t *begun, uint64_t *submitted, uint64_t *abandoned);
@@ -75,7 +103,8 @@ static int nvlog_dropped(const char *fmt, uint64_t *rep) {
 }
 const char *nvmtl_log_path(void) {
 #if NVMTL_RELEASE
-    return "/private/tmp/nvmtl-off.log";
+    // A release plugin writes no log unless this process opted into its own knobs (NVMTL_PROCESS_ENV=1).
+    if (!nvmtl_process_env_on()) return "/private/tmp/nvmtl-off.log";
 #endif
     // A diagnostic probe needs its own file even when the system log is writable.
     // Otherwise the per-run fault watcher reads an empty file and misses GPU faults.
@@ -90,18 +119,29 @@ const char *nvmtl_log_path(void) {
     }
     return path;
 }
+static void nvlog_line(const char *t);
 void nvlog(const char *fmt, ...) {
     uint64_t rep; if (nvlog_dropped(fmt, &rep)) return;
     char b[512]; va_list a; va_start(a, fmt); vsnprintf(b, sizeof b, fmt, a); va_end(a);
     char t[640];
     if (rep) snprintf(t, sizeof t, "%s   [logged %llu times now]", b, (unsigned long long)rep);
     else     snprintf(t, sizeof t, "%s", b);
+    nvlog_line(t);
+}
+// A periodic census line: the same format every window, so the repeat limiter above would drop it after a few windows
+// (a run's gameplay windows were lost that way). It goes to the log every time; the caller keeps its own period.
+void nvlog_every(const char *fmt, ...) {
+    char t[640]; va_list a; va_start(a, fmt); vsnprintf(t, sizeof t, fmt, a); va_end(a);
+    nvlog_line(t);
+}
+static void nvlog_line(const char *t) {
 #if NVMTL_RELEASE
     if (nvmtl_log_failure(t)) syslog(LOG_ERR, "NullMoth: %s", t);
+    if (!nvmtl_process_env_on()) return;   // the file below is written only for a process that opted in
 #else
     syslog(LOG_NOTICE, "NVMTL: %s", t);
-    FILE *f = fopen(nvmtl_log_path(), "a"); if (f) { fprintf(f, "pid %d NVMTL: %s\n", getpid(), t); fclose(f); }
 #endif
+    FILE *f = fopen(nvmtl_log_path(), "a"); if (f) { fprintf(f, "pid %d NVMTL: %s\n", getpid(), t); fclose(f); }
 }
 
 #define NVMTL_OOM_STREAK      32
@@ -143,6 +183,10 @@ void nvmtl_vendor_attach_sass(id device, id pipelineState, id function);
 int  nvmtl_vendor_dispatch_sass(id pipelineState, nvk_cmdbuf *c,
                                 const uint32_t threads[3], const uint32_t tg[3]);
 id   nvmtl_vendor_apple_pipeline(id device, id function);
+id   nvmtl_sass_kernel_for_function(id function);
+id   nvmtl_sass_kernel_for_linked(id function, NSDictionary *mods, NSDictionary *fc);
+BOOL nvmtl_sass_tables_wanted(void);
+int  nvmtl_sass_dispatch(id encoder, MTLSize grid, MTLSize group, uint32_t kind, BOOL hasFallback);
 NSDictionary<NSString *, NSData *> *nvmtl_translate_metallib(NSData *lib, NSDictionary **stages, NSDictionary **airs);
 void nvmtl_vendor_compile_airs(NSDictionary<NSString *, NSString *> *airs,
                                NSDictionary<NSString *, NSString *> *stages);
@@ -171,6 +215,107 @@ static bool nvmtl_accel_armed(void)
 }
 #include <dlfcn.h>
 #include <libgen.h>
+// The video libraries tile and untile frames in the Blackwell (GB20x) layout. Earlier GPUs' NVDEC/NVENC use the classic
+// one: on an RTX 3070 Laptop (issue #65, measured against Apple's software codecs) H.264 decode showed shifted macroblock
+// rows and a green stripe, and both encoders produced torn pictures. The decoder's only difference is its untiling mode
+// (1 = Blackwell, 0 = classic), so earlier GPUs load libnvdec_h264_t2d.dylib, the same library with mode 0 (51 dB on
+// GA104). The encoders are not registered on them, so apps use Apple's encoder until they are fixed for those GPUs.
+// Set from the I/O registry where no Metal device (and so no Vulkan device name) exists: -1 = unknown, use the name.
+static int g_video_blackwell = -1;
+// One string from the per-generation profile NVRM publishes on the GPU's PCI device ("nvrm-gpu-profile": chip,
+// generation, engine classes, scan-out model, video layout). False when the driver is older than the profile or the key
+// is missing; callers then keep their previous rule.
+static bool nvmtl_gpu_profile_string(CFStringRef key, char *out, size_t n)
+{
+    bool ok = false;
+    io_iterator_t it = IO_OBJECT_NULL;
+    if (IOServiceGetMatchingServices(kIOMainPortDefault, IOServiceMatching("IOPCIDevice"), &it) != KERN_SUCCESS) return false;
+    for (io_object_t o; !ok && (o = IOIteratorNext(it)); IOObjectRelease(o)) {
+        CFTypeRef d = IORegistryEntryCreateCFProperty(o, CFSTR("nvrm-gpu-profile"), kCFAllocatorDefault, 0);
+        if (!d) continue;
+        if (CFGetTypeID(d) == CFDictionaryGetTypeID()) {
+            CFTypeRef v = CFDictionaryGetValue((CFDictionaryRef)d, key);
+            if (v && CFGetTypeID(v) == CFStringGetTypeID()) ok = CFStringGetCString((CFStringRef)v, out, (CFIndex)n, kCFStringEncodingUTF8);
+        }
+        CFRelease(d);
+    }
+    IOObjectRelease(it);
+    return ok;
+}
+// True when the generation the driver published is this one, whatever family follows it. The TU11x cards publish
+// "Turing GTX 16" where the TU10x ones publish plain "Turing", so an exact compare left every GTX 16 card without a
+// hardware encoder. Both GTX 16 chips encode on the Turing libraries: measured on a GTX 1650 (TU117), H.264 and HEVC
+// 5 of 5 frames with no errors, although its profile lists no encoder class (the library allocates the class itself).
+static bool nvmtl_gen_is(const char *gen, const char *name)
+{
+    size_t n = strlen(name);
+    return !strncmp(gen, name, n) && (gen[n] == '\0' || gen[n] == ' ');
+}
+static bool nvmtl_video_is_blackwell(void)
+{
+    if (g_video_blackwell >= 0) return g_video_blackwell == 1;
+    char layout[32];
+    if (nvmtl_gpu_profile_string(CFSTR("video-layout"), layout, sizeof layout)) {
+        g_video_blackwell = !strcmp(layout, "blackwell");
+        return g_video_blackwell == 1;
+    }
+    return strstr(nvmtl_vk_device_name(), "NVK GB") != NULL;
+}
+// The H.264 encoder library built for this card's generation, or NULL when we ship none for it (then the app keeps
+// Apple's encoder, which is what every non-Blackwell card got before these libraries existed).
+// The setup a card's NVENC expects differs per generation: Turing and Ampere write the same picture setup apart from
+// the class byte, and Blackwell differs in the plane offsets, the input layout and the padding. Each library is
+// checked byte-for-byte against NVIDIA's own output on that generation before it ships.
+// The HEVC encoder library for this card's generation. Turing and Ampere write the same HEVC setup apart from the
+// class byte, checked byte-for-byte against NVIDIA's own output on each; Blackwell differs in the layout as it does
+// for H.264.
+static const char *nvmtl_nvenc_hevc_library_for_this_gpu(void)
+{
+    char gen[32];
+    if (!nvmtl_gpu_profile_string(CFSTR("generation"), gen, sizeof gen))
+        return nvmtl_video_is_blackwell() ? "libnvenc_hevc.dylib" : NULL;
+    if (nvmtl_gen_is(gen, "Blackwell")) return "libnvenc_hevc.dylib";
+    if (nvmtl_gen_is(gen, "Ampere")) return "libnvenc_hevc_ga10x.dylib";
+    if (nvmtl_gen_is(gen, "Turing")) return "libnvenc_hevc_tu10x.dylib";
+    return NULL;
+}
+static const char *nvmtl_nvenc_library_for_this_gpu(void)
+{
+    char gen[32];
+    if (!nvmtl_gpu_profile_string(CFSTR("generation"), gen, sizeof gen)) {
+        // No profile: fall back to the name test, which only recognises Blackwell.
+        return nvmtl_video_is_blackwell() ? "libnvenc_h264.dylib" : NULL;
+    }
+    if (nvmtl_gen_is(gen, "Blackwell")) return "libnvenc_h264.dylib";
+    if (nvmtl_gen_is(gen, "Ampere")) return "libnvenc_h264_ga10x.dylib";
+    if (nvmtl_gen_is(gen, "Turing")) return "libnvenc_h264_tu10x.dylib";
+    return NULL;
+}
+static bool nvmtl_is_sandboxed(void)
+{
+    typedef int (*sandbox_check_fn)(pid_t, const char *, int, ...);
+    static sandbox_check_fn sbc = NULL;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        sbc = (sandbox_check_fn)dlsym(RTLD_DEFAULT, "sandbox_check");
+    });
+    return sbc ? (sbc(getpid(), NULL, 0) != 0) : false;
+}
+static bool nvmtl_is_decode_service(const char *me)
+{
+    return me && strncmp(me, "VTDecoderXPCService", 19) == 0;
+}
+// Apple's sandboxed apps (Safari's WebKit GPU process, QuickTime Player, Preview) hand decoding to VTDecoderXPCService,
+// where the decoder is registered; inside them the in-process registration fails on the sandbox (#349). Chromium and
+// Electron decode in their own GPU process and ask VideoToolbox for a hardware decoder there, so skipping it left
+// Discord with no H.264 decoder at all and its videos stopped playing on 2.5.4. Only Apple's own processes delegate.
+static bool nvmtl_decode_is_delegated(const char *me)
+{
+    if (!nvmtl_is_sandboxed() || nvmtl_is_decode_service(me)) return false;
+    CFBundleRef main = CFBundleGetMainBundle();
+    CFStringRef ident = main ? CFBundleGetIdentifier(main) : NULL;
+    return ident && CFStringHasPrefix(ident, CFSTR("com.apple."));
+}
 static void nvmtl_nvdec_register(void)
 {
     static dispatch_once_t once;
@@ -178,6 +323,10 @@ static void nvmtl_nvdec_register(void)
         const char *me = getprogname();
         if (getenv("NVMTL_NO_NVDEC")) { nvlog("nvdec: NVMTL_NO_NVDEC set - not registering in %s", me); return; }
         if (!strcmp(me, "WindowServer")) return;
+        if (nvmtl_decode_is_delegated(me)) {
+            nvlog("nvdec: %s is a sandboxed Apple process - not registering in-process H.264 decoder (delegates to VTDecoderXPCService)", me);
+            return;
+        }
         typedef int32_t (*RegFn)(uint32_t, CFDictionaryRef, void *);
         RegFn reg = (RegFn)dlsym(RTLD_DEFAULT, "VTRegisterVideoDecoderWithInfo");
         if (!reg) { nvlog("nvdec: VideoToolbox is not loaded in %s - not registering", me); return; }
@@ -185,7 +334,7 @@ static void nvmtl_nvdec_register(void)
         if (!dladdr((const void *)nvmtl_nvdec_register, &di) || !di.dli_fname) { nvlog("nvdec: dladdr failed - not registering"); return; }
         char dir[1024], path[1200];
         strlcpy(dir, di.dli_fname, sizeof dir);
-        snprintf(path, sizeof path, "%s/libnvdec_h264.dylib", dirname(dir));
+        snprintf(path, sizeof path, "%s/%s", dirname(dir), nvmtl_video_is_blackwell() ? "libnvdec_h264.dylib" : "libnvdec_h264_t2d.dylib");
         void *h = dlopen(path, RTLD_NOW | RTLD_LOCAL);
         if (!h) { nvlog("nvdec: dlopen %s FAILED: %s", path, dlerror()); return; }
         void *fac = dlsym(h, "NVDecH264_CreateInstance");
@@ -203,6 +352,8 @@ static void nvmtl_nvenc_register(void)
     dispatch_once(&once, ^{
         const char *me = getprogname();
         if (getenv("NVMTL_NO_NVENC")) { nvlog("nvenc: NVMTL_NO_NVENC set - not registering in %s", me); return; }
+        const char *lib = nvmtl_nvenc_library_for_this_gpu();
+        if (!lib) { nvlog("nvenc: no encoder library for %s - H.264 encode stays on Apple's encoder", nvmtl_vk_device_name()); return; }
         if (!strcmp(me, "WindowServer")) return;
         typedef int32_t (*RegFn)(uint32_t, CFDictionaryRef, void *);
         RegFn reg = (RegFn)dlsym(RTLD_DEFAULT, "VTRegisterVideoEncoderWithInfo");
@@ -211,7 +362,7 @@ static void nvmtl_nvenc_register(void)
         if (!dladdr((const void *)nvmtl_nvenc_register, &di) || !di.dli_fname) { nvlog("nvenc: dladdr failed - not registering"); return; }
         char dir[1024], path[1200];
         strlcpy(dir, di.dli_fname, sizeof dir);
-        snprintf(path, sizeof path, "%s/libnvenc_h264.dylib", dirname(dir));
+        snprintf(path, sizeof path, "%s/%s", dirname(dir), lib);
         void *h = dlopen(path, RTLD_NOW | RTLD_LOCAL);
         if (!h) { nvlog("nvenc: dlopen %s FAILED: %s", path, dlerror()); return; }
         void *fac = dlsym(h, "NVEncH264_CreateInstance");
@@ -224,6 +375,63 @@ static void nvmtl_nvenc_register(void)
               st ? "NOT registered" : "REGISTERED", me, (int)st, path);
     });
 }
+// An encoder built outside this driver can register itself beside ours and let VTRating decide which
+// one an app gets, so both can be installed and compared. The one this was written for reports H.264
+// at about 5 ms where the library we ship takes about 12, and it runs on Turing, Ampere and Ada,
+// which nvmtl_nvenc_register above turns away for not being Blackwell.
+// Off unless NVMTL_NVENCVT names this process (or is 1), from nvrm610.conf or the environment.
+// This loads code into every app that encodes, so the library and the directory holding it must be
+// ours and nobody else's. The firmware taught this: it used to sit in /Users/Shared, which is mode
+// 1777, and the only permission step was a chmod that adds read bits and never takes write away, so
+// a directory left there by any user was adopted as-is. A path anyone can write is not a path you can
+// trust. lstat, not stat: a symlink must not be followed into something else.
+static bool nvmtl_loadable_root_only(const char *path)
+{
+    struct stat st;
+    if (lstat(path, &st) != 0 || !S_ISREG(st.st_mode)) return false;
+    if (st.st_uid != 0 || (st.st_mode & (S_IWGRP | S_IWOTH))) return false;
+    char dir[1024]; strlcpy(dir, path, sizeof dir);
+    char *d = dirname(dir);
+    struct stat ds;                                  // a writable directory lets the file be swapped
+    if (!d || lstat(d, &ds) != 0 || !S_ISDIR(ds.st_mode)) return false;
+    return ds.st_uid == 0 && !(ds.st_mode & (S_IWGRP | S_IWOTH));
+}
+static void nvmtl_nvencvt_register(void)
+{
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        const char *me = getprogname();
+        const char *sel = getenv("NVMTL_NVENCVT");
+        if (!sel || !*sel || !strcmp(sel, "0")) return;
+        if (strcmp(sel, "1")) {                      // a process list, so one app can be moved over at a time
+            char list[512]; strlcpy(list, sel, sizeof list);
+            bool named = false;
+            for (char *t = strtok(list, ", :"); t && !named; t = strtok(NULL, ", :")) named = !strcmp(t, me);
+            if (!named) return;
+        }
+        if (!strcmp(me, "WindowServer")) return;     // the codec registrars all stay out of it
+        Dl_info di;
+        if (!dladdr((const void *)nvmtl_nvencvt_register, &di) || !di.dli_fname) { nvlog("nvencvt: dladdr failed - not registering"); return; }
+        char dir[1024], path[1200];
+        strlcpy(dir, di.dli_fname, sizeof dir);
+        snprintf(path, sizeof path, "%s/libnvencvt.dylib", dirname(dir));
+        if (!nvmtl_loadable_root_only(path)) {
+            nvlog("nvencvt: %s is absent, or is not a root-owned file inside a root-owned directory - REFUSED", path);
+            return;
+        }
+        void *h = dlopen(path, RTLD_NOW | RTLD_LOCAL);
+        if (!h) { nvlog("nvencvt: dlopen %s FAILED: %s", path, dlerror()); return; }
+        typedef int32_t (*RegFn)(int);
+        RegFn r = (RegFn)dlsym(h, "NVEncVT_Register");
+        if (!r) { nvlog("nvencvt: %s has no NVEncVT_Register", path); return; }
+        int rating = 1100;                           // above our own 1000, so the opt-in one wins where it is asked for
+        const char *rv = getenv("NVMTL_NVENCVT_RATING");
+        if (rv) { int v = atoi(rv); if (v > 0) rating = v; }
+        int32_t st = r(rating);
+        nvlog("nvencvt: external encoder %s in %s (NVEncVT_Register -> %d, rating %d, %s)",
+              st ? "NOT registered" : "REGISTERED", me, (int)st, rating, path);
+    });
+}
 static void nvmtl_nvdec_hevc_register(void)
 {
     static dispatch_once_t once;
@@ -231,6 +439,10 @@ static void nvmtl_nvdec_hevc_register(void)
         const char *me = getprogname();
         if (getenv("NVMTL_NO_NVDEC_HEVC")) { nvlog("nvdec: NVMTL_NO_NVDEC_HEVC set - not registering HEVC in %s", me); return; }
         if (!strcmp(me, "WindowServer")) return;
+        if (nvmtl_decode_is_delegated(me)) {
+            nvlog("nvdec: %s is a sandboxed Apple process - not registering in-process HEVC decoder (delegates to VTDecoderXPCService)", me);
+            return;
+        }
         typedef int32_t (*RegFn)(uint32_t, CFDictionaryRef, void *);
         RegFn reg = (RegFn)dlsym(RTLD_DEFAULT, "VTRegisterVideoDecoderWithInfo");
         if (!reg) { nvlog("nvdec: VideoToolbox is not loaded in %s - not registering HEVC", me); return; }
@@ -250,12 +462,53 @@ static void nvmtl_nvdec_hevc_register(void)
               st ? "NOT registered" : "REGISTERED", me, (int)st, path);
     });
 }
+// GH #175: with Chrome's GPU sandbox on, decoding runs in VTDecoderXPCService. Metal maps this bundle there (the
+// process holds the bundle's mappings but never creates a Metal device), but the decoders were registered only when a Metal
+// device came up, so that process never had them and H.264 fell to AppleH264SW. The decoder libraries open NVRM
+// themselves (IOKit; nothing from the Vulkan device), as NVIDIA's own decoder is a per-process capability needing no
+// render device. So in that one process register them at load, telling Blackwell apart by the GPU's PCI device id
+// instead of the Vulkan device name.
+static void nvmtl_nvdec_hevc_register(void);
+__attribute__((constructor)) static void nvmtl_nvdec_in_decode_service(void)
+{
+    const char *me = getprogname();
+    if (!nvmtl_is_decode_service(me) || getenv("NVMTL_NO_NVDEC")) return;
+    // off the loader's thread: the registration dlopens the decoder library
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+        uint32_t dev = 0;
+        io_iterator_t it = IO_OBJECT_NULL;
+        if (IOServiceGetMatchingServices(kIOMainPortDefault, IOServiceMatching("IOPCIDevice"), &it) == KERN_SUCCESS) {
+            for (io_object_t o; !dev && (o = IOIteratorNext(it)); IOObjectRelease(o)) {
+                CFDataRef v = IORegistryEntryCreateCFProperty(o, CFSTR("vendor-id"), kCFAllocatorDefault, 0);
+                CFDataRef c = IORegistryEntryCreateCFProperty(o, CFSTR("class-code"), kCFAllocatorDefault, 0);
+                CFDataRef d = IORegistryEntryCreateCFProperty(o, CFSTR("device-id"), kCFAllocatorDefault, 0);
+                uint32_t vv = 0, cc = 0, dd = 0;
+                if (v && CFDataGetLength(v) >= 4) CFDataGetBytes(v, CFRangeMake(0, 4), (UInt8 *)&vv);
+                if (c && CFDataGetLength(c) >= 4) CFDataGetBytes(c, CFRangeMake(0, 4), (UInt8 *)&cc);
+                if (d && CFDataGetLength(d) >= 4) CFDataGetBytes(d, CFRangeMake(0, 4), (UInt8 *)&dd);
+                if ((vv & 0xffff) == 0x10de && (cc >> 16) == 0x03) dev = dd & 0xffff;
+                if (v) CFRelease(v); if (c) CFRelease(c); if (d) CFRelease(d);
+            }
+            IOObjectRelease(it);
+        }
+        if (!dev) { nvlog("nvdec: no NVIDIA GPU in the I/O registry - not registering in %s", me); return; }
+        char layout[32];
+        if (nvmtl_gpu_profile_string(CFSTR("video-layout"), layout, sizeof layout)) g_video_blackwell = !strcmp(layout, "blackwell");
+        else g_video_blackwell = dev >= 0x2b00 && dev < 0x3000;   // no profile (older NVRM): the GB20x device-id block
+        nvlog("nvdec: decode service, GPU 10de:%04x (%s): registering the decoders at load", dev,
+              g_video_blackwell ? "Blackwell" : "before Blackwell");
+        nvmtl_nvdec_register();
+        nvmtl_nvdec_hevc_register();
+    });
+}
 static void nvmtl_nvenc_hevc_register(void)
 {
     static dispatch_once_t once;
     dispatch_once(&once, ^{
         const char *me = getprogname();
         if (getenv("NVMTL_NO_NVENC_HEVC")) { nvlog("nvenc: NVMTL_NO_NVENC_HEVC set - not registering HEVC in %s", me); return; }
+        const char *lib = nvmtl_nvenc_hevc_library_for_this_gpu();
+        if (!lib) { nvlog("nvenc: no HEVC encoder library for %s - HEVC encode stays on Apple's encoder", nvmtl_vk_device_name()); return; }
         if (!strcmp(me, "WindowServer")) return;
         typedef int32_t (*RegFn)(uint32_t, CFDictionaryRef, void *);
         RegFn reg = (RegFn)dlsym(RTLD_DEFAULT, "VTRegisterVideoEncoderWithInfo");
@@ -264,7 +517,7 @@ static void nvmtl_nvenc_hevc_register(void)
         if (!dladdr((const void *)nvmtl_nvenc_hevc_register, &di) || !di.dli_fname) { nvlog("nvenc: dladdr failed - not registering HEVC"); return; }
         char dir[1024], path[1200];
         strlcpy(dir, di.dli_fname, sizeof dir);
-        snprintf(path, sizeof path, "%s/libnvenc_hevc.dylib", dirname(dir));
+        snprintf(path, sizeof path, "%s/%s", dirname(dir), lib);
         void *h = dlopen(path, RTLD_NOW | RTLD_LOCAL);
         if (!h) { nvlog("nvenc: dlopen %s FAILED: %s", path, dlerror()); return; }
         void *fac = dlsym(h, "NVEncHEVC_CreateInstance");
@@ -277,15 +530,101 @@ static void nvmtl_nvenc_hevc_register(void)
               st ? "NOT registered" : "REGISTERED", me, (int)st, path);
     });
 }
+// ANGLE refuses Metal on NVIDIA (disableMetalOnNvidia), and Chromium on macOS has no other GL backend, so without this
+// the GPU process exits at start-up and the app draws everything on the CPU. Chrome, Chromium, Brave, Edge and Discord
+// get it by default: without it their GPU process cannot start. Electron stays opt-in (NVMTL_ANGLE_METAL=1) because it showed artifacts,
+// stutter and lost transparency on several cards. NVMTL_ANGLE_METAL=0 turns the rule off in every process. An existing
+// ANGLE override is kept; no sandbox setting is changed.
+// Matched three ways: by process name, by the frameworks in the app bundle, and by ANGLE's own libraries
+// (libGLESv2.dylib, libEGL.dylib) already loaded in the process. The loaded-library check covers Chromium-based apps
+// whose names and bundles the first two miss (Vivaldi, Opera, Arc and other CEF hosts). It is an addition, not a
+// replacement: a process that creates its Metal device before ANGLE is loaded is still matched by the first two.
+static bool nvmtl_angle_chrome_family(void)
+{
+    const char *me = getprogname();
+    if (!me) return false;
+
+    // 1. By process name. "Helper" and "Edge" alone also match unrelated apps (every app's own helper tools,
+    // "EdgeView"), so Edge is matched by its full name and helpers through the framework check below.
+    if (strstr(me, "Chrome") != NULL ||
+        strstr(me, "Chromium") != NULL ||
+        strstr(me, "Electron") != NULL ||
+        strstr(me, "Brave") != NULL ||
+        strncmp(me, "Microsoft Edge", 14) == 0 ||
+        strstr(me, "Discord") != NULL) {
+        return true;
+    }
+
+    // 2. By the frameworks the app bundle ships.
+    char path[PATH_MAX];
+    if (proc_pidpath(getpid(), path, sizeof(path)) > 0) {
+        char app_path[PATH_MAX];
+        strlcpy(app_path, path, sizeof(app_path));
+
+        char *p = strstr(app_path, ".app");
+        if (p != NULL) {
+            *(p + 4) = '\0'; // Truncate to the root directory of .app
+
+            char check_buf[PATH_MAX];
+
+            snprintf(check_buf, sizeof(check_buf), "%s/Contents/Frameworks/libEGL.dylib", app_path);
+            if (access(check_buf, F_OK) == 0) return true;
+
+            snprintf(check_buf, sizeof(check_buf), "%s/Contents/Frameworks/Chromium Embedded Framework.framework", app_path);
+            if (access(check_buf, F_OK) == 0) return true;
+
+            snprintf(check_buf, sizeof(check_buf), "%s/Contents/Frameworks/Electron Framework.framework", app_path);
+            if (access(check_buf, F_OK) == 0) return true;
+
+            snprintf(check_buf, sizeof(check_buf), "%s/Contents/Frameworks/libffmpeg.dylib", app_path);
+            if (access(check_buf, F_OK) == 0) return true;
+        }
+    }
+
+    // 3. By ANGLE's libraries in the process.
+    const uint32_t n = _dyld_image_count();
+    for (uint32_t i = 0; i < n; i++) {
+        const char *img = _dyld_get_image_name(i);
+        if (!img) continue;
+        const char *base = strrchr(img, '/');
+        base = base ? base + 1 : img;
+        if (!strcmp(base, "libGLESv2.dylib") || !strcmp(base, "libEGL.dylib")) return true;
+    }
+    return false;
+}
+__attribute__((constructor)) static void nvmtl_angle_allow_nvidia(void)
+{
+    const char *opt = getenv("NVMTL_ANGLE_METAL");
+    if (opt && !strcmp(opt, "0")) return;
+    const char *me = getprogname();
+    if (!(opt && !strcmp(opt, "1")) && !nvmtl_angle_chrome_family()) return;
+    const char *key = "ANGLE_FEATURE_OVERRIDES_DISABLED", *rule = "disableMetalOnNvidia";
+    const char *cur = getenv(key);
+    if (cur && strstr(cur, rule)) return;
+    // One line per process, outside nvlog's release failure filter: a field report must show whether the rule was
+    // active in this process.
+    syslog(LOG_NOTICE, "NullMoth: angle: Metal allowed in %s (%s; NVMTL_ANGLE_METAL=0 disables)", me ? me : "?",
+           (opt && !strcmp(opt, "1")) ? "NVMTL_ANGLE_METAL=1" : "Chrome family");
+    char v[1024];
+    if (cur && *cur) snprintf(v, sizeof v, "%s:%s", cur, rule); else snprintf(v, sizeof v, "%s", rule);
+    setenv(key, v, 1);
+}
 static bool nvmtl_process_is_allowed(void)
 {
     const char *me = getprogname();
     if (!me) return false;
+    // A headless NVIDIA GPU (the display is on the Intel or AMD GPU) is a Metal device for apps only: WindowServer stays
+    // on the GPU that owns the display, as on Apple's two-GPU Macs. The list below cannot express this: "*" matches
+    // WindowServer before its "!WindowServer" line is reached.
+    { int hv = 0; size_t hn = sizeof hv;
+      if (!strcmp(me, "WindowServer") && (nvmtl_vk_vendor() != 0x10de ||
+                                          (sysctlbyname("debug.nvaccel_headless", &hv, &hn, NULL, 0) == 0 && hv))) {
+          nvlog("  headless GPU: no device for WindowServer (it composites on the GPU that owns the display)"); return false; } }
     if (getenv("NVMTL_ENABLE")) return true;
     if (!strcmp(me, "mtlprobe") || !strcmp(me, "nvmtltest") || !strcmp(me, "nvmtlrender")) return true;
     FILE *f = fopen("/Library/GPUBundles/nvmtl-allow.txt", "r");
     if (!f) f = fopen("/Library/Extensions/nvmtl-allow.txt", "r");
-    if (!f) { nvlog("  no allow-list readable from this process: no device for %s", me); return false; }
+    if (!f) { nvlog("  no allow-list readable from this process: no device for %s (cannot read nvmtl-allow.txt)", me); return false; }
     char line[256]; bool ok = false;
     while (fgets(line, sizeof line, f)) {
         char *nl = strpbrk(line, "\r\n"); if (nl) *nl = 0;
@@ -303,9 +642,44 @@ static bool nvmtl_process_is_allowed(void)
     }
     fclose(f);
     if (ok) nvlog("  allow-listed: %s", me);
+    // a list that was read but grants nothing to this process said so nowhere, so a field log showed only the final
+    // refusal and could not tell an empty or replaced list from a deny rule
+    else nvlog("  no rule in nvmtl-allow.txt matches %s: no device (the list was read; it needs a '*' or '%s' line)", me, me);
     return ok;
 }
 
+#include "nvmtl_dlss.h"
+static BOOL nvmtl_m4_enabled(void);   // NVMTLMetal4.m, later in this translation unit
+static id<MTLCommandBuffer> nvmtl_m4_underlying(id cb);
+void nvmtl_m4_note_buffer(id buf, uint64_t addr, uint64_t length);
+int nvmtl_m4_note_current(_Atomic uint64_t note[3], uint64_t addr, uint64_t length);
+void nvmtl_m4_note_buffer_cached(id buf, uint64_t addr, uint64_t length, _Atomic uint64_t note[3]);
+#include "nvmtl_mfx_native_profile.inc"
+
+// NVMTL_WS_RT_GATE_MB=<n>: while ray tracing is available, the working-set answer is raised to at least n MB. Measured in the
+// disassembly of Cyberpunk 2077's device set-up (0x104978280..0x104978540 in the arm64 slice): it asks
+// recommendedMaxWorkingSetSize FIRST and keeps the value, then asks supportsRaytracing and the device name, and enables
+// ray tracing only if the saved figure is above 0x1800FFFFF bytes (6145 MB). The same figure also sets a low-memory flag
+// (figure below 0x180100000) that the game stores for its own sizing, so this is one number for both decisions.
+// Default 0: off.
+static uint64_t nvmtl_rt_gate_working_set(uint64_t ws)
+{
+    static long long floor_mb = -1;
+    if (floor_mb < 0) { const char *e = getenv("NVMTL_WS_RT_GATE_MB"); floor_mb = (e && *e) ? atoll(e) : 0; }
+    if (floor_mb <= 0 || ws >= ((uint64_t)floor_mb << 20) || !nvmtl_vk_rt_available()) return ws;
+    // The floor is a figure for 8 GB and larger cards. A card with less than 1 GB of memory above it (a 6 GB card) keeps
+    // its own answer: telling the game it may use more than the card holds would let it place ray tracing it cannot fit.
+    uint64_t card = nvmtl_vk_vram_bytes();
+    if (card < ((uint64_t)floor_mb << 20) + (1024ull << 20)) {
+        static int refused;
+        if (!refused++) nvlog("working set: the %lld MB ray tracing floor is not applied on this %llu MB card (it needs %lld MB)",
+                              floor_mb, (unsigned long long)(card >> 20), floor_mb + 1024);
+        return ws;
+    }
+    static int said;
+    if (!said++) nvlog("working set: answered %lld MB instead of %llu MB while ray tracing is available (NVMTL_WS_RT_GATE_MB)", floor_mb, (unsigned long long)(ws >> 20));
+    return (uint64_t)floor_mb << 20;
+}
 @implementation NVMTLDevice
 + (void)load {
     char me[1200], ts[40] = "?"; time_t now = time(NULL); struct tm tm;
@@ -343,8 +717,20 @@ static void nvmtl_install_hw_resource_pools(id dev)
 }
 - (instancetype)initWithAcceleratorPort:(mach_port_t)port {
     nvlog("-[NVMTLDevice initWithAcceleratorPort:%u] in %s", port, getprogname());
+    {   /* the 2.x driver is built for macOS 15 and 26 only: on any later macOS, or when the version cannot be
+           read, it creates no device, before touching the accelerator */
+        char v[32] = {0}; size_t n = sizeof v - 1;
+        int major = sysctlbyname("kern.osproductversion", v, &n, NULL, 0) == 0 ? atoi(v) : 0;
+        if (major < 15 || major > 26) { nvlog("  macOS %s is not supported by this driver: no device", v[0] ? v : "unknown"); return nil; }
+    }
     self = [super initWithAcceleratorPort:port];
     if (!self) { nvlog("  super initWithAcceleratorPort: returned nil"); return nil; }
+    {   /* one GPU per process: the plugin runs a single Vulkan device, so a second Metal device on another vendor's
+           accelerator (a PC with an NVIDIA card and an AMD or Intel GPU) is refused rather than given the wrong GPU */
+        uint16_t mine = nvmtl_vk_set_accelerator(port), live = nvmtl_vk_vendor();
+        if (mine && mine != live) { nvlog("  accelerator vendor %04x, but this process runs Metal on %04x: no second device", mine, live); return nil; }
+        nvlog("  GPU vendor %04x (%s)", live, live == 0x1002 ? "AMD, RADV" : live == 0x8086 ? "Intel, ANV" : "NVIDIA, NVK");
+    }
     if (!nvmtl_process_is_allowed()) { nvlog("  not allow-listed: no device for %s", getprogname()); return nil; }
     nvlog("MTLIOAccelDevice's initWithAcceleratorPort: -> %p", (__bridge void *)self);
     gNVMTLMainDevice = self;
@@ -354,10 +740,14 @@ static void nvmtl_install_hw_resource_pools(id dev)
         nvlog("  NVK did not come up in this process - refusing to be the Metal device for %s", getprogname());
         return nil;
     }
-    nvmtl_nvdec_register();
-    nvmtl_nvenc_register();
-    nvmtl_nvdec_hevc_register();
-    nvmtl_nvenc_hevc_register();
+    nvmtl_gl_caps_enable();
+    if (nvmtl_vk_vendor() == 0x10de) {   /* NVDEC/NVENC are NVIDIA engines reached through NVRM */
+        nvmtl_nvdec_register();
+        nvmtl_nvenc_register();
+        nvmtl_nvdec_hevc_register();
+        nvmtl_nvenc_hevc_register();
+        nvmtl_nvencvt_register();   // last, so an opt-in external encoder registers above ours
+    }
     SEL il = sel_registerName("initLimits");
     if ([self respondsToSelector:il]) {
         ((void (*)(id, SEL))objc_msgSend)(self, il);
@@ -393,8 +783,9 @@ static void nvmtl_install_hw_resource_pools(id dev)
 - (NSString *)vendorName {
     static NSMutableSet *seen; static dispatch_once_t once; dispatch_once(&once, ^{ seen = [NSMutableSet new]; });
     Dl_info i = {0}; const char *who = dladdr(__builtin_return_address(0), &i) && i.dli_fname ? i.dli_fname : "?";
-    @synchronized(seen) { NSString *k = @(who); if (![seen containsObject:k]) { [seen addObject:k]; nvlog("vendorName -> NVIDIA (asked by %s)", who); } }
-    return @"NVIDIA";
+    NSString *v = nvmtl_vk_vendor() == 0x1002 ? @"AMD" : nvmtl_vk_vendor() == 0x8086 ? @"Intel" : @"NVIDIA";
+    @synchronized(seen) { NSString *k = @(who); if (![seen containsObject:k]) { [seen addObject:k]; nvlog("vendorName -> %s (asked by %s)", v.UTF8String, who); } }
+    return v;
 }
 - (NSString *)name {
     static int vk = 0; if (!vk) { vk = 1; nvmtl_vk_init(); }
@@ -415,13 +806,32 @@ static void nvmtl_install_hw_resource_pools(id dev)
 
 static void nvmtl_zero_new_buffer(NVMTLBuffer *b, NSUInteger len);
 static __thread int gZeroSkip;
+// NVMTL_MANAGED_SYSMEM=1: a Managed buffer lives in mapped system memory (no VRAM copy + shadow pair). This was a bare
+// getenv() on every call, so any value - "0" included - switched it on, nothing said whether it had, and a release
+// plugin forgets the variable unless the process also sets NVMTL_PROCESS_ENV=1 (or the conf file sets it), which made a
+// run with it look identical to a run without it. Now read once, only "1" enables it, and it says so: once when read,
+// and once when the first Managed buffer is actually placed by it (an app that makes no Managed buffers is unaffected).
+static int nvmtl_managed_sysmem(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("NVMTL_MANAGED_SYSMEM");
+        on = e && e[0] == '1';
+        if (e || on) nvlog("buffers: Managed buffers %s (NVMTL_MANAGED_SYSMEM=%s)", on ? "go to mapped system memory" : "keep VRAM + shadow", e ? e : "unset");
+    }
+    return on;
+}
 - (id<MTLBuffer>)newBufferWithLength:(NSUInteger)len options:(MTLResourceOptions)opt {
     if (nvmtl_vk_init()) return nil;
     if (nvmtl_alloc_blocked()) return nil;
     NVMTLBuffer *b = [NVMTLBuffer new];
     b->_storage = (MTLStorageMode)((opt >> MTLResourceStorageModeShift) & 0xF);
     b->_ropt = opt & ((MTLResourceOptions)0xF | ((MTLResourceOptions)0x3 << MTLResourceHazardTrackingModeShift));
-    int hv = (b->_storage == MTLStorageModeShared) || (b->_storage == MTLStorageModeManaged && getenv("NVMTL_MANAGED_SYSMEM"));
+    int hv = (b->_storage == MTLStorageModeShared) || (b->_storage == MTLStorageModeManaged && nvmtl_managed_sysmem());
+    if (b->_storage == MTLStorageModeManaged && hv) {
+        static _Atomic int said;
+        if (!atomic_exchange(&said, 1)) nvlog("buffers: first Managed buffer (%lu bytes) placed in system memory by NVMTL_MANAGED_SYSMEM=1", (unsigned long)len);
+    }
     if (nvmtl_vk_buffer_create(len, (hv && b->_storage == MTLStorageModeShared) ? 2 : hv, &b->_b)) {
         if (hv) { nvmtl_alloc_failed("newBufferWithLength"); nvlog("newBufferWithLength: FAILED"); return nil; }
         nvlog("newBufferWithLength:%lu private: VRAM refused - placing it in system memory", (unsigned long)len);
@@ -465,6 +875,10 @@ static int nvmtl_pixfmt(MTLPixelFormat f, uint32_t *vk, uint32_t *bpp, int *a8)
     *a8 = 0;
     switch (f) {
     case MTLPixelFormatA8Unorm:          *vk = 9  ;               *bpp = 1;  *a8 = 1; return 0;
+    // Apple's private ARGB8 format: AppleMetalOpenGLRenderer asks for it when a GL_RGBA8 texture is uploaded as GL_BGRA +
+    // GL_UNSIGNED_INT_8_8_8_8 (bytes A,R,G,B; Unity 5's ARGB32 textures). Stored as RGBA8, the view swizzle reorders it
+    // (a8 = 2). WAS nil, so the GL texture was "unloadable" and sampled as zero: Homeworld: Deserts of Kharak's UI sprites.
+    case (MTLPixelFormat)84:             *vk = 37 ;         *bpp = 4;  *a8 = 2; return 0;
     case MTLPixelFormatR8Unorm:          *vk = 9  ;               *bpp = 1;  return 0;
     case MTLPixelFormatR8Unorm_sRGB:     *vk = 15 ;                *bpp = 1;  return 0;
     case MTLPixelFormatR8Snorm:          *vk = 10 ;               *bpp = 1;  return 0;
@@ -499,6 +913,15 @@ static int nvmtl_pixfmt(MTLPixelFormat f, uint32_t *vk, uint32_t *bpp, int *a8)
     case MTLPixelFormatRGB10A2Uint:      *vk = 68 ; *bpp = 4; return 0;
     case MTLPixelFormatBGR10A2Unorm:     *vk = 58 ; *bpp = 4; return 0;
     case MTLPixelFormatRG11B10Float:     *vk = 122 ; *bpp = 4; return 0;
+    // Apple's extended-range formats have no Vulkan twin. CoreAnimation renders video and wide-colour layers into them
+    // (PBGRAXb is BGRA10_XR); without them Apple TV aborted on every video (#309). Each maps to a format of the same size
+    // that holds the values this driver's readers expect: the 64-bit ones to half floats (the whole -0.75..1.25 range,
+    // blendable), the 32-bit ones to 10:10:10:2 unorm (10-bit precision, values above 1.0 clamp). The bytes are not
+    // Apple's XR bit layout, which only a CPU reading raw texels would see.
+    case MTLPixelFormatBGRA10_XR:        *vk = 97 ; *bpp = 8; return 0;
+    case MTLPixelFormatBGRA10_XR_sRGB:   *vk = 97 ; *bpp = 8; return 0;
+    case MTLPixelFormatBGR10_XR:         *vk = 58 ; *bpp = 4; return 0;
+    case MTLPixelFormatBGR10_XR_sRGB:    *vk = 58 ; *bpp = 4; return 0;
     case MTLPixelFormatRGB9E5Float:      *vk = 123 ;  *bpp = 4; return 0;
     case MTLPixelFormatRG32Uint:         *vk = 101 ;           *bpp = 8;  return 0;
     case MTLPixelFormatRG32Sint:         *vk = 102 ;           *bpp = 8;  return 0;
@@ -594,6 +1017,18 @@ static BOOL nvmtl_desc_fbo(MTLTextureDescriptor *d) {
     SEL s = sel_registerName("framebufferOnly");
     return d && [d respondsToSelector:s] && ((BOOL (*)(id, SEL))objc_msgSend)(d, s);
 }
+// BGR10A2Unorm (VkFormat 58) cannot be a storage image on NVIDIA; a writable private texture of it is created as
+// R10G10B10A2 (VkFormat 64): same bits per channel, storage-capable. YES when the format was swapped. Without this a
+// kernel's stores to such a texture went to the dummy storage image (Cyberpunk's tonemapped output is BGR10A2).
+static inline BOOL nvmtl_bgr10_storage_remap(MTLTextureDescriptor *d, uint32_t *vkf)
+{
+    if (!d || !vkf || *vkf != 58u || d.pixelFormat != MTLPixelFormatBGR10A2Unorm) return NO;
+    if (!(d.usage & MTLTextureUsageShaderWrite) || d.storageMode != MTLStorageModePrivate) return NO;
+    if (getenv("NVMTL_NO_BGR10_REMAP")) return NO;
+    *vkf = 64u;
+    { static int said; if (!said++) nvlog("texture: writable BGR10A2Unorm is held as R10G10B10A2 so kernels can store to it"); }
+    return YES;
+}
 - (id<MTLTexture>)newTextureWithDescriptor:(MTLTextureDescriptor *)d {
     if (nvmtl_vk_init()) return nil;
     if (d.textureType == MTLTextureTypeTextureBuffer) {
@@ -622,6 +1057,7 @@ static BOOL nvmtl_desc_fbo(MTLTextureDescriptor *d) {
     }
     uint32_t vkf = 0, bpp = 0; int a8 = 0;
     if (nvmtl_pixfmt(d.pixelFormat, &vkf, &bpp, &a8)) return nil;
+    const BOOL rbSwap = nvmtl_bgr10_storage_remap(d, &vkf);
     int wantStex = (d.usage & MTLTextureUsageShaderWrite) != 0;
     if (d.textureType == MTLTextureType2DMultisample || d.textureType == MTLTextureType2DMultisampleArray) {
         if (d.mipmapLevelCount != 1 || d.depth != 1) { nvlog("newTextureWithDescriptor: invalid multisample color descriptor"); return nil; }
@@ -632,10 +1068,12 @@ static BOOL nvmtl_desc_fbo(MTLTextureDescriptor *d) {
     if (nvmtl_vk_image_create_typed((uint32_t)d.width, (uint32_t)d.height, vkf, bpp, a8, (uint32_t)d.mipmapLevelCount, wantStex, (uint32_t)d.textureType, nvmtl_vk_layers_for_desc((uint32_t)d.textureType, (uint32_t)d.arrayLength, (uint32_t)d.depth), &t->_i)) { nvmtl_alloc_failed("newTextureWithDescriptor"); nvlog("newTextureWithDescriptor: FAILED"); return nil; }
     nvmtl_alloc_ok();
     t->_q = nvmtl_device_queue();
-    t->_stex = t->_i.storage != 0;
+    t->_stex = t->_i.storage == 1;
+    t->_rbSwap = rbSwap;
     t->_usage = d.usage;
     if (wantStex && !t->_stex) { static unsigned long lost; lost++;
         if (!(lost & (lost - 1))) nvlog("newTextureWithDescriptor: pixel format %lu asked for ShaderWrite and NVK cannot make it a storage image — shader writes to it will be LOST (%lu texture(s) so far in this process)", (unsigned long)d.pixelFormat, lost); }
+    nvmtl_texture_desc_swizzle(t, d);
     nvlog("newTextureWithDescriptor: %lux%lu%s -> %p", (unsigned long)d.width, (unsigned long)d.height, t->_stex ? " +storage" : "", (__bridge void *)t); return t; }
 
 typedef struct { uint32_t magic, seed, gen; } nvmtl_vram_tag;
@@ -675,6 +1113,47 @@ static void nvmtl_vram_tag_set(IOSurfaceRef surf, NSUInteger plane, uint32_t see
     CFDataRef d = CFDataCreate(NULL, (const UInt8 *)&t, sizeof t); CFStringRef k = nvmtl_vram_tag_key(plane);
     IOSurfaceSetValue(surf, k, d); CFRelease(k); CFRelease(d);
 }
+typedef struct { uint32_t magic, done; uint64_t stamp_ns, seq; int32_t pid; uint32_t pad; } nvmtl_busy_tag;
+#define NVMTL_BUSY_MAGIC 0x4255535au
+#define NVMTL_BUSY_WAIT_NS  (10ull * 1000 * 1000)
+#define NVMTL_BUSY_STALE_NS (100ull * 1000 * 1000)
+#define NVMTL_BUSY_POLL_US 100
+static CFStringRef nvmtl_busy_key(NSUInteger plane) { return CFStringCreateWithFormat(NULL, NULL, CFSTR("NVMTLBusyAt:p%lu"), (unsigned long)plane); }
+static int nvmtl_busy_read(IOSurfaceRef surf, NSUInteger plane, nvmtl_busy_tag *out)
+{
+    CFStringRef k = nvmtl_busy_key(plane); CFTypeRef v = IOSurfaceCopyValue(surf, k); CFRelease(k);
+    nvmtl_busy_tag t = { 0, 0, 0, 0, 0, 0 };
+    int ok = v && CFGetTypeID(v) == CFDataGetTypeID() && CFDataGetLength((CFDataRef)v) == (CFIndex)sizeof t;
+    if (ok) memcpy(&t, CFDataGetBytePtr((CFDataRef)v), sizeof t);
+    if (v) CFRelease(v);
+    ok = ok && t.magic == NVMTL_BUSY_MAGIC;
+    if (ok && out) *out = t;
+    return ok;
+}
+static void nvmtl_busy_write(IOSurfaceRef surf, NSUInteger plane, uint64_t seq, int done)
+{
+    nvmtl_busy_tag t = { NVMTL_BUSY_MAGIC, (uint32_t)done, clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW), seq, getpid(), 0 };
+    CFDataRef d = CFDataCreate(NULL, (const UInt8 *)&t, sizeof t); CFStringRef k = nvmtl_busy_key(plane);
+    IOSurfaceSetValue(surf, k, d); CFRelease(k); CFRelease(d);
+}
+static int nvmtl_busy_foreign(IOSurfaceRef surf, NSUInteger plane)
+{
+    nvmtl_busy_tag t;
+    return nvmtl_busy_read(surf, plane, &t) && t.pid != getpid();
+}
+static void nvmtl_busy_wait(IOSurfaceRef surf, NSUInteger plane)
+{
+    nvmtl_busy_tag t;
+    if (!nvmtl_busy_read(surf, plane, &t) || t.done || t.pid == getpid()) return;
+    const uint64_t t0 = clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW);
+    if (t.stamp_ns <= t0 && t0 - t.stamp_ns > NVMTL_BUSY_STALE_NS) return;
+    for (;;) {
+        usleep(NVMTL_BUSY_POLL_US);
+        if (!nvmtl_busy_read(surf, plane, &t) || t.done || t.pid == getpid()) return;
+        const uint64_t now = clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW);
+        if (now - t0 > NVMTL_BUSY_WAIT_NS || (t.stamp_ns <= now && now - t.stamp_ns > NVMTL_BUSY_STALE_NS)) return;
+    }
+}
 static int nvmtl_surface_image_create(NVMTLTexture *t, IOSurfaceRef surf, NSUInteger plane, uint32_t w, uint32_t h,
                                       uint32_t vkf, uint32_t bpp, int a8, int stex)
 {
@@ -698,10 +1177,49 @@ static int nvmtl_surface_image_create(NVMTLTexture *t, IOSurfaceRef surf, NSUInt
         }
     }
     g_surf_private++;
+    // A private image stands for the whole surface: wrappers that read it and wrappers that write it must share ONE image
+    // (nvmtlNewSurfaceTexture caches it), or what one writes the other never sees. So it is made writable whenever the
+    // format can be, whatever the first wrapper asked for.
+    if (!stex && nvmtl_vk_format_is_storage(vkf)) stex = 1;
+    if (surf) {
+        const size_t prow = IOSurfaceGetBytesPerRow(surf), pplanes = IOSurfaceGetPlaneCount(surf);
+        nvlog("item 7: surface %u %ux%u plane %lu -> a private image, copied in and out (%s; row %zu bytes, %zu plane(s))",
+              (unsigned)IOSurfaceGetID(surf), w, h, (unsigned long)plane,
+              (plane != 0 || pplanes > 1) ? "more than one plane" : ((size_t)w * (bpp ? bpp : 4) > prow || h > IOSurfaceGetHeight(surf)) ? "image larger than the surface"
+              : (prow % 32) ? "the row is not a multiple of 32 bytes" : "the family VRAM could not be used", prow, pplanes);
+    }
     return nvmtl_vk_image_create_typed(w, h, vkf, bpp, a8, 1, stex, 2u, 1u, &t->_i);
 }
 
+// A CAMetalLayer drawable with framebufferOnly=NO is, on real Metal, usable as a render target AND a compute/Core Image
+// destination. QuartzCore hands this driver a descriptor whose usage is only ShaderRead for it, so Core Image refuses the
+// texture ("texture usage must include MTLTextureUsageShaderWrite") and Photo Booth's preview stays black. The surface's
+// image is already writable whenever its format allows (see nvmtl_surface_image_create), so say so.
+// WindowServer keeps the usage it asked for: it wraps hundreds of surfaces a second, none of them Core Image targets.
+static NSUInteger nvmtl_surface_usage(NSUInteger usage, BOOL fbo, BOOL storage) {
+    // Unknown permits shader writes too. Adding only ShaderRead/RenderTarget to a
+    // non-storage surface would forbid its optimal-tiled storage twin below
+    // (ImageIO's RGBA16Unorm outputs), silently sending those writes to a dummy.
+    if (usage == MTLTextureUsageUnknown) return usage;
+    static int ws = -1;
+    if (ws < 0) { const char *me = getprogname(); ws = me && !strcmp(me, "WindowServer"); }
+    if (!fbo && !ws) {
+        usage |= MTLTextureUsageShaderRead | MTLTextureUsageRenderTarget;
+        if (storage) usage |= MTLTextureUsageShaderWrite;
+    }
+    return usage;
+}
+
+static char nvmtl_surface_cache_key;
 - (id<MTLTexture>)newTextureWithDescriptor:(MTLTextureDescriptor *)d iosurface:(IOSurfaceRef)surf plane:(NSUInteger)plane {
+    @synchronized(self) {
+        NSMapTable *cache = objc_getAssociatedObject(self, &nvmtl_surface_cache_key);
+        if (!cache) { cache = [NSMapTable strongToWeakObjectsMapTable];
+            objc_setAssociatedObject(self, &nvmtl_surface_cache_key, cache, OBJC_ASSOCIATION_RETAIN_NONATOMIC); }
+        return [self nvmtlNewSurfaceTexture:d surface:surf plane:plane cache:cache];
+    }
+}
+- (id<MTLTexture>)nvmtlNewSurfaceTexture:(MTLTextureDescriptor *)d surface:(IOSurfaceRef)surf plane:(NSUInteger)plane cache:(NSMapTable *)cache {
     if (nvmtl_vk_init()) return nil;
     size_t w = d.width, h = d.height;
     if (!w || !h || w > UINT32_MAX || h > UINT32_MAX) return nil;
@@ -713,14 +1231,30 @@ static int nvmtl_surface_image_create(NVMTLTexture *t, IOSurfaceRef surf, NSUInt
     uint32_t vkf = 0, bpp = 0; int a8 = 0;
     if (nvmtl_pixfmt(d.pixelFormat, &vkf, &bpp, &a8)) return nil;
     int wantStex = (d.usage & MTLTextureUsageShaderWrite) != 0;
+    NSArray *key = surf ? @[@(IOSurfaceGetID(surf)), @(plane), @(w), @(h), @(d.pixelFormat), @(t->_ropt), @(t->_fbo)] : nil;
+    NVMTLTexture *backing = key ? [cache objectForKey:key] : nil;
+    // Failed BAR imports use a private image. Repeated wrappers of the same
+    // surface must share that image, just as successful family imports do,
+    // whether a wrapper reads it or writes it (the image is made writable).
+    // Weak entries do not pin the image after the application's last wrapper.
+    if (backing && !backing->_vramOn) {
+        NVMTLTexture *alias = (NVMTLTexture *)[backing newTextureViewWithPixelFormat:d.pixelFormat];
+        if (alias) {
+            alias->_viewParent = nil; alias->_usage = nvmtl_surface_usage(d.usage, t->_fbo, alias->_stex); alias->_ropt = t->_ropt; alias->_fbo = t->_fbo;
+            nvmtl_texture_desc_swizzle(alias, d);
+            return alias;
+        }
+    }
     if (nvmtl_surface_image_create(t, surf, plane, (uint32_t)w, (uint32_t)h, vkf, bpp, a8, wantStex)) {
         nvlog("newTextureWithDescriptor:iosurface:plane: image create FAILED (%zux%zu)", w, h); return nil; }
     t->_q = nvmtl_device_queue();
-    t->_surf = surf; if (surf) { CFRetain(surf); t->_surfOwned = YES; }
+    t->_surf = surf; if (surf) { CFRetain(surf); t->_surfOwned = YES; t->_clientWritten = nvmtl_busy_foreign(surf, plane) != 0; }
     t->_plane = plane;
     t->_fmt = d.pixelFormat;
-    t->_stex = t->_i.storage != 0;
-    t->_usage = d.usage;
+    t->_stex = t->_i.storage == 1;
+    t->_usage = nvmtl_surface_usage(d.usage, t->_fbo, t->_stex);
+    nvmtl_texture_desc_swizzle(t, d);
+    if (key && !t->_vramOn) [cache setObject:t forKey:key];
     nvlog("newTextureWithDescriptor:iosurface:%p plane:%lu -> %p (%zux%zu fmt %lu)",
           (void *)surf, (unsigned long)plane, (__bridge void *)t, w, h, (unsigned long)d.pixelFormat);
     return t; }
@@ -1128,11 +1662,24 @@ static int nvmtl_blend_op(MTLBlendOperation op, uint32_t *v) {
             nvlog("blend: operation %lu is not a value this driver knows", (unsigned long)op); return -1;
     }
 }
-static int nvmtl_blend_from(MTLRenderPipelineColorAttachmentDescriptor *ca, int noWrite, nvk_blend_state *b) {
+// An A8Unorm attachment is an R8 image on Vulkan whose red lane holds Metal's alpha (the shader variant broadcasts alpha
+// to every lane). A factor that reads the destination's alpha must read its colour instead: R8 has no alpha to read.
+static uint32_t nvmtl_a8_factor(uint32_t f) {
+    switch (f) {
+    case VK_BLEND_FACTOR_DST_ALPHA: return VK_BLEND_FACTOR_DST_COLOR;
+    case VK_BLEND_FACTOR_ONE_MINUS_DST_ALPHA: return VK_BLEND_FACTOR_ONE_MINUS_DST_COLOR;
+    case VK_BLEND_FACTOR_SRC1_ALPHA: return VK_BLEND_FACTOR_SRC1_COLOR;
+    case VK_BLEND_FACTOR_ONE_MINUS_SRC1_ALPHA: return VK_BLEND_FACTOR_ONE_MINUS_SRC1_COLOR;
+    default: return f;
+    }
+}
+static int nvmtl_blend_from(MTLRenderPipelineColorAttachmentDescriptor *ca, int noWrite, int a8, nvk_blend_state *b) {
     *b = (nvk_blend_state){ .enabled = ca.blendingEnabled,
         .src_rgb = VK_BLEND_FACTOR_ONE, .dst_rgb = VK_BLEND_FACTOR_ZERO, .op_rgb = VK_BLEND_OP_ADD,
         .src_alpha = VK_BLEND_FACTOR_ONE, .dst_alpha = VK_BLEND_FACTOR_ZERO, .op_alpha = VK_BLEND_OP_ADD };
-    if (!noWrite) {
+    if (!noWrite && a8) {
+        if (ca.writeMask & MTLColorWriteMaskAlpha) b->write_mask |= VK_COLOR_COMPONENT_R_BIT;
+    } else if (!noWrite) {
         if (ca.writeMask & MTLColorWriteMaskRed) b->write_mask |= VK_COLOR_COMPONENT_R_BIT;
         if (ca.writeMask & MTLColorWriteMaskGreen) b->write_mask |= VK_COLOR_COMPONENT_G_BIT;
         if (ca.writeMask & MTLColorWriteMaskBlue) b->write_mask |= VK_COLOR_COMPONENT_B_BIT;
@@ -1160,9 +1707,31 @@ static NVMTLFunction *nvmtl_empty_fragment(void) {
     return fn;
 }
 MTLRenderPipelineDescriptor *nvmtl_gl_rewrite_descriptor(MTLRenderPipelineDescriptor *d, NSError **err);
+NSData *nvmtl_translate_samplers(NVMTLFunction *fn, NSDictionary *states, uint32_t a8, NSString **err);
 void nvmtl_gl_tag_reflection(id refl, MTLRenderPipelineDescriptor *d);
+// One line per function the first time it goes into a pipeline: the kernel/stage name, the FNV-1a of its SPIR-V (what a
+// per-kernel GPU profile keys a row on) and the sha256 of its AIR (what the translator caches key a module on), so a
+// profile row maps to a translator module without guessing.
+uint32_t nvmtl_function_spv_fnv(id f);
+uint64_t nvmtl_function_air_key(id f);
+static void nvmtl_pipeline_key_log(id f, const char *stage, const void *pipe)
+{
+    if (![f isKindOfClass:[NVMTLFunction class]]) return;
+    NVMTLFunction *fn = f; static char kKey;
+    if (objc_getAssociatedObject(fn, &kKey)) return;
+    objc_setAssociatedObject(fn, &kKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    const uint32_t x = nvmtl_function_spv_fnv(fn);
+    char air[17] = "-";
+    if (fn->_air.length) snprintf(air, sizeof air, "%016llx", (unsigned long long)nvmtl_function_air_key(fn));
+    nvlog_every("pipeline key: %s %s spv-fnv %08x air %s%s%s pipe %p", stage, fn->_fname.UTF8String ?: "-", x, air,
+          fn->_specName.length ? " fc " : "", fn->_specName.length ? fn->_specName.UTF8String : "", pipe);
+}
 - (id<MTLRenderPipelineState>)newRenderPipelineStateWithDescriptor:(MTLRenderPipelineDescriptor *)d error:(NSError **)err {
     if (err) *err = nil;
+    // Work on a copy: some descriptor getters (vertexLinkedFunctions, ...) create their object on first read, and the
+    // caller's descriptor then no longer equals a fresh one. Apple's GL keys its built-in (blit) pipelines by the
+    // descriptor it passed here, so every blit missed and built a new pipeline.
+    d = [d copy];
     d = nvmtl_gl_rewrite_descriptor(d, err); if (!d) return nil;
     if (nvmtl_vk_init()) return nvmtl_fail(err, @"pipeline: Vulkan is not up in this process");
     id<MTLFunction> vfn = d.vertexFunction, ffn = d.fragmentFunction;
@@ -1186,15 +1755,26 @@ void nvmtl_gl_tag_reflection(id refl, MTLRenderPipelineDescriptor *d);
     if ([samplePayload isKindOfClass:[NSDictionary class]] && !nvmtl_vk_sample_positions_backend())
         return nvmtl_fail(err, @"pipeline: fragment sample positions require the checked NVIDIA runtime payload contract");
     NVMTLRenderPipelineState *ps = [NVMTLRenderPipelineState new];
-    nvk_rt rt; memset(&rt, 0, sizeof rt);
+    nvmtl_pipeline_key_log(d.vertexFunction, "vertex", &ps->_p); nvmtl_pipeline_key_log(d.fragmentFunction, "fragment", &ps->_p);
+    nvk_rt rt; memset(&rt, 0, sizeof rt); uint32_t a8mask = 0;
     for (uint32_t i = 0; i < NVMTL_NCOL; i++) {
         MTLRenderPipelineColorAttachmentDescriptor *ca = d.colorAttachments[i];
         if (ca.pixelFormat == MTLPixelFormatInvalid) continue;
         uint32_t svk = 0, sbpp = 0; int sa8 = 0;
         if (nvmtl_pixfmt(ca.pixelFormat, &svk, &sbpp, &sa8))
             return nvmtl_fail(err, [NSString stringWithFormat:@"pipeline: colour attachment %u pixel format %lu not carried by this driver", i, (unsigned long)ca.pixelFormat]);
-        if (nvmtl_blend_from(ca, noFrag, &rt.blend[i]))
+        // ARGB8 (84) is sampled through a reordering view swizzle, which a colour attachment does not get, and the A8
+        // remapping below would treat it as a one-channel target. Refused, as it was before the format was carried.
+        if (sa8 == 2)
+            return nvmtl_fail(err, [NSString stringWithFormat:@"pipeline: colour attachment %u pixel format %lu (ARGB8) is not carried as a render target", i, (unsigned long)ca.pixelFormat]);
+        if (nvmtl_blend_from(ca, noFrag, sa8, &rt.blend[i]))
             return nvmtl_fail(err, [NSString stringWithFormat:@"pipeline: colour attachment %u has a blend factor or operation this driver cannot translate (the reason is the preceding \"blend:\" log line)", i]);
+        if (sa8) {
+            a8mask |= 1u << i;
+            if (rt.blend[i].enabled) {   // the red lane is Metal's alpha: blend it with the alpha factors and operation
+                rt.blend[i].src_rgb = nvmtl_a8_factor(rt.blend[i].src_alpha); rt.blend[i].dst_rgb = nvmtl_a8_factor(rt.blend[i].dst_alpha);
+                rt.blend[i].op_rgb = rt.blend[i].op_alpha; }
+        }
         rt.cfmt[i] = svk; rt.ncol = i + 1;
     }
     for (uint32_t i = 0; i < rt.ncol; i++) {
@@ -1237,13 +1817,28 @@ void nvmtl_gl_tag_reflection(id refl, MTLRenderPipelineDescriptor *d);
             (unsigned long)ad.offset, (unsigned long)ld.stride, (unsigned long)ld.stepFunction, (unsigned long)ld.stepRate];
     }
     ps->_vdesc = vdesc; ps->_descriptor = [d copy];
+    /* _descriptor keeps the caller's (unlinked) functions; a pixel-sampler variant re-translates from these, the
+     * stages the pipeline was actually built from (RenderBox's custom_fn fragments only translate once linked). */
+    ps->_linkedVert = vf; ps->_linkedFrag = noFrag ? nil : ff;
     if (!vf->_spirv.length || !ff->_spirv.length)
         return nvmtl_fail(err, [NSString stringWithFormat:
             @"pipeline: REFUSED — %@ is a visible function, not an entry point (vertex %lu B, fragment %lu B)",
             !vf->_spirv.length ? vf->_fname : ff->_fname,
             (unsigned long)vf->_spirv.length, (unsigned long)ff->_spirv.length]);
+    NVMTLFunction *ffx = ff;   // the fragment stage as built: an A8-target variant when a colour attachment is A8Unorm
+    ps->_a8mask = a8mask;
+    if (a8mask && !noFrag) {
+        NSString *why = nil; NSData *fa = nvmtl_translate_samplers(ff, nil, a8mask, &why);
+        if (!fa) return nvmtl_fail(err, [NSString stringWithFormat:@"pipeline: A8 target variant of %@ REFUSED: %@", ff->_fname, why ?: @"?"]);
+        if (fa != ff->_spirv) {
+            ffx = [NVMTLFunction new]; ffx->_spirv = fa; ffx->_fname = ff->_fname; ffx->_stage = ff->_stage; ffx->_fc = ff->_fc;
+            ffx->_refl = ff->_refl; ffx->_airNames = ff->_airNames; ffx->_arguments = ff->_arguments; ffx->_embedded = ff->_embedded;
+            static _Atomic unsigned na8; if (atomic_fetch_add(&na8, 1) < 8)
+                nvlog("pipeline: %s writes alpha into A8 target(s) mask %#x (%lu B variant)", ff->_fname.UTF8String, a8mask, (unsigned long)fa.length);
+        }
+    }
     uint32_t rsc = (uint32_t)([d respondsToSelector:@selector(rasterSampleCount)] ? d.rasterSampleCount : d.sampleCount); if (!rsc) rsc = 1;
-    NSData *flk = nvmtl_varying_link(vf, ff); const void *fsb = flk ? flk.bytes : ff->_spirv.bytes; size_t fsl = flk ? flk.length : ff->_spirv.length;
+    NSData *flk = nvmtl_varying_link(vf, ffx); const void *fsb = flk ? flk.bytes : ffx->_spirv.bytes; size_t fsl = flk ? flk.length : ffx->_spirv.length;
     uint32_t tpt = 0, tcps = 0; int prc;
     if (nvmtl_spirv_tess_info(vf->_spirv.bytes, vf->_spirv.length, &tpt, &tcps)) {
         if (d.tessellationFactorFormat != MTLTessellationFactorFormatHalf)
@@ -1265,8 +1860,13 @@ void nvmtl_gl_tag_reflection(id refl, MTLRenderPipelineDescriptor *d);
             (uint32_t)d.tessellationFactorStepFunction, d.isTessellationFactorScaleEnabled ? 1u : 0u, (uint32_t)d.tessellationControlPointIndexType,
             mf, rl ? rl.intValue : -1 };
         prc = nvmtl_vk_pipeline_create_rt(vf->_spirv.bytes, vf->_spirv.length, fsb, fsl, &rt, vin.nattr ? &vin : NULL, rsc, &td, &ps->_p);
-    } else
+    } else {
         prc = nvmtl_vk_pipeline_create_rt(vf->_spirv.bytes, vf->_spirv.length, fsb, fsl, &rt, vin.nattr ? &vin : NULL, rsc, NULL, &ps->_p);
+        if (!prc)
+            nvmtl_vk_pipeline_try_gl_uniform(vf->_spirv.bytes, vf->_spirv.length, fsb, fsl,
+                nvmtl_gl_uniform_index(vf), nvmtl_gl_uniform_index(ff),
+                &rt, vin.nattr ? &vin : NULL, rsc, &ps->_p);
+    }
     if (prc) {
         nvlog("pipeline FAILED: %s / %s — see the vk: line above for the VkResult", vf->_fname.UTF8String ?: "?", ff->_fname.UTF8String ?: "?");
         return nvmtl_fail(err, [NSString stringWithFormat:@"pipeline: vkCreateGraphicsPipelines FAILED (%@ / %@)", vf->_fname, ff->_fname]); }
@@ -1285,26 +1885,53 @@ void nvmtl_gl_tag_reflection(id refl, MTLRenderPipelineDescriptor *d);
     if (r && *r) nvmtl_gl_tag_reflection(*r, d);
     return ps;
 }
-static dispatch_queue_t nvmtl_pipeline_compile_queue(void) {
-    static dispatch_queue_t queue; static dispatch_once_t once;
-    dispatch_once(&once, ^{ queue = dispatch_queue_create("nvmtl.pipeline.compile", DISPATCH_QUEUE_SERIAL); });
+// Asynchronous pipeline builds share a bounded pool. A serial queue made an app that creates its pipelines up front
+// (games, a browser's GPU process) wait for them one after another on one core.
+// Width: one less than the physical cores (the performance cores on a CPU with two kinds), 1 to 8, and at most half
+// the memory in GB: translating a large kernel alone peaks near 300 MB. NVMTL_PIPELINE_THREADS sets it; 1 is the old
+// serial behaviour.
+static int nvmtl_sysctl_int(const char *name) {
+    int value = 0; size_t size = sizeof value;
+    return sysctlbyname(name, &value, &size, NULL, 0) == 0 && size == sizeof value ? value : 0;
+}
+static NSInteger nvmtl_pipeline_compile_width(void) {
+    const char *e = getenv("NVMTL_PIPELINE_THREADS");
+    if (e && *e) { const long v = strtol(e, NULL, 10); if (v >= 1 && v <= 64) return v; }
+    int cores = nvmtl_sysctl_int("hw.nperflevels") > 1 ? nvmtl_sysctl_int("hw.perflevel0.physicalcpu") : 0;
+    if (cores <= 0) cores = nvmtl_sysctl_int("hw.physicalcpu");
+    if (cores <= 0) cores = (int)NSProcessInfo.processInfo.activeProcessorCount;
+    NSInteger width = cores > 1 ? cores - 1 : 1;
+    if (width > 8) width = 8;
+    const NSInteger byMemory = (NSInteger)(NSProcessInfo.processInfo.physicalMemory >> 31);
+    if (byMemory >= 1 && width > byMemory) width = byMemory;
+    return width;
+}
+static NSOperationQueue *nvmtl_pipeline_compile_queue(void) {
+    static NSOperationQueue *queue; static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        queue = [NSOperationQueue new];
+        queue.name = @"nvmtl.pipeline.compile";
+        queue.qualityOfService = NSQualityOfServiceUserInitiated;   // what the completion handlers run at
+        queue.maxConcurrentOperationCount = nvmtl_pipeline_compile_width();
+        nvlog("pipeline compile: %ld asynchronous builds at a time", (long)queue.maxConcurrentOperationCount);
+    });
     return queue;
 }
 - (void)newRenderPipelineStateWithDescriptor:(MTLRenderPipelineDescriptor *)d completionHandler:(MTLNewRenderPipelineStateCompletionHandler)h {
     MTLRenderPipelineDescriptor *snapshot = [d copy];
-    dispatch_async(nvmtl_pipeline_compile_queue(), ^{ @autoreleasepool {
+    [nvmtl_pipeline_compile_queue() addOperationWithBlock:^{ @autoreleasepool {
         NSError *e = nil; id<MTLRenderPipelineState> ps = [self newRenderPipelineStateWithDescriptor:snapshot error:&e];
         if (h) dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{ h(ps, e); });
-    }});
+    }}];
 }
 - (void)newRenderPipelineStateWithDescriptor:(MTLRenderPipelineDescriptor *)d options:(MTLPipelineOption)o
                            completionHandler:(MTLNewRenderPipelineStateWithReflectionCompletionHandler)h {
     MTLRenderPipelineDescriptor *snapshot = [d copy];
-    dispatch_async(nvmtl_pipeline_compile_queue(), ^{ @autoreleasepool {
+    [nvmtl_pipeline_compile_queue() addOperationWithBlock:^{ @autoreleasepool {
         NSError *e = nil; MTLRenderPipelineReflection *reflection = nil;
         id<MTLRenderPipelineState> ps = [self newRenderPipelineStateWithDescriptor:snapshot options:o reflection:&reflection error:&e];
         if (h) dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{ h(ps, reflection, e); });
-    }});
+    }}];
 }
 - (id<MTLComputePipelineState>)newComputePipelineStateWithFunction:(id<MTLFunction>)fn options:(MTLPipelineOption)o
                                                         reflection:(MTLAutoreleasedComputePipelineReflection *)r error:(NSError **)err {
@@ -1313,18 +1940,18 @@ static dispatch_queue_t nvmtl_pipeline_compile_queue(void) {
     return ps;
 }
 - (void)newComputePipelineStateWithFunction:(id<MTLFunction>)fn completionHandler:(MTLNewComputePipelineStateCompletionHandler)h {
-    dispatch_async(nvmtl_pipeline_compile_queue(), ^{ @autoreleasepool {
+    [nvmtl_pipeline_compile_queue() addOperationWithBlock:^{ @autoreleasepool {
         NSError *e = nil; id<MTLComputePipelineState> ps = [self newComputePipelineStateWithFunction:fn error:&e];
         if (h) dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{ h(ps, e); });
-    }});
+    }}];
 }
 - (void)newComputePipelineStateWithFunction:(id<MTLFunction>)fn options:(MTLPipelineOption)o
                           completionHandler:(MTLNewComputePipelineStateWithReflectionCompletionHandler)h {
-    dispatch_async(nvmtl_pipeline_compile_queue(), ^{ @autoreleasepool {
+    [nvmtl_pipeline_compile_queue() addOperationWithBlock:^{ @autoreleasepool {
         NSError *e = nil; MTLComputePipelineReflection *reflection = nil;
         id<MTLComputePipelineState> ps = [self newComputePipelineStateWithFunction:fn options:o reflection:&reflection error:&e];
         if (h) dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{ h(ps, reflection, e); });
-    }});
+    }}];
 }
 
 static NSString *nvmtl_tg_mismatch(id fn, NSUInteger ask, const char *who) {
@@ -1364,6 +1991,7 @@ static void nvmtl_log_compute_descriptor(MTLComputePipelineDescriptor *d) {
     id<MTLComputePipelineState> ps = [self newComputePipelineStateWithFunction:kfn error:err];
     if ([(id)ps isKindOfClass:[NVMTLComputePipelineState class]]) { ((NVMTLComputePipelineState *)ps)->_icb = d.supportIndirectCommandBuffers;
         ((NVMTLComputePipelineState *)ps)->_askT = d.maxTotalThreadsPerThreadgroup;
+        ((NVMTLComputePipelineState *)ps)->_reqTG = nvmtl_desc_size(d, @selector(requiredThreadsPerThreadgroup));
         ((NVMTLComputePipelineState *)ps)->_label = [d.label copy]; }
     if (r) *r = ps ? (MTLComputePipelineReflection *)nvmtl_compute_reflection(kfn) : nil;
     return ps;
@@ -1371,11 +1999,11 @@ static void nvmtl_log_compute_descriptor(MTLComputePipelineDescriptor *d) {
 - (void)newComputePipelineStateWithDescriptor:(MTLComputePipelineDescriptor *)d options:(MTLPipelineOption)o
                             completionHandler:(MTLNewComputePipelineStateWithReflectionCompletionHandler)h {
     MTLComputePipelineDescriptor *snapshot = [d copy];
-    dispatch_async(nvmtl_pipeline_compile_queue(), ^{ @autoreleasepool {
+    [nvmtl_pipeline_compile_queue() addOperationWithBlock:^{ @autoreleasepool {
         NSError *e = nil; MTLComputePipelineReflection *reflection = nil;
         id<MTLComputePipelineState> ps = [self newComputePipelineStateWithDescriptor:snapshot options:o reflection:&reflection error:&e];
         if (h) dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{ h(ps, reflection, e); });
-    }});
+    }}];
 }
 - (id<MTLComputePipelineState>)newComputePipelineStateWithDescriptor:(MTLComputePipelineDescriptor *)d error:(NSError **)err {
     nvlog("cpdesc: withDescriptor:error: -> options route");
@@ -1384,10 +2012,10 @@ static void nvmtl_log_compute_descriptor(MTLComputePipelineDescriptor *d) {
 - (void)newComputePipelineStateWithDescriptor:(MTLComputePipelineDescriptor *)d
                             completionHandler:(MTLNewComputePipelineStateCompletionHandler)h {
     MTLComputePipelineDescriptor *snapshot = [d copy];
-    dispatch_async(nvmtl_pipeline_compile_queue(), ^{ @autoreleasepool {
+    [nvmtl_pipeline_compile_queue() addOperationWithBlock:^{ @autoreleasepool {
         NSError *e = nil; id<MTLComputePipelineState> ps = [self newComputePipelineStateWithDescriptor:snapshot options:MTLPipelineOptionNone reflection:nil error:&e];
         if (h) dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{ h(ps, e); });
-    }});
+    }}];
 }
 - (BOOL)supportsFunctionPointers { return YES; }
 - (BOOL)supportsFunctionPointersFromRender { return YES; }
@@ -1396,7 +2024,10 @@ static void nvmtl_log_compute_descriptor(MTLComputePipelineDescriptor *d) {
 - (id<MTLDynamicLibrary>)newDynamicLibrary:(id<MTLLibrary>)lib error:(NSError **)err { return nvmtl_new_dylib(lib, err); }
 - (id<MTLDynamicLibrary>)newDynamicLibraryWithURL:(NSURL *)url error:(NSError **)err { return nvmtl_new_dylib_url(url, err); }
 - (id<MTLBinaryArchive>)newBinaryArchiveWithDescriptor:(MTLBinaryArchiveDescriptor *)d error:(NSError **)err { return nvmtl_new_binary_archive(d, err); }
-- (BOOL)supportsShaderBarycentricCoordinates { return YES; }
+- (BOOL)supportsShaderBarycentricCoordinates {
+    struct nvmtl_caps c = { nvmtl_vk_barycentrics_available(), nvmtl_vk_rt_available() };
+    return nvmtl_claim_barycentrics(&c) ? YES : NO;
+}
 - (BOOL)areBarycentricCoordsSupported { return YES; }
 - (BOOL)supportsPrimitiveMotionBlur { return NO; }
 - (NSMutableDictionary *)copyIOSurfaceSharedTextureProperties:(MTLTextureDescriptor *)d {
@@ -1497,8 +2128,50 @@ static void nvmtl_log_compute_descriptor(MTLComputePipelineDescriptor *d) {
         return nvmtl_fail(err, [NSString stringWithFormat:
             @"newComputePipelineState: REFUSED - this function is not ours: %s", object_getClassName(fn)]);
     NVMTLFunction *f = (NVMTLFunction *)fn;
+    // EVERY compute pipeline, named, bypassing nvlog's per-site dedupe (which hid the RT
+    //    pipelines behind cs_main_ and made a run read as "never linked"). This is the only way to tell a
+    //    pipeline created from a DESCRIPTOR (which carries linkedFunctions) from one created with a bare
+    //    function - the latter reaches the relink below with nil linked functions, so its handles can
+    //    never resolve. rgs_reference_wavefront_trace asks for 8 handles and gets nil on exactly that path.
+    {
+        FILE *lg = fopen(nvmtl_log_path(), "a");
+        if (lg) {
+            fprintf(lg, "pid %d NVMTL: computePipelineFromFunction: \"%s\" needsLink=%s\n", getpid(),
+                    f ? f->_fname.UTF8String : "(nil)", (f && f->_needsLink) ? "YES" : "no");
+            fclose(lg);
+        }
+    }
     if (f && f->_needsLink) { NSError *le = nil; id<MTLFunction> lk = nvmtl_link_stage(fn, nil, nil, &le); if (!lk) { if (err) *err = le; return nil; } f = (NVMTLFunction *)lk; fn = lk; }
+    // Machine code compiled ahead of time (NVMTLSass.m), from the linker or looked up for this function, runs
+    // instead of a Vulkan pipeline, which is then never built for it.
+    id sass = f ? (f->_sassKernel ?: nvmtl_sass_kernel_for_function(f)) : nil;
+    if (sass && f.functionType == MTLFunctionTypeKernel) {
+        NVMTLComputePipelineState *ps = [NVMTLComputePipelineState new];
+        ps->_function = f; ps->_attrT = nvmtl_air_max_tg(f); ps->_sassKernel = sass; ps->_sassOnly = YES;
+        nvlog("newComputePipelineStateWithFunction: %s -> %p from compiled machine code",
+              f->_fname.UTF8String, (__bridge void *)ps);
+        return ps;
+    }
     if (!f || !f->_spirv) return nvmtl_fail(err, @"newComputePipelineState: function has no SPIR-V");
+    // A replacement module for one translated kernel, from a whole file (a developer override). The application profile's
+    // kernel edit is applied later, where every compute pipeline is created (nvmtl_vk_compute_pipeline_create_g).
+    const char *compatPath = getenv("NVMTL_BDA_PROBE_FILE");
+    static char compatShaderKey;
+    if (compatPath && !objc_getAssociatedObject(f, &compatShaderKey)) {
+        uint32_t hash = 2166136261u;
+        for (NSUInteger i = 0; i < f->_spirv.length; i++) { hash ^= ((const uint8_t *)f->_spirv.bytes)[i]; hash *= 16777619u; }
+        const char *targetText = getenv("NVMTL_BDA_PROBE_HASH");
+        uint32_t target = targetText ? (uint32_t)strtoul(targetText, NULL, 16) : 0xd57e32ceu;
+        if (hash == target) {
+            NSData *replacement = [NSData dataWithContentsOfFile:@(compatPath)];
+            if (replacement.length < 20 || (replacement.length & 3u) || ((const uint32_t *)replacement.bytes)[0] != 0x07230203u)
+                return nvmtl_fail(err, @"Configured shader compatibility module is unavailable");
+            f->_spirv = replacement;
+            objc_setAssociatedObject(f, &compatShaderKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+            nvlog("replacement module for %08x: %lu bytes from NVMTL_BDA_PROBE_FILE", hash, (unsigned long)replacement.length);
+        }
+    }
+
     if (f.functionType != MTLFunctionTypeKernel) {
         nvlog("newComputePipelineState: \"%s\" is a %s, not a kernel — REFUSED",
               f->_fname.UTF8String, f->_stage.length ? f->_stage.UTF8String : "non-kernel");
@@ -1508,20 +2181,29 @@ static void nvmtl_log_compute_descriptor(MTLComputePipelineDescriptor *d) {
     }
     NVMTLComputePipelineState *ps = [NVMTLComputePipelineState new];
     ps->_function = f;
+    nvmtl_pipeline_key_log(f, "kernel", &ps->_p);
     ps->_attrT = nvmtl_air_max_tg(f);
     if (nvmtl_vk_compute_pipeline_create(f->_spirv.bytes, f->_spirv.length, &ps->_p)) {
         return nvmtl_fail(err, @"newComputePipelineState: vkCreateComputePipelines FAILED"); }
+    if (g_app_edit_last) {
+        objc_setAssociatedObject(ps, &g_app_edit_ps_key, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        nvlog("profile: %s: edited kernel %s (module %08x -> %08x)", g_app_profile->exe, f->_fname.UTF8String,
+              g_app_profile->shader_from, g_app_profile->shader_to);
+    }
     nvlog("newComputePipelineStateWithFunction: %s -> %p (%lu B of SPIR-V)",
           f->_fname.UTF8String, (__bridge void *)ps, (unsigned long)f->_spirv.length);
     nvmtl_vendor_attach_sass(self, ps, f);
     { id apple = nvmtl_vendor_apple_pipeline(self, f); if (apple) return apple; }
     return ps; }
 
-- (BOOL)supportsRaytracing { return nvmtl_vk_rt_available() != 0; }
-- (BOOL)supportsRaytracingFromRender { return nvmtl_vk_rt_available() != 0; }
+- (BOOL)supportsRaytracing { const BOOL y = nvmtl_vk_rt_available() != 0; static int said; if (!said++) nvlog("QUERY supportsRaytracing -> %s", y ? "YES" : "NO"); return y; }
+- (BOOL)supportsRaytracingFromRender { const BOOL y = nvmtl_vk_rt_available() != 0; static int said; if (!said++) nvlog("QUERY supportsRaytracingFromRender -> %s", y ? "YES" : "NO"); return y; }
 - (MTLAccelerationStructureSizes)accelerationStructureSizesWithDescriptor:(MTLAccelerationStructureDescriptor *)desc {
     MTLAccelerationStructureSizes s = { 0, 0, 0 };
-    static nvmtl_geom geoms[NVMTL_MAX_GEOMS]; int instance = 0; uint32_t icount = 0;
+    // One per thread: these are filled from the descriptor and read by the build, and the game
+    // encodes from nine threads at once. Shared, two builds in flight overwrite each other's
+    // geometry and a structure gets built from another mesh.
+    static _Thread_local nvmtl_geom geoms[NVMTL_MAX_GEOMS]; int instance = 0; uint32_t icount = 0;
     uint32_t n = nvmtl_geoms_from_descriptor(desc, geoms, NVMTL_MAX_GEOMS, &instance, &icount, nil);
     size_t as = 0, sc = 0;
     if (nvmtl_vk_accel_sizes(geoms, n, instance, icount, &as, &sc)) {
@@ -1534,7 +2216,23 @@ static void nvmtl_log_compute_descriptor(MTLComputePipelineDescriptor *d) {
     if (nvmtl_vk_init() || !nvmtl_vk_rt_available()) { nvlog("newAccelerationStructureWithSize: no ray tracing on this NVK"); return nil; }
     NVMTLAccelerationStructure *a = [NVMTLAccelerationStructure new];
     a->_storage = MTLStorageModePrivate;
-    if (nvmtl_vk_buffer_create(size < 256 ? 256 : size, 0, &a->_b)) { nvlog("newAccelerationStructureWithSize: FAILED"); return nil; }
+    const size_t as_len = size < 256 ? 256 : size;
+    if (nvmtl_vk_buffer_create(as_len, 0, &a->_b)) {
+        // Every other resource falls back to system memory when VRAM refuses it; this one used to
+        // return nil instead. A nil acceleration structure is far worse than a slow one: the game
+        // keeps the nil, hands it back at build time (the "nil structure" refusal), and the
+        // structure its instance descriptors still name is never built - so the traversal reads
+        // uninitialised memory and the channel faults at an address that moves from run to run.
+        nvlog("newAccelerationStructureWithSize:%lu: VRAM refused - placing it in system memory", (unsigned long)size);
+        if (nvmtl_vk_buffer_create(as_len, 1, &a->_b)) {
+            nvmtl_alloc_failed("newAccelerationStructureWithSize");
+            nvmtl_rt_count_bump(NVMTL_RT_AS_FAILED);
+            nvlog("newAccelerationStructureWithSize: FAILED in system memory too");
+            return nil;
+        }
+        nvmtl_rt_count_bump(NVMTL_RT_AS_SYSMEM);
+    } else nvmtl_rt_count_bump(NVMTL_RT_AS_VRAM);
+    nvmtl_alloc_ok();
     nvlog("newAccelerationStructureWithSize:%lu -> %p", (unsigned long)size, (__bridge void *)a); return a;
 }
 - (id<MTLAccelerationStructure>)newAccelerationStructureWithDescriptor:(MTLAccelerationStructureDescriptor *)desc {
@@ -1554,6 +2252,8 @@ static void nvmtl_log_compute_descriptor(MTLComputePipelineDescriptor *d) {
     return [self heapAccelerationStructureSizeAndAlignWithSize:s.accelerationStructureSize];
 }
 - (BOOL)supportsBCTextureCompression { return YES; }
+- (BOOL)supportsRasterizationRateMapWithLayerCount:(NSUInteger)count { return NO; }
+- (id<MTLRasterizationRateMap>)newRasterizationRateMapWithDescriptor:(MTLRasterizationRateMapDescriptor *)descriptor { return nil; }
 - (BOOL)supportsInt64 { return YES; }
 - (BOOL)isQuadDataSharingSupported { return YES; }
 - (BOOL)supportsCounterSampling:(MTLCounterSamplingPoint)p {
@@ -1595,13 +2295,42 @@ static void nvmtl_log_compute_descriptor(MTLComputePipelineDescriptor *d) {
 - (id<MTLEvent>)newEvent { NVMTLEvent *e = [NVMTLEvent new]; e->_dev = self; return e; }
 - (id<MTLSharedEvent>)newSharedEvent { NVMTLSharedEvent *e = [NVMTLSharedEvent new]; e->_dev = self; return e; }
 - (MTLArgumentBuffersTier)argumentBuffersSupport { return MTLArgumentBuffersTier2; }
+// NVMTL_APPLE_FAMILY=<n>: also answer YES for MTLGPUFamilyApple1..Apple<n> (default 0: none).
+// Measured on Cyberpunk 2077: its whole GPU capability decision is five queries - supportsFamily
+// Apple6 (asked exactly once), name (twice), supportsRaytracing and supportsRaytracingFromRender -
+// and a NO to Apple6 puts it on the minimal tier with ray tracing refused before any acceleration
+// structure is touched. Six is also the most that is safe to claim: Apple7 and above promise
+// simdgroup matrices, and claiming them makes MPS select its A14 convolution kernels, which this
+// translator refuses. Any Apple family also implies tile shaders, imageblocks and memoryless
+// textures, which this driver does not implement, so the claim stays off unless asked for and is
+// a per-process measurement knob, not a default identity.
+static NSInteger nvmtl_apple_family_max(void)
+{
+    static NSInteger n = -1;
+    if (n < 0) { const char *e = getenv("NVMTL_APPLE_FAMILY"); n = (e && *e) ? atoi(e) : 0; if (n < 0) n = 0; if (n > 9) n = 9; }
+    return n;
+}
+// The answer to each family query, logged once per family: whether an application's ray-tracing option is offered is decided
+// by these answers, and the only way to tell a refused family from a refused ray-tracing capability is to see both.
+static BOOL nvmtl_family_answer(NSInteger f, BOOL yes, const char *why)
+{
+    static _Atomic uint32_t seen; const uint32_t bit = 1u << ((f % 1000) & 15);
+    if (!(atomic_fetch_or(&seen, bit) & bit))
+        nvlog("QUERY supportsFamily %ld -> %s (%s; claim up to Apple%ld)", (long)f, yes ? "YES" : "NO", why, (long)nvmtl_apple_family_max());
+    return yes;
+}
 - (BOOL)supportsFamily:(MTLGPUFamily)f {
+    if (nvmtl_mfx_profile_depth && (NSInteger)f >= 1001 && (NSInteger)f <= 1009) return NO;
     switch ((NSInteger)f) {
         case MTLGPUFamilyMac2: case MTLGPUFamilyCommon1: case MTLGPUFamilyCommon2: case MTLGPUFamilyCommon3: return YES;
         case 2001 : return YES;
-        case 5001 : return YES;
-        default: return NO;
+        case 5001 : { struct nvmtl_caps c = { 0, 0 }; return nvmtl_claim_metal3(&c) ? YES : NO; }   // MTLGPUFamilyMetal3
+        case 5002 : { struct nvmtl_caps c = { 0, 0 }; return nvmtl_claim_metal3(&c) && nvmtl_m4_enabled() ? YES : NO; }   // MTLGPUFamilyMetal4: the Metal 4 command model in NVMTLMetal4.m, on top of Metal 3
+        default: break;
     }
+    if ((NSInteger)f >= 1001 && (NSInteger)f <= 1009) return nvmtl_family_answer(f, (NSInteger)f <= 1000 + nvmtl_apple_family_max(), "Apple family");
+    if ((NSInteger)f >= 1001 && (NSInteger)f <= 1000 + nvmtl_apple_family_max()) return YES;
+    return NO;
 }
 - (BOOL)supportsFeatureSet:(MTLFeatureSet)fs { return fs >= 10000 && fs <= 10005; }
 - (id<MTLHeap>)newHeapWithDescriptor:(MTLHeapDescriptor *)hd {
@@ -1674,7 +2403,14 @@ static void nvmtl_log_compute_descriptor(MTLComputePipelineDescriptor *d) {
 }
 - (NSUInteger)currentAllocatedSize { return (NSUInteger)nvmtl_vk_allocated_bytes(); }
 - (uint64_t)recommendedMaxWorkingSetSize {
-    uint64_t ws = nvmtl_vk_working_set();
+    uint64_t ws = nvmtl_vk_recommended_working_set();
+    ws = nvmtl_rt_gate_working_set(ws);
+    // The same hole as maxBufferLength, and it matters more here: a streaming engine sizes its pools
+    // from this number, and the working set reads 0 when the budget is unknown. The old code could
+    // never answer under 1 GB. An unknown budget falls back to the card rather than telling the app
+    // that nothing fits.
+    if (!ws) { ws = nvmtl_vk_vram_bytes();
+        static int said; if (!said++) nvlog("recommendedMaxWorkingSetSize: working set UNKNOWN - answering the card's %llu MB", (unsigned long long)(ws >> 20)); }
     nvlog("recommendedMaxWorkingSetSize -> %llu MB", (unsigned long long)(ws >> 20));
     return ws;
 }
@@ -1693,7 +2429,12 @@ static void nvmtl_log_compute_descriptor(MTLComputePipelineDescriptor *d) {
 - (NSUInteger)maxBufferLength {
     uint64_t range = 0; nvmtl_vk_pubcaps(NULL, NULL, &range, NULL);
     if (!range) { static int said; if (!said++) nvlog("maxBufferLength: NVK limits unavailable - answering 0 (UNKNOWN)"); return 0; }
-    uint64_t three_q = nvmtl_vk_working_set() / 4 * 3;
+    // A zero working set means the budget is UNKNOWN, not that no buffer can be made. maxBufferLength
+    // is a capability an app may treat as hard, and three quarters of zero is zero, so an unknown
+    // budget leaves NVK's own range as the answer rather than reporting that nothing fits.
+    const uint64_t ws = nvmtl_vk_working_set();
+    uint64_t three_q = ws / 4 * 3;
+    if (!ws) { static int saidws; if (!saidws++) nvlog("maxBufferLength: working set UNKNOWN - answering NVK's maxStorageBufferRange alone"); three_q = range; }
     uint64_t v = range < three_q ? range : three_q;
     static int said;
     if (!said++) nvlog("maxBufferLength -> %llu MB (NVK maxStorageBufferRange %llu MB, 3/4 of working set %llu MB)",
@@ -1775,9 +2516,13 @@ static void nvmtl_log_compute_descriptor(MTLComputePipelineDescriptor *d) {
 #import "NVMTLDevice_contract.m"
 
 #import "NVMTLObjects.m"
+#import "NVMTLMetalFXDLSS.m"
 #import "NVMTLForward.m"
 #import "NVMTLLibraryLoad.m"
 #import "NVMTLGL.m"
+#import "NVMTLGLVBlank.m"
 #import "NVMTLEmbedded.m"
+#import "NVMTLMetal4.m"
 #import "NVMTLVendorCompiler.m"
 #include "nvmtl_vk.c"
+#import "NVMTLSass.m"

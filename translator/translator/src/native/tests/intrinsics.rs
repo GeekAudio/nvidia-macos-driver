@@ -8,13 +8,13 @@ use super::super::emitter::Emitter;
 use super::super::ir::{LlType, LlValue};
 use super::super::parse::{parse_type, parse_typed_value};
 use super::*;
+use crate::fxhash::{HashMap, HashSet};
 use crate::passes::{self, Stage};
 use crate::spirv_module::load_bytes;
 use crate::spirv_module::Operand;
 use crate::spirv_module::{Block, Instruction};
 use crate::{disassemble, meta, tools};
 use spirv::{Decoration, Op, Scope, SelectionControl, StorageClass, Word};
-use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
 #[test]
@@ -614,7 +614,7 @@ declare void @air.atomic.fence(i32, i32, i32)
     let _ = std::fs::create_dir_all(&tmp);
     let spv = crate::translate_sanitized_native(ll, Stage::Kernel, &tmp).expect("translate");
     let asm = disassemble(&spv).expect("disassemble");
-    let mut constants = std::collections::HashMap::new();
+    let mut constants = crate::fxhash::HashMap::default();
     for line in asm.lines() {
         let mut words = line.split_whitespace();
         if let (Some(result), Some("="), Some("OpConstant"), Some(_), Some(value)) = (
@@ -830,6 +830,38 @@ declare i32 @llvm.agx2.cluster.num()
 }
 
 #[test]
+fn native_empty_inline_asm_keeps_surrounding_instructions() {
+    for call in [
+        "call void asm \"\", \"\"()",
+        "tail call void asm sideeffect \"\", \"\"() #0, !srcloc !0",
+        "call void asm sideeffect \"\" , \"\" ( )",
+    ] {
+        let ll = format!(
+            "target triple = \"spirv-unknown-vulkan1.2\"\ndefine i32 @main(i32 %x) {{\nentry:\n  {call}\n  %next = add i32 %x, 1\n  ret i32 %next\n}}\nattributes #0 = {{ nounwind }}\n!0 = !{{i32 1}}\n"
+        );
+        let bytes = emit_vulkan_spirv(&ll).expect("empty assembly is a no-op");
+        let asm = disassemble(&bytes).expect("disassemble");
+        assert!(asm.contains("OpIAdd"), "{asm}");
+    }
+}
+
+#[test]
+fn native_nonempty_inline_asm_is_still_refused() {
+    for call in [
+        "call void asm sideeffect \"nop\", \"\"()",
+        "call void asm sideeffect \"\", \"~{memory}\"()",
+        "call void asm sideeffect \"\", \"r\"(i32 %x)",
+        "%result = call i32 asm sideeffect \"\", \"=r\"()",
+        "call void asm sideeffect \"\", \"\"() [ \"deopt\"(i32 %x) ]",
+    ] {
+        let ll = format!(
+            "target triple = \"spirv-unknown-vulkan1.2\"\ndefine void @main(i32 %x) {{\nentry:\n  {call}\n  ret void\n}}\n"
+        );
+        assert!(emit_vulkan_spirv(&ll).is_err(), "assembly must not be discarded: {call}");
+    }
+}
+
+#[test]
 fn native_void_air_call_is_emitted_for_lowering() {
     let ll = r#"
 target triple = "spirv-unknown-vulkan1.2"
@@ -895,6 +927,50 @@ attributes #1 = { convergent nobuiltin nounwind "no-builtins" }
         .is_ok()
     {
         tools::spirv_val_bytes(&out, &tmp).expect("spirv-val");
+    }
+}
+
+#[test]
+fn native_fcmp_ord_and_uno_lower_to_is_nan() {
+    // World of Warcraft's vertex shaders test a float2 with `fcmp ord` before feeding `air.all`.
+    let ll = r#"
+target triple = "spirv-unknown-vulkan1.2"
+define void @k(ptr addrspace(1) %out, <2 x i32> %id) {
+entry:
+  %v = uitofp <2 x i32> %id to <2 x float>
+  %x = extractelement <2 x float> %v, i64 0
+  %s = fdiv float %x, 3.000000e+00
+  %ord = fcmp reassoc nsz arcp contract afn ord <2 x float> %v, zeroinitializer
+  %all = tail call i1 @air.all.v2i1(<2 x i1> %ord)
+  %uno = fcmp uno float %s, 1.000000e+00
+  %both = and i1 %all, %uno
+  %bits = zext i1 %both to i32
+  store i32 %bits, ptr addrspace(1) %out, align 4
+  ret void
+}
+
+declare i1 @air.all.v2i1(<2 x i1>)
+
+!air.kernel = !{!0}
+!0 = !{ptr @k, !1, !2}
+!1 = !{}
+!2 = !{!3, !4}
+!3 = !{i32 0, !"air.buffer", !"air.location_index", i32 0, i32 1, !"air.write", !"air.address_space", i32 1, !"air.arg_type_size", i32 4, !"air.arg_type_align_size", i32 4, !"air.arg_type_name", !"uint*", !"air.arg_name", !"out"}
+!4 = !{i32 1, !"air.thread_position_in_grid", !"air.arg_type_name", !"uint2", !"air.arg_name", !"id"}
+"#;
+    let tmp = std::env::temp_dir().join(format!("metal2vulkan_fcmp_ord_uno_{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&tmp);
+    let spv = crate::translate_sanitized_native(ll, Stage::Kernel, &tmp).expect("translate");
+    let asm = disassemble(&spv).expect("disassemble");
+    assert_eq!(asm.matches("OpIsNan").count(), 4, "{asm}");
+    assert!(asm.contains("OpLogicalNot"), "{asm}");
+    assert!(asm.contains("OpAll"), "{asm}");
+    if std::process::Command::new("spirv-val")
+        .arg("--version")
+        .output()
+        .is_ok()
+    {
+        tools::spirv_val_bytes(&spv, &tmp).expect("spirv-val");
     }
 }
 
@@ -2226,7 +2302,7 @@ declare float @air.powr.f32(float, float)
     let _ = std::fs::remove_dir_all(&tmp);
 }
 
-fn float_math_modes(asm: &str) -> std::collections::HashMap<String, String> {
+fn float_math_modes(asm: &str) -> crate::fxhash::HashMap<String, String> {
     asm.lines()
         .filter_map(|line| {
             let rest = line.trim().strip_prefix("OpDecorate ")?;
@@ -2424,9 +2500,9 @@ declare i32 @air.atomic.global.add.u.i32(ptr addrspace(1), i32, i32, i32, i1)
     let spv = crate::translate_sanitized_native(&san, Stage::Kernel, &tmp).expect("translate");
     let asm = disassemble(&spv).expect("disassemble");
 
-    let mut constants = std::collections::HashMap::new();
-    let mut pointer_class = std::collections::HashMap::new();
-    let mut result_type = std::collections::HashMap::new();
+    let mut constants = crate::fxhash::HashMap::default();
+    let mut pointer_class = crate::fxhash::HashMap::default();
+    let mut result_type = crate::fxhash::HashMap::default();
     for line in asm.lines() {
         let words: Vec<&str> = line.split_whitespace().collect();
         match words.as_slice() {
@@ -2530,8 +2606,8 @@ declare i32 @air.atomic.global.add.u.i32(ptr addrspace(1), i32, i32, i32, i1)
     let spv = crate::translate_sanitized_native(ll, Stage::Kernel, &tmp).expect("translate");
     let asm = disassemble(&spv).expect("disassemble");
 
-    let mut pointer_class = std::collections::HashMap::new();
-    let mut result_type = std::collections::HashMap::new();
+    let mut pointer_class = crate::fxhash::HashMap::default();
+    let mut result_type = crate::fxhash::HashMap::default();
     for line in asm.lines() {
         let words: Vec<&str> = line.split_whitespace().collect();
         match words.as_slice() {
@@ -2644,8 +2720,8 @@ entry:
             )
             .unwrap_or_else(|| panic!("no variable at binding {binding}\n{asm}"))
     };
-    let reached_from = |seeds: &[&str]| -> std::collections::HashSet<String> {
-        let mut reached: std::collections::HashSet<String> =
+    let reached_from = |seeds: &[&str]| -> crate::fxhash::HashSet<String> {
+        let mut reached: crate::fxhash::HashSet<String> =
             seeds.iter().map(|id| id.to_string()).collect();
         loop {
             let before = reached.len();
@@ -2988,7 +3064,7 @@ declare i16 @air.get_descriptor_size_tensor(i16, i16)
     let spv = crate::translate_sanitized_native(ll, Stage::Kernel, &tmp).expect("translate");
     let asm = disassemble(&spv).expect("disassemble");
 
-    let mut width = std::collections::HashMap::new();
+    let mut width = crate::fxhash::HashMap::default();
     for line in asm.lines() {
         let words: Vec<&str> = line.split_whitespace().collect();
         if let [result, "=", "OpTypeInt", bits, _sign] = words.as_slice() {

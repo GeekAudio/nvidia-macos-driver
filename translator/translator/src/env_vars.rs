@@ -21,6 +21,11 @@ pub const REGISTRY: &[EnvVar] = &[
         effect: "requested relooper cases per dispatch group (hard maximum: 1024)",
     },
     EnvVar {
+        name: "METAL2VULKAN_NEST",
+        default: "unset",
+        effect: "stages the nest relooper may structure: unset = all, 0 = none, or a comma list of kernel,fragment,vertex",
+    },
+    EnvVar {
         name: "METAL2VULKAN_REPRO_DIR",
         default: "$TMPDIR/metal2vulkan-repros",
         effect: "base directory for FALLBACK repro bundles",
@@ -160,6 +165,12 @@ pub const REGISTRY: &[EnvVar] = &[
         default: "off",
         effect: "measurement override: keep each all-byte Function variable byte-typed \
                  (skip the b78 retype to 32-bit words that keeps Mesa from one u8 phi per byte)",
+    },
+    EnvVar {
+        name: "METAL2VULKAN_NO_RRM_IDENTITY",
+        default: "off",
+        effect: "refuse air.map_screen_to_physical_coordinates / air.map_physical_to_screen_coordinates \
+                 again instead of lowering them to the identity (the driver has no rasterization rate maps)",
     },
     EnvVar {
         name: "METAL2VULKAN_NO_LOAD_HOIST",
@@ -311,6 +322,9 @@ pub fn no_wide_half_load() -> bool {
 }
 pub fn no_byte_words() -> bool {
     present("METAL2VULKAN_NO_BYTE_WORDS")
+}
+pub fn no_rrm_identity() -> bool {
+    present("METAL2VULKAN_NO_RRM_IDENTITY")
 }
 pub fn no_load_hoist() -> bool {
     present("METAL2VULKAN_NO_LOAD_HOIST")

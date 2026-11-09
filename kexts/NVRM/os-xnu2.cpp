@@ -12,15 +12,31 @@
 #include <kern/thread.h>
 #include <kern/thread_call.h>
 #include <kern/clock.h>
+#include <sys/kauth.h>
 #include <kern/task.h>
 #include <sys/vnode.h>
 #include <sys/fcntl.h>
 #include <sys/uio.h>
 #include <IOKit/IOSubMemoryDescriptor.h>
+#include <IOKit/acpi/IOACPIPlatformDevice.h>
 #include <sys/proc.h>
 #include <sys/kauth.h>
+#include <libkern/crypto/sha1.h>
 
-#define NV_FIRMWARE_FOR_NAME(name) "/Users/Shared/nvfw/nvidia/610.57.04/" name ".bin"
+// The firmware moved out of /Users/Shared, which every user can write: the kernel reads these images and
+// the card runs them. /Library/NullMoth is where the installer already keeps the cached accelerators
+// root-owned and not group- or world-writable.
+// NVIDIA's GSP firmware must be the exact release the RM was built from; this directory names it (the package ships
+// nvfw/nvidia/<version>/, and older versions stay beside it for a rollback).
+#define NV_XNU_FW_DIR "/Library/NullMoth/nvfw/nvidia/620.70.06/"
+// Fallback for an early start: /Library is firmlinked to the Data volume, so NV_XNU_FW_DIR does not
+// exist yet when this driver is loaded from the boot collection. /usr/share lives on the system
+// volume and is not firmlinked. Same layout underneath, so only the prefix differs. See the
+// firmlink note in nv_get_firmware.
+#define NV_XNU_FW_ALT_DIR "/usr/share/nvfw/nvidia/620.70.06/"
+// The largest image we ship is the Ampere ucodes at 56 MB (620.70.06, measured); the cap only has to be generous.
+#define NV_XNU_FW_MAX_BYTES (256u * 1024u * 1024u)
+#define NV_FIRMWARE_FOR_NAME(name) NV_XNU_FW_DIR name ".bin"
 extern "C" {
 #include "nv-firmware.h"
 }
@@ -41,14 +57,20 @@ static inline void nvx2_memcpy(void *d, const void *s, size_t n) { __asm__ __vol
 
 extern "C" {
 
-NvBool NV_API_CALL os_check_access(RsAccessRight accessRight) { TRC; return NV_TRUE; }
+// GPU profiling and channel priority are for administrators, as on Linux, where this answers from CAP_PERFMON and
+// CAP_SYS_NICE. RM's own kernel clients do not come through here. Any other right is refused.
+NvBool NV_API_CALL os_check_access(RsAccessRight accessRight)
+{
+    TRC;
+    return (accessRight == RS_ACCESS_PERFMON || accessRight == RS_ACCESS_NICE) ? os_is_administrator() : NV_FALSE;
+}
 NvU32  NV_API_CALL os_get_current_process_flags(void) { TRC; return 0; }
 NvBool NV_API_CALL nv_requires_dma_remap(nv_state_t *nv) { TRC; return NV_FALSE; }
 static NvU32 nv_xnu_dma_bits = 64;
 void   NV_API_CALL nv_set_dma_address_size(nv_state_t *nv, NvU32 bits) { TRC; nv_xnu_dma_bits = bits; kprintf("NVRM-xnu:   dma address size %u bits\n", bits); }
 
 struct nv_xnu_alloc { IOBufferMemoryDescriptor *md; void *va; NvU64 page_size; NvU64 bytes; NvU32 page_count; NvBool contig; NvU32 cache;
-                      NvU64 *ptes; NvU32 nptes; SInt32 kmaps; NvBool freed, pinned; struct nv_xnu_alloc *prev, *next; };
+                      NvU64 *ptes; NvU32 nptes; SInt32 kmaps; NvBool freed, pinned; int owner_pid; struct nv_xnu_alloc *prev, *next; };
 static nv_xnu_alloc *nv_xnu_live[512]; static int nv_xnu_live_n = 0;
 extern "C" int nv_xnu_kmap_overlap(NvU64 phys, NvU64 len);
 extern "C" bool nv_xnu_chat(void);
@@ -320,8 +342,19 @@ static void nv_q_init(void)
     kprintf("NVRM-xnu: QUARANTINE armed, selftest %s\n", nv_q_selftest);
 }
 
+// The panic-hunt diagnostics below print physical addresses of RM allocations and, for nvrm_winraw, the bytes of a
+// physical memory window. Up to 2.0.2 they were registered on every machine and readable by any user. They now exist
+// only with boot-arg nvrmdiag=1, and even then only root may read them.
+static bool nv_diag_on(void)
+{
+    static int on = -1;
+    if (on < 0) { int v = 0; on = (PE_parse_boot_argn("nvrmdiag", &v, sizeof(v)) && v) ? 1 : 0; }
+    return on == 1;
+}
+#define NV_DIAG_ROOT_ONLY() do { if (!kauth_cred_issuser(kauth_cred_get())) return EPERM; } while (0)
 static int nv_watch_sysctl SYSCTL_HANDLER_ARGS
 {
+    NV_DIAG_ROOT_ONLY();
     char *buf = (char *)IOMalloc(sizeof nv_watch_text + 512);
     if (!buf) return ENOMEM;
     IOSimpleLockLock(nv_watch_lock);
@@ -349,7 +382,7 @@ static void nv_watch_init(void)
     bool neg = nv_watch_hit(0x4132a000ULL, 0x1000ULL) == 0;
     bool two = nv_watch_hit(0x0132b000ULL + PAGE_SIZE, kNvWatchSlot) == 0x4132b000ULL;
     nv_watch_selftest = (pos && neg && two) ? "ok (hit/miss/next-slot)" : "FAILED — events below are not trustworthy";
-    sysctl_register_oid(&sysctl__debug_nvrm_watchpage);
+    if (nv_diag_on()) sysctl_register_oid(&sysctl__debug_nvrm_watchpage);
     kprintf("NVRM-xnu: WATCHPAGE armed, selftest %s\n", nv_watch_selftest);
 }
 extern "C" void nv_xnu_dump_live_allocs(void)
@@ -369,12 +402,22 @@ static IOSimpleLock *nv_pm_lock = NULL;
 static nv_xnu_alloc *nv_pm_head = NULL;
 static SInt64 nv_pm_alias_n = 0, nv_pm_alias_live = 0, nv_pm_foreign_n = 0, nv_pm_deferred_n = 0, nv_pm_deferred_rel = 0,
               nv_pm_pinned_n = 0, nv_pm_pinned_bytes = 0, nv_pm_dev_alias_n = 0, nv_pm_dev_refused_n = 0, nv_pm_stale_n = 0,
-              nv_pm_nolist_n = 0, nv_pm_chat_n = 0, nv_pm_chat_dropped = 0;
+              nv_pm_nolist_n = 0, nv_pm_chat_n = 0, nv_pm_chat_dropped = 0, nv_pm_owner_mismatch_n = 0;
 static const char *nv_pm_selftest = "not run";
+// A RAM allocation is keyed on its physical range alone; a client that presents
+// another client's range would otherwise resolve to that client's buffer. The
+// owner is the pid captured when the allocation is created; refuse a device map
+// only when both owner and caller are real, distinct user processes. owner 0 is
+// kernel/RM-internal and stays shareable, so a legitimate kernel-created buffer
+// is never refused. Enforced by default; boot-arg nvrmmapowner=0 falls back to
+// observe-and-count (allow but log) as a field recovery valve.
+static inline bool nv_pm_owner_blocks(int owner, int caller) { return owner > 0 && caller > 0 && owner != caller; }
+static bool nv_pm_owner_enforce(void);
 struct nv_pm_ev { NvU64 t_s, phys, size, extra; NvU32 kind; };
 static nv_pm_ev nv_pm_ring[48]; static unsigned nv_pm_ring_n = 0;
 static const char *const nv_pm_kind[] = { "?", "ALIAS(first 8)", "FOREIGN-KMAP", "FREE-DEFERRED", "FREE-PINNED(leaked)",
-                                          "DEVMAP-RAM-ALIASED", "DEVMAP-REFUSED", "STALE-CTX-REFUSED", "DEFERRED-RELEASED" };
+                                          "DEVMAP-RAM-ALIASED", "DEVMAP-REFUSED", "STALE-CTX-REFUSED", "DEFERRED-RELEASED",
+                                          "MAP-OWNER-MISMATCH" };
 static void nv_pm_note(NvU32 kind, NvU64 phys, NvU64 size, NvU64 extra)
 {
     NvU64 ns = 0; absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
@@ -382,7 +425,7 @@ static void nv_pm_note(NvU32 kind, NvU64 phys, NvU64 size, NvU64 extra)
     nv_pm_ev &e = nv_pm_ring[nv_pm_ring_n % 48]; nv_pm_ring_n++;
     e.t_s = ns / 1000000000ULL; e.phys = phys; e.size = size; e.extra = extra; e.kind = kind;
     if (nv_pm_lock) IOSimpleLockUnlock(nv_pm_lock);
-    kprintf("NVRM-xnu: PHYSMAP %s phys 0x%llx +0x%llx extra 0x%llx\n", kind < 9 ? nv_pm_kind[kind] : "?", phys, size, extra);
+    kprintf("NVRM-xnu: PHYSMAP %s phys 0x%llx +0x%llx extra 0x%llx\n", kind < 10 ? nv_pm_kind[kind] : "?", phys, size, extra);
 }
 static bool nv_pm_match(const nv_xnu_alloc *a, NvU64 start, NvU64 size, NvU64 *off)
 {
@@ -474,6 +517,16 @@ extern "C" void nv_pm_alias_drop(void *cookie)
     OSDecrementAtomic64((volatile SInt64 *)&nv_pm_alias_live);
     if (release) { OSIncrementAtomic64((volatile SInt64 *)&nv_pm_deferred_rel); nv_pm_note(8, a->ptes ? a->ptes[0] : 0, a->bytes, 0); nv_q_put(a); }
 }
+// Only the framebuffer aperture. nv_pm_is_gpu below answers for every bar, which is what its other
+// callers want, but a range handed to a user process must never be the register file: a writable mapping
+// of BAR0 is the command and copy engines, and that is the whole machine. Apple keeps register apertures
+// to privileged clients for the same reason.
+extern "C" bool nv_pm_is_gpu_fb(NvU64 start, NvU64 size)
+{
+    nv_state_t *nv = nv_xnu_gpu_state(); if (!nv) return false;
+    const NvU64 b = nv->bars[NV_GPU_BAR_INDEX_FB].cpu_address, s = nv->bars[NV_GPU_BAR_INDEX_FB].size;
+    return b && s && start >= b && start + size <= b + s && start + size >= start;
+}
 extern "C" bool nv_pm_is_gpu(NvU64 start, NvU64 size)
 {
     nv_state_t *nv = nv_xnu_gpu_state(); if (!nv) return false;
@@ -488,14 +541,21 @@ extern "C" void nv_pm_foreign(NvU64 start, NvU64 size, NvU32 mode, void *caller)
     OSIncrementAtomic64((volatile SInt64 *)&nv_pm_foreign_n);
     nv_pm_note(2, start, size, (NvU64)((uintptr_t)caller - (uintptr_t)&nv_pm_foreign));
 }
-extern "C" IOMemoryDescriptor *nv_pm_ram_submd(NvU64 start, NvU64 size)
+extern "C" IOMemoryDescriptor *nv_pm_ram_submd(NvU64 start, NvU64 size, int caller_pid)
 {
     if (!nv_pm_ok()) return NULL;
-    NvU64 off = 0; IOBufferMemoryDescriptor *md = NULL;
+    NvU64 off = 0; IOBufferMemoryDescriptor *md = NULL; int owner = 0; bool mismatch = false;
     IOSimpleLockLock(nv_pm_lock);
     nv_xnu_alloc *a = nv_pm_find(start, size, &off);
-    if (a) { md = a->md; md->retain(); }
+    if (a) {
+        owner = a->owner_pid;
+        mismatch = nv_pm_owner_blocks(owner, caller_pid);
+        // a cross-owner map is refused by default; nvrmmapowner=0 downgrades to observe-and-count
+        if (!(mismatch && nv_pm_owner_enforce())) { md = a->md; md->retain(); }
+    }
     IOSimpleLockUnlock(nv_pm_lock);
+    if (mismatch) { OSIncrementAtomic64((volatile SInt64 *)&nv_pm_owner_mismatch_n);
+                    nv_pm_note(9, start, size, ((NvU64)(NvU32)owner << 32) | (NvU32)caller_pid); }
     if (!md) { OSIncrementAtomic64((volatile SInt64 *)&nv_pm_dev_refused_n); nv_pm_note(6, start, size, 0); return NULL; }
     IOMemoryDescriptor *s = IOSubMemoryDescriptor::withSubRange(md, (IOByteCount)off, (IOByteCount)size, kIODirectionInOut);
     md->release();
@@ -510,19 +570,20 @@ extern "C" bool nv_xnu_chat(void)
 }
 static int nv_pm_sysctl SYSCTL_HANDLER_ARGS
 {
+    NV_DIAG_ROOT_ONLY();
     const size_t cap = 8192; char *buf = (char *)IOMalloc(cap); if (!buf) return ENOMEM;
     size_t h = 0; int w;
     w = snprintf(buf, cap, "selftest %s\nkernel-alias %lld (live %lld) | FOREIGN-KMAP %lld | FREE-DEFERRED %lld (released %lld) | "
-                 "FREE-PINNED %lld (%lld KB leaked) | DEVMAP-RAM-ALIASED %lld | DEVMAP-REFUSED %lld | STALE-CTX %lld | unlisted-free %lld | "
-                 "kprintf dropped %lld\nevents (%u):\n", nv_pm_selftest, nv_pm_alias_n, nv_pm_alias_live, nv_pm_foreign_n, nv_pm_deferred_n,
+                 "FREE-PINNED %lld (%lld KB leaked) | DEVMAP-RAM-ALIASED %lld | DEVMAP-REFUSED %lld | STALE-CTX %lld | MAP-OWNER-MISMATCH %lld | "
+                 "unlisted-free %lld | kprintf dropped %lld\nevents (%u):\n", nv_pm_selftest, nv_pm_alias_n, nv_pm_alias_live, nv_pm_foreign_n, nv_pm_deferred_n,
                  nv_pm_deferred_rel, nv_pm_pinned_n, nv_pm_pinned_bytes >> 10, nv_pm_dev_alias_n, nv_pm_dev_refused_n, nv_pm_stale_n,
-                 nv_pm_nolist_n, nv_pm_chat_dropped, nv_pm_ring_n);
+                 nv_pm_owner_mismatch_n, nv_pm_nolist_n, nv_pm_chat_dropped, nv_pm_ring_n);
     if (w > 0) h = (size_t)w < cap ? (size_t)w : cap - 1;
     if (nv_pm_lock) IOSimpleLockLock(nv_pm_lock);
     unsigned n = nv_pm_ring_n < 48 ? nv_pm_ring_n : 48;
     for (unsigned i = 0; i < n && h < cap - 160; i++) {
         const nv_pm_ev &e = nv_pm_ring[(nv_pm_ring_n - n + i) % 48];
-        w = snprintf(buf + h, cap - h, "  t+%llus %s phys 0x%llx +0x%llx extra 0x%llx\n", e.t_s, e.kind < 9 ? nv_pm_kind[e.kind] : "?", e.phys, e.size, e.extra);
+        w = snprintf(buf + h, cap - h, "  t+%llus %s phys 0x%llx +0x%llx extra 0x%llx\n", e.t_s, e.kind < 10 ? nv_pm_kind[e.kind] : "?", e.phys, e.size, e.extra);
         if (w > 0) h += (size_t)w;
     }
     if (nv_pm_lock) IOSimpleLockUnlock(nv_pm_lock);
@@ -535,10 +596,22 @@ SYSCTL_PROC(_debug, OID_AUTO, nvrm_physmap, CTLTYPE_STRING | CTLFLAG_RD | CTLFLA
 static bool nv_pm_registered = false;
 
 #include <pexpert/pexpert.h>
+static bool nv_pm_owner_enforce(void)
+{
+    static int on = -1;
+    // enforce unless explicitly disabled with nvrmmapowner=0 (a no-rebuild recovery valve)
+    if (on < 0) { int v = 1; PE_parse_boot_argn("nvrmmapowner", &v, sizeof(v)); on = v ? 1 : 0; }
+    return on != 0;
+}
+// Kernel addresses of one macOS build (24G830), used only by the class-F panic hunt's page-table sentinel. Shipped
+// builds leave them out: on any other build they point at unrelated memory, and in the binary they are a ready-made
+// address book for anyone attacking the kernel (security report #214, finding 7).
+#if NVRM_PANIC_HUNT
 static const uint64_t kKdkKprintf = 0xffffff8000b94da0ULL, kKdkPvHead = 0xffffff80011bd8c8ULL, kKdkAttr = 0xffffff80012de470ULL,
                       kKdkLastManaged = 0xffffff80012de468ULL, kKdkPmapInit = 0xffffff80011bd358ULL,
                       kKdkKernelPmap = 0xffffff8000266460ULL, kKdkVerifyFree = 0xffffff8000512880ULL;
 static const uint8_t  kKdkVerifyBytes[16] = { 0x83,0x3d,0xd1,0xaa,0xca,0x00,0x00,0x0f,0x94,0xc0,0x83,0xff,0xfe,0x0f,0x94,0xc1 };
+#endif
 static const char *nv_pv_state = "not started";
 static volatile uint8_t *nv_pv_head = NULL, *nv_pv_attr = NULL;
 static uint32_t nv_pv_last = 0; static uint64_t nv_pv_kpmap = 0; static uint8_t *nv_pv_managed = NULL;
@@ -661,6 +734,7 @@ static void nv_pv_thread(void *, wait_result_t)
     }
 }
 
+#if NVRM_PANIC_HUNT
 static const char *nv_pv_arm(void)
 {
     const uint64_t slide = (uint64_t)(uintptr_t)&kprintf - kKdkKprintf;
@@ -732,9 +806,14 @@ static const char *nv_pv_arm(void)
     nv_wm_boot_taken = true;
     return NULL;
 }
+#else
+static const char *nv_pv_arm(void) { return "REFUSED: the page-table sentinel is only in NVRM_PANIC_HUNT=1 builds"; }
+#endif
+
 
 static int nv_pv_sysctl SYSCTL_HANDLER_ARGS
 {
+    NV_DIAG_ROOT_ONLY();
     const size_t cap = 16384; char *buf = (char *)IOMalloc(cap); if (!buf) return ENOMEM;
     size_t h = 0; int w;
     w = snprintf(buf, cap, "state %s | pages 0x%x managed %llu | passes %llu (full every 5 s) | repair %s | slide 2MB-aligned %s\n",
@@ -805,6 +884,7 @@ static size_t nv_wm_unarmed(char *buf, size_t cap)
 
 static int nv_wm_why_sysctl SYSCTL_HANDLER_ARGS
 {
+    NV_DIAG_ROOT_ONLY();
     const size_t cap = 160 * 1024;
     char *buf = (char *)IOMalloc(cap);
     if (!buf) return ENOMEM;
@@ -897,6 +977,7 @@ SYSCTL_PROC(_debug, OID_AUTO, nvrm_winwhy, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG
 static const NvU64 kPvcMaxPages = 262144;
 static int nv_pvchain_sysctl SYSCTL_HANDLER_ARGS
 {
+    NV_DIAG_ROOT_ONLY();
     const size_t cap = 64 * 1024;
     char *buf = (char *)IOMalloc(cap);
     if (!buf) return ENOMEM;
@@ -969,6 +1050,7 @@ SYSCTL_PROC(_debug, OID_AUTO, nvrm_pvchain, CTLTYPE_STRING | CTLFLAG_RD | CTLFLA
 
 static int nv_wm_raw_sysctl SYSCTL_HANDLER_ARGS
 {
+    NV_DIAG_ROOT_ONLY();
     const size_t cap = 96 * 1024;
     char *buf = (char *)IOMalloc(cap);
     if (!buf) return ENOMEM;
@@ -1032,7 +1114,10 @@ NV_STATUS NV_API_CALL nv_alloc_pages(nv_state_t *nv, NvU32 page_count, NvU64 pag
     else if (cache_type == NV_MEMORY_WRITECOMBINED) opts |= kIOMapWriteCombineCache;
     uint64_t mask = (nv_xnu_dma_bits >= 64) ? 0xFFFFFFFFFFFFF000ULL : ((1ULL << nv_xnu_dma_bits) - 1) & ~0xFFFULL;
     IOBufferMemoryDescriptor *md = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task, opts, (mach_vm_size_t)bytes, mask);
-    if (!md) { kprintf("NVRM-xnu:   inTaskWithPhysicalMask FAILED (%llu KB)\n", bytes >> 10); return NV_ERR_NO_MEMORY; }
+    // the request's shape rides in the failure line: 1.14.5-1.14.7 reports logged hundreds of these (8100, 9800, 10240 KB)
+    // after the boot-time allocation log had stopped, so no report said whether RM asked for contiguous memory
+    if (!md) { kprintf("NVRM-xnu:   inTaskWithPhysicalMask FAILED (%llu KB, page 0x%llx, contig %u, cache %u)\n",
+                       bytes >> 10, page_size, (unsigned)contiguous, cache_type); return NV_ERR_NO_MEMORY; }
     if (md->prepare() != kIOReturnSuccess) { kprintf("NVRM-xnu:   prepare FAILED\n"); md->release(); return NV_ERR_NO_MEMORY; }
     void *va = md->getBytesNoCopy();
     if (zeroed && va) nvx2_memset(va, 0, (size_t)bytes);
@@ -1047,12 +1132,13 @@ NV_STATUS NV_API_CALL nv_alloc_pages(nv_state_t *nv, NvU32 page_count, NvU64 pag
     if (!a) { md->complete(); md->release(); return NV_ERR_NO_MEMORY; }
     nvx2_memset(a, 0, sizeof *a);
     a->md = md; a->va = va; a->page_size = page_size; a->bytes = bytes; a->page_count = page_count; a->contig = contiguous; a->cache = cache_type;
+    a->owner_pid = proc_selfpid();  // the client whose escape triggered this allocation; 0 for a kernel-thread (RM-internal) allocation
     a->ptes = (NvU64 *)kern_os_malloc((size_t)n * sizeof(NvU64));
     if (a->ptes) { for (NvU32 i = 0; i < n; i++) a->ptes[i] = pte_array[i]; a->nptes = n; }
     nv_pm_init();
-    if (!nv_pm_registered && nv_pm_lock) { nv_pm_registered = true; sysctl_register_oid(&sysctl__debug_nvrm_physmap); }
+    if (!nv_pm_registered && nv_pm_lock && nv_diag_on()) { nv_pm_registered = true; sysctl_register_oid(&sysctl__debug_nvrm_physmap); }
     nv_pm_link(a);
-    nv_pv_start();
+    if (nv_diag_on()) nv_pv_start();   // detect-only page sentinel thread from the class-F panic hunt
     *priv_data = a;
     if (nv_xnu_live_n < 512) nv_xnu_live[nv_xnu_live_n++] = a;
     nv_watch_init(); nv_q_init(); OSIncrementAtomic64((volatile SInt64 *)&nv_watch_allocs); OSAddAtomic64((SInt64)bytes, (volatile SInt64 *)&nv_watch_bytes_seen);
@@ -1117,6 +1203,35 @@ NV_STATUS NV_API_CALL nv_dma_map_alloc(nv_dma_device_t *dev, NvU64 page_count, N
 }
 NV_STATUS NV_API_CALL nv_dma_unmap_alloc(nv_dma_device_t *dev, NvU64 page_count, NvU64 *va_array, void **priv) { TRC; return NV_OK; }
 
+// What we shipped, by name. The card verifies the signature on a GSP image itself, so this is not an
+// authorisation check; it is how the driver notices that the image on disk is not the one the package
+// installed - a partial download, a half-finished update, local corruption, or a substitution. Digests
+// are SHA-1 because that is what the kernel SDK exposes (there is no sha2.h): it settles identity, and
+// the card's own secure boot is what decides whether an image may run.
+struct nv_xnu_fw_expected { const char *name; NvU64 bytes; const char *sha1; };
+static const nv_xnu_fw_expected nv_xnu_fw_set[] = {
+    // NVIDIA 620.70.06 (NV_XNU_FW_DIR above); these move together with that directory on every NVIDIA update
+    { "gsp_ga10x.bin",    18266264ull, "6af82922e1a09b7dc4a8ce4c321fbb9d2f81894b" },
+    { "gsp_tu10x.bin",    16692112ull, "e16ff38dd2f9db6958b02dea4582dc5dff9b21cc" },
+    { "ucodes_ga10x.bin", 56128512ull, "62e74fcdd2c22765993a36a796cec536eb2eed4b" },
+    { "ucodes_tu10x.bin", 12532480ull, "5ccef0d210a2cdc1f1a1becb3ff50dbad19c332b" },
+};
+static const nv_xnu_fw_expected *nv_xnu_fw_expect(const char *path)
+{
+    const char *base = path; for (const char *q = path; *q; q++) if (*q == '/') base = q + 1;
+    for (unsigned i = 0; i < sizeof nv_xnu_fw_set / sizeof nv_xnu_fw_set[0]; i++)
+        if (!strcmp(base, nv_xnu_fw_set[i].name)) return &nv_xnu_fw_set[i];
+    return NULL;   // a name we do not ship: nothing to compare against, so nothing is claimed
+}
+static bool nv_xnu_fw_digest_ok(const nv_xnu_fw_expected *e, const void *buf, size_t len)
+{
+    SHA1_CTX c; unsigned char d[20]; char hex[41];
+    static const char k[] = "0123456789abcdef";
+    SHA1Init(&c); SHA1Update(&c, buf, (unsigned int)len); SHA1Final(d, &c);
+    for (int i = 0; i < 20; i++) { hex[2*i] = k[d[i] >> 4]; hex[2*i+1] = k[d[i] & 15]; }
+    hex[40] = 0;
+    return !strcmp(hex, e->sha1);
+}
 const void *NV_API_CALL nv_get_firmware(nv_state_t *nv, nv_firmware_type_t fw_type, nv_firmware_chip_family_t fw_chip_family, const void **fw_buf, NvU32 *fw_size)
 {
     const char *path = nv_xnu_fw_path(fw_type, fw_chip_family);
@@ -1125,9 +1240,30 @@ const void *NV_API_CALL nv_get_firmware(nv_state_t *nv, nv_firmware_type_t fw_ty
     vfs_context_t ctx = vfs_context_current();
     vnode_t vp = NULL;
     int err = vnode_open(path, FREAD, 0, 0, &vp, ctx);
+    // /Library is firmlinked to the Data volume, so NV_XNU_FW_DIR is unreachable whenever this driver
+    // starts before that volume is mounted (loaded from the boot collection it starts a few seconds
+    // after the root volume mounts, and every image comes back ENOENT, which RM reports only as
+    // "RmFetchGspRmImages: No firmware image found"). /usr/share is on the system volume and is not
+    // firmlinked, so it is readable with only the root volume mounted. A fallback, not a move, so an
+    // installer that places firmware the existing way keeps working.
+    if (err) {
+        char alt[256];
+        snprintf(alt, sizeof alt, "%s%s", NV_XNU_FW_ALT_DIR, path + sizeof(NV_XNU_FW_DIR) - 1);
+        kprintf("NVRM-xnu:   vnode_open failed %d on %s, trying %s\n", err, path, alt);
+        err = vnode_open(alt, FREAD, 0, 0, &vp, ctx);
+        // `path` is deliberately not reassigned: nv_xnu_fw_expect() keys the expected size and sha1 off
+        // the canonical NV_XNU_FW_DIR path, so the integrity check still applies to the fallback image.
+    }
     if (err) { kprintf("NVRM-xnu:   vnode_open failed %d\n", err); return NULL; }
     struct vnode_attr va; VATTR_INIT(&va); VATTR_WANTED(&va, va_data_size);
     if (vnode_getattr(vp, &va, ctx) != 0) { kprintf("NVRM-xnu:   vnode_getattr failed\n"); vnode_close(vp, FREAD, ctx); return NULL; }
+    // The real blobs are a few MB. A 0-byte file gave RM a zero-length firmware, and anything from 2 GiB
+    // up made the (int) cast below negative; the file lives outside the kernel's control, so bound it here.
+    if (va.va_data_size == 0 || va.va_data_size > NV_XNU_FW_MAX_BYTES) {
+        kprintf("NVRM-xnu:   firmware %s is %llu bytes, refusing (limit %u)\n", path,
+                (unsigned long long)va.va_data_size, (unsigned)NV_XNU_FW_MAX_BYTES);
+        vnode_close(vp, FREAD, ctx); return NULL;
+    }
     size_t size = (size_t)va.va_data_size;
     void *buf = kern_os_malloc(size);
     if (!buf) { kprintf("NVRM-xnu:   no memory for %zu bytes\n", size); vnode_close(vp, FREAD, ctx); return NULL; }
@@ -1135,6 +1271,15 @@ const void *NV_API_CALL nv_get_firmware(nv_state_t *nv, nv_firmware_type_t fw_ty
     err = vn_rdwr(UIO_READ, vp, (caddr_t)buf, (int)size, 0, UIO_SYSSPACE, IO_NODELOCKED, vfs_context_ucred(ctx), &resid, vfs_context_proc(ctx));
     vnode_close(vp, FREAD, ctx);
     if (err || resid != 0) { kprintf("NVRM-xnu:   vn_rdwr err=%d resid=%d\n", err, resid); kern_os_free(buf); return NULL; }
+    {
+        const nv_xnu_fw_expected *e = nv_xnu_fw_expect(path);
+        if (e && (e->bytes != (NvU64)size || !nv_xnu_fw_digest_ok(e, buf, size))) {
+            kprintf("NVRM-xnu:   firmware %s is not the image this driver shipped (%llu bytes on disk, "
+                    "%llu expected) - refusing it; reinstall the driver\n", path,
+                    (unsigned long long)size, (unsigned long long)e->bytes);
+            kern_os_free(buf); return NULL;
+        }
+    }
     *fw_buf = buf; *fw_size = (NvU32)size;
     kprintf("NVRM-xnu:   firmware loaded: %zu bytes\n", size);
     return buf;
@@ -1153,17 +1298,139 @@ void NV_API_CALL os_wait_uninterruptible(os_wait_queue *wq) { TRC; IOLockLock(wq
 void NV_API_CALL os_wait_interruptible(os_wait_queue *wq)   { TRC; IOLockLock(wq->lock); IOLockSleep(wq->lock, wq, THREAD_INTERRUPTIBLE); IOLockUnlock(wq->lock); }
 void NV_API_CALL os_wake_up(os_wait_queue *wq)              { TRC; IOLockLock(wq->lock); IOLockWakeup(wq->lock, wq, false); IOLockUnlock(wq->lock); }
 
+// Each work item runs on its own thread. rm_power_management() flushes the queue before suspend/resume
+// (nv_kthread_q_flush on Linux), so count the items still running and let os_flush_work_queue() wait for them.
+static IOLock *nv_xnu_work_lock;
+static int nv_xnu_work_running;
+static bool nv_xnu_work_flushing;
+static IOLock *nv_xnu_work_lock_get(void)
+{
+    if (!nv_xnu_work_lock) {
+        IOLock *l = IOLockAlloc();
+        if (l && !OSCompareAndSwapPtr(NULL, l, (void * volatile *)&nv_xnu_work_lock)) IOLockFree(l);
+    }
+    return nv_xnu_work_lock;
+}
 static void nv_xnu_work_thread(void *item, wait_result_t)
 {
     kprintf("NVRM-xnu: work item %p running\n", item);
     rm_execute_work_item(NULL, item);
+    IOLockLock(nv_xnu_work_lock);
+    if (--nv_xnu_work_running == 0) IOLockWakeup(nv_xnu_work_lock, &nv_xnu_work_running, false);
+    IOLockUnlock(nv_xnu_work_lock);
     thread_terminate(current_thread());
 }
 NV_STATUS NV_API_CALL os_queue_work_item(struct os_work_queue *queue, void *item)
 {
     TRC; thread_t t;
-    if (kernel_thread_start(nv_xnu_work_thread, item, &t) != KERN_SUCCESS) return NV_ERR_NO_MEMORY;
+    if (!nv_xnu_work_lock_get()) return NV_ERR_NO_MEMORY;
+    IOLockLock(nv_xnu_work_lock); nv_xnu_work_running++; IOLockUnlock(nv_xnu_work_lock);
+    if (kernel_thread_start(nv_xnu_work_thread, item, &t) != KERN_SUCCESS) {
+        IOLockLock(nv_xnu_work_lock); nv_xnu_work_running--; IOLockUnlock(nv_xnu_work_lock);
+        return NV_ERR_NO_MEMORY;
+    }
     thread_deallocate(t); return NV_OK;
+}
+NV_STATUS NV_API_CALL os_flush_work_queue(struct os_work_queue *queue, NvBool is_unload)
+{
+    TRC;
+    if (!nv_xnu_work_lock) return NV_OK;
+    IOLockLock(nv_xnu_work_lock);
+    nv_xnu_work_flushing = true;
+    while (nv_xnu_work_running > 0) IOLockSleep(nv_xnu_work_lock, &nv_xnu_work_running, THREAD_UNINT);
+    nv_xnu_work_flushing = false;
+    IOLockUnlock(nv_xnu_work_lock);
+    return NV_OK;
+}
+NvBool NV_API_CALL os_is_queue_flush_ongoing(struct os_work_queue *queue) { return nv_xnu_work_flushing ? NV_TRUE : NV_FALSE; }
+
+// RM's "temporary file" (FBSR_TYPE_FILE). With PreserveVideoMemoryAllocations, rm_power_management(STANDBY) copies every
+// VRAM allocation out through a small pinned buffer and os_write_file, and RESUME reads it back with os_read_file - on
+// Linux into a file under NVreg_TemporaryFilePath. Here the "file" is kernel memory in 4 MB chunks: pageable first, so
+// the VM can compress it on a machine short of RAM (the reason Linux uses a file rather than one wired buffer); wired
+// when the pageable maps are full. RAM keeps power in S3, and no disk is touched while the system goes to sleep.
+#define NV_XNU_TMPF_CHUNK (4ull << 20)
+struct nv_xnu_tmpfile { void **chunk; bool *pageable; NvU64 cap, used, bytes, wired; };
+NV_STATUS NV_API_CALL os_allocate_temporary_file(void **ppFile, NvU64 size)
+{
+    TRC;
+    nv_xnu_tmpfile *f = (nv_xnu_tmpfile *)IOMallocZero(sizeof *f);
+    if (!f) return NV_ERR_NO_MEMORY;
+    *ppFile = f;
+    return NV_OK;
+}
+static NV_STATUS nv_xnu_tmpf_grow(nv_xnu_tmpfile *f, NvU64 need)
+{
+    if (need <= f->cap) return NV_OK;
+    NvU64 cap = f->cap ? f->cap : 64;
+    while (cap < need) cap *= 2;
+    void **chunk = (void **)IOMallocZero((vm_size_t)(cap * sizeof(void *)));
+    bool *pageable = (bool *)IOMallocZero((vm_size_t)(cap * sizeof(bool)));
+    if (!chunk || !pageable) {
+        if (chunk) IOFree(chunk, (vm_size_t)(cap * sizeof(void *)));
+        if (pageable) IOFree(pageable, (vm_size_t)(cap * sizeof(bool)));
+        return NV_ERR_NO_MEMORY;
+    }
+    for (NvU64 i = 0; i < f->cap; i++) { chunk[i] = f->chunk[i]; pageable[i] = f->pageable[i]; }
+    if (f->chunk) IOFree(f->chunk, (vm_size_t)(f->cap * sizeof(void *)));
+    if (f->pageable) IOFree(f->pageable, (vm_size_t)(f->cap * sizeof(bool)));
+    f->chunk = chunk; f->pageable = pageable; f->cap = cap;
+    return NV_OK;
+}
+NV_STATUS NV_API_CALL os_write_file(void *pFile, NvU8 *buf, NvU64 size, NvU64 offset)
+{
+    nv_xnu_tmpfile *f = (nv_xnu_tmpfile *)pFile;
+    if (!f || (!buf && size)) return NV_ERR_INVALID_ARGUMENT;
+    while (size) {
+        const NvU64 idx = offset / NV_XNU_TMPF_CHUNK, in = offset % NV_XNU_TMPF_CHUNK;
+        const NvU64 n = (size < NV_XNU_TMPF_CHUNK - in) ? size : NV_XNU_TMPF_CHUNK - in;
+        if (nv_xnu_tmpf_grow(f, idx + 1) != NV_OK) return NV_ERR_NO_MEMORY;
+        if (!f->chunk[idx]) {
+            void *c = IOMallocPageable((vm_size_t)NV_XNU_TMPF_CHUNK, PAGE_SIZE);
+            bool pg = c != NULL;
+            if (!c) { c = IOMallocAligned((vm_size_t)NV_XNU_TMPF_CHUNK, PAGE_SIZE); f->wired += c ? NV_XNU_TMPF_CHUNK : 0; }
+            if (!c) {
+                kprintf("NVRM-xnu: VRAM save file: no memory for chunk %llu (%llu MB stored)\n", idx, f->bytes >> 20);
+                return NV_ERR_NO_MEMORY;
+            }
+            f->chunk[idx] = c; f->pageable[idx] = pg;
+            if (idx + 1 > f->used) f->used = idx + 1;
+            f->bytes += NV_XNU_TMPF_CHUNK;
+        }
+        memcpy((NvU8 *)f->chunk[idx] + in, buf, (size_t)n);
+        buf += n; offset += n; size -= n;
+    }
+    return NV_OK;
+}
+NV_STATUS NV_API_CALL os_read_file(void *pFile, NvU8 *buf, NvU64 size, NvU64 offset)
+{
+    nv_xnu_tmpfile *f = (nv_xnu_tmpfile *)pFile;
+    if (!f || (!buf && size)) return NV_ERR_INVALID_ARGUMENT;
+    while (size) {
+        const NvU64 idx = offset / NV_XNU_TMPF_CHUNK, in = offset % NV_XNU_TMPF_CHUNK;
+        const NvU64 n = (size < NV_XNU_TMPF_CHUNK - in) ? size : NV_XNU_TMPF_CHUNK - in;
+        if (idx < f->cap && f->chunk[idx]) memcpy(buf, (const NvU8 *)f->chunk[idx] + in, (size_t)n);
+        else memset(buf, 0, (size_t)n);
+        buf += n; offset += n; size -= n;
+    }
+    return NV_OK;
+}
+void NV_API_CALL os_close_file(void *pFile)
+{
+    nv_xnu_tmpfile *f = (nv_xnu_tmpfile *)pFile;
+    if (!f) return;
+    kprintf("NVRM-xnu: VRAM save file closed: %llu MB held (%llu MB pageable, %llu MB wired)\n",
+            f->bytes >> 20, (f->bytes - f->wired) >> 20, f->wired >> 20);
+    IOLog("NVRM-xnu: VRAM save file closed: %llu MB held (%llu MB pageable, %llu MB wired)\n",
+          f->bytes >> 20, (f->bytes - f->wired) >> 20, f->wired >> 20);
+    for (NvU64 i = 0; i < f->used; i++) {
+        if (!f->chunk[i]) continue;
+        if (f->pageable[i]) IOFreePageable(f->chunk[i], (vm_size_t)NV_XNU_TMPF_CHUNK);
+        else IOFreeAligned(f->chunk[i], (vm_size_t)NV_XNU_TMPF_CHUNK);
+    }
+    if (f->chunk) IOFree(f->chunk, (vm_size_t)(f->cap * sizeof(void *)));
+    if (f->pageable) IOFree(f->pageable, (vm_size_t)(f->cap * sizeof(bool)));
+    IOFree(f, sizeof *f);
 }
 NV_STATUS NV_API_CALL os_schedule(void) { IOSleep(1); return NV_OK; }
 
@@ -1175,8 +1442,152 @@ void  NV_API_CALL os_delete_record_for_crashLog(void *p) { TRC; }
 void  NV_API_CALL nv_get_disp_smmu_stream_ids(nv_state_t *nv, NvU32 *a, NvU32 *b) { TRC; if (a) *a = 0; if (b) *b = 0; }
 void  NV_API_CALL nv_acpi_methods_init(NvU32 *handlesPresent) { TRC; if (handlesPresent) *handlesPresent = 0; }
 void  NV_API_CALL nv_acpi_methods_uninit(void) { TRC; }
-NV_STATUS NV_API_CALL nv_acpi_dod_method(nv_state_t *nv, NvU32 *a, NvU32 *b) { TRC; return NV_ERR_NOT_SUPPORTED; }
-NV_STATUS NV_API_CALL nv_acpi_dsm_method(nv_state_t *nv, NvU8 *guid, NvU32 a, NvBool b, NvU32 c, void *d, NvU16 e, NvU32 *f, void *g, NvU16 *h) { TRC; return NV_ERR_NOT_SUPPORTED; }
+
+// Laptop panel backlight. RM only finds an internal panel's backlight when it can read the panel's
+// backlight tables from the firmware: the NBCI _DSM functions GETOBJBYTYPE (0x10) and GETBACKLIGHT
+// (0x14), plus the display ACPI ids from _DOD. Without them NV0073_CTRL_CMD_SPECIFIC_GET_BACKLIGHT_BRIGHTNESS
+// fails with NV_ERR_NOT_SUPPORTED and NVKMS never calls nvkms_register_backlight().
+// Both are evaluated on the GPU's ACPI node, as kernel-open/nvidia/nv-acpi.c does. Only NBCI is answered:
+// RM asks each _DSM GUID for its functions separately (_acpiDsmSupportedFuncCacheInit), so every other
+// GUID (NVHG, MXM, NVOP, GPS, JT, NVPCF...) stays "not supported", as before.
+extern "C" {
+#include "nbci.h"
+}
+#define NV_XNU_MAX_ACPI_DSM_PARAM_SIZE 1024                                                  // NV_MAX_ACPI_DSM_PARAM_SIZE (nv-linux.h)
+static const NvU8 nv_xnu_nbci_guid[16] = { 0x75, 0x0B, 0xA5, 0xD4, 0xC7, 0x65, 0xF7, 0x46,      // NBCI_DSM_GUID_STR
+                                           0xBF, 0xB7, 0x41, 0x51, 0x4C, 0xEA, 0x02, 0x44 };    // (acpidsmguids.h)
+
+// The GPU's ACPI node: AppleACPIPCI puts its IOACPIPlane path on the PCI device as "acpi-path".
+// Cached per GPU (PCI address), kept retained for the life of the kext: a PC with two NVIDIA cards must ask each
+// card's own ACPI node, never the first one found.
+static struct { NvU32 domain; NvU8 bus, slot, function; IOACPIPlatformDevice *acpi; } nv_xnu_acpi_nodes[8];
+static IOACPIPlatformDevice *nv_xnu_gpu_acpi(nv_state_t *nv)
+{
+    if (!nv) return NULL;
+    const nv_pci_info_t *pi = &nv->pci_info;
+    for (auto &n : nv_xnu_acpi_nodes)
+        if (n.acpi && n.domain == pi->domain && n.bus == pi->bus && n.slot == pi->slot && n.function == pi->function)
+            return n.acpi;
+    nv_xnu_pci_slot *s = (nv_xnu_pci_slot *)os_pci_init_handle(pi->domain, pi->bus, pi->slot, pi->function, NULL, NULL);
+    OSString *path = s ? OSDynamicCast(OSString, s->pci->getProperty("acpi-path")) : NULL;
+    IORegistryEntry *e = path ? IORegistryEntry::fromPath(path->getCStringNoCopy()) : NULL;
+    IOACPIPlatformDevice *acpi = OSDynamicCast(IOACPIPlatformDevice, e);
+    if (!acpi) { OSSafeReleaseNULL(e); return NULL; }
+    for (auto &n : nv_xnu_acpi_nodes)
+        if (!n.acpi && OSCompareAndSwapPtr(NULL, acpi, (void * volatile *)&n.acpi)) {
+            n.domain = pi->domain; n.bus = pi->bus; n.slot = pi->slot; n.function = pi->function;
+            kprintf("NVRM-xnu: GPU %02x:%02x.%x ACPI node %s\n", pi->bus, pi->slot, pi->function, path->getCStringNoCopy());
+            return acpi;
+        }
+    acpi->release();   // table full: answer this call, keep nothing
+    return NULL;
+}
+
+// nv_acpi_extract_object (nv-acpi.c): integers, buffers and packages of them, flattened into one buffer.
+static NV_STATUS nv_xnu_acpi_extract(OSObject *o, NvU8 *buf, NvU32 cap, NvU32 *size)
+{
+    *size = 0;
+    if (!o) return NV_OK;
+    if (OSNumber *n = OSDynamicCast(OSNumber, o)) {
+        NvU64 v = n->unsigned64BitValue(); NvU32 len = (v >> 32) ? 8 : 4;
+        *size = len; if (cap < len) return NV_ERR_BUFFER_TOO_SMALL;
+        memcpy(buf, &v, len); return NV_OK;
+    }
+    if (OSData *d = OSDynamicCast(OSData, o)) {
+        *size = d->getLength(); if (cap < d->getLength()) return NV_ERR_BUFFER_TOO_SMALL;
+        if (d->getLength()) memcpy(buf, d->getBytesNoCopy(), d->getLength());
+        return NV_OK;
+    }
+    if (OSArray *a = OSDynamicCast(OSArray, o)) {
+        NvU32 used = 0;
+        for (unsigned i = 0; i < a->getCount(); i++) {
+            NvU32 len = 0; NV_STATUS st = nv_xnu_acpi_extract(a->getObject(i), buf + used, cap - used, &len);
+            if (st != NV_OK) { *size = used; return st; }
+            used += len;
+        }
+        *size = used; return NV_OK;
+    }
+    return NV_ERR_NOT_SUPPORTED;
+}
+
+// Opt-in (boot-arg nvrmacpibl=1). 1.14 ran these for every GPU and PCs stopped booting right after the GPU's _DSM
+// call (10-12: RTX 2060 desktop, RTX 4060 laptop - the last line on screen is macOS ACPI warning that argument 4
+// is a Buffer where ACPI wants a Package). On desktops that _DSM is not the backlight table, and on laptops the
+// same method often switches GPU power; calling it while RM brings the GPU up hung the start. Off, RM gets
+// "not supported" as in 1.13; on, the laptop backlight works for the panels it was written for.
+static bool nv_xnu_acpi_backlight_on(void)
+{
+    static int on = -1;
+    if (on < 0) { int v = 0; on = (PE_parse_boot_argn("nvrmacpibl", &v, sizeof(v)) && v) ? 1 : 0; }
+    return on == 1;
+}
+
+NV_STATUS NV_API_CALL nv_acpi_dod_method(nv_state_t *nv, NvU32 *pOutData, NvU32 *pSize)
+{
+    TRC;
+    if (!nv_xnu_acpi_backlight_on()) return NV_ERR_NOT_SUPPORTED;
+    IOACPIPlatformDevice *acpi = nv_xnu_gpu_acpi(nv);
+    if (!acpi || !pOutData || !pSize) return NV_ERR_INVALID_ARGUMENT;
+    NvU32 count = *pSize / sizeof(NvU32);
+    OSObject *o = NULL;
+    if (acpi->evaluateObject("_DOD", &o) != kIOReturnSuccess) { OSSafeReleaseNULL(o); return NV_ERR_GENERIC; }
+    OSArray *dod = OSDynamicCast(OSArray, o);
+    NV_STATUS st = NV_ERR_GENERIC;
+    if (dod && dod->getCount() <= count) {
+        st = NV_OK; *pSize = 0;
+        for (unsigned i = 0; i < dod->getCount(); i++) {
+            OSNumber *n = OSDynamicCast(OSNumber, dod->getObject(i));
+            if (!n) { st = NV_ERR_GENERIC; break; }
+            pOutData[i] = n->unsigned32BitValue(); *pSize += sizeof(NvU32);
+        }
+    }
+    kprintf("NVRM-xnu: _DOD -> 0x%x, %u display id(s)\n", st, dod ? dod->getCount() : 0);
+    OSSafeReleaseNULL(o);
+    return st;
+}
+
+NV_STATUS NV_API_CALL nv_acpi_dsm_method(nv_state_t *nv, NvU8 *pAcpiDsmGuid, NvU32 acpiDsmRev, NvBool acpiNvpcfDsmFunction,
+                                         NvU32 acpiDsmSubFunction, void *pInParams, NvU16 inParamSize, NvU32 *outStatus,
+                                         void *pOutData, NvU16 *pSize)
+{
+    TRC;
+    if (!nv_xnu_acpi_backlight_on()) return NV_ERR_NOT_SUPPORTED;
+    if (!pAcpiDsmGuid || !pInParams || inParamSize > NV_XNU_MAX_ACPI_DSM_PARAM_SIZE || !pOutData || !pSize)
+        return NV_ERR_INVALID_ARGUMENT;
+    if (acpiNvpcfDsmFunction || memcmp(pAcpiDsmGuid, nv_xnu_nbci_guid, sizeof nv_xnu_nbci_guid) != 0 ||
+        (acpiDsmSubFunction != 0 /* NV_ACPI_ALL_FUNC_SUPPORT */ && acpiDsmSubFunction != NV_NBCI_FUNC_GETOBJBYTYPE &&
+         acpiDsmSubFunction != NV_NBCI_FUNC_GETBACKLIGHT))
+        return NV_ERR_NOT_SUPPORTED;
+    IOACPIPlatformDevice *acpi = nv_xnu_gpu_acpi(nv);
+    if (!acpi) return NV_ERR_NOT_SUPPORTED;
+
+    OSObject *args[4] = { OSData::withBytes(pAcpiDsmGuid, 16), OSNumber::withNumber(acpiDsmRev, 32),
+                          OSNumber::withNumber(acpiDsmSubFunction, 32),
+                          inParamSize ? OSData::withBytes(pInParams, inParamSize) : OSData::withCapacity(1) };
+    OSObject *o = NULL;
+    IOReturn r = (args[0] && args[1] && args[2] && args[3]) ? acpi->evaluateObject("_DSM", &o, args, 4) : kIOReturnNoMemory;
+    for (OSObject *a : args) OSSafeReleaseNULL(a);
+    NV_STATUS st = NV_ERR_OPERATING_SYSTEM;
+    if (r == kIOReturnSuccess) {
+        NvU32 len = 0;
+        st = nv_xnu_acpi_extract(o, (NvU8 *)pOutData, *pSize, &len);
+        *pSize = (NvU16)len;
+    }
+    OSSafeReleaseNULL(o);
+    // One line per subfunction, every GETBACKLIGHT call. A flat cap of 8 lines was spent by the support query and
+    // the GETOBJBYTYPE fetches at GPU start, so a laptop log never showed whether the backlight table was asked for.
+    // For the support query the first word is the firmware's subfunction bitmask (bit 0x14 = GETBACKLIGHT).
+    static NvU32 loggedMask;
+    const NvU32 bit = 1u << (acpiDsmSubFunction & 31);
+    if (acpiDsmSubFunction == NV_NBCI_FUNC_GETBACKLIGHT || !(loggedMask & bit)) {
+        loggedMask |= bit;
+        NvU32 word = 0;
+        if (st == NV_OK && *pSize >= sizeof(word)) memcpy(&word, pOutData, sizeof(word));
+        kprintf("NVRM-xnu: NBCI _DSM 0x%x -> 0x%x (%u B%s0x%x)\n", acpiDsmSubFunction, st, (unsigned)*pSize,
+                acpiDsmSubFunction == NV_NBCI_FUNC_GETBACKLIGHT ? ", backlight table, first word " : ", first word ", word);
+    }
+    return st;
+}
 void  NV_API_CALL nv_get_screen_info(nv_state_t *nv, NvU64 *pa, NvU32 *w, NvU32 *h, NvU32 *depth, NvU32 *pitch, NvU64 *size)
 {
     TRC;
@@ -1232,12 +1643,14 @@ void NV_API_CALL nv_destroy_nano_timer(nv_state_t *nv, nv_nano_timer_t *t)
 }
 
 extern "C" nv_file_private_t *nv_xnu_lookup_fd(NvS32 fd, void **priv, NvBool *isCtl);
-extern "C" nv_alloc_mapping_context_t *nv_xnu_mmap_context(void *priv);
-nv_file_private_t *NV_API_CALL nv_get_file_private(NvS32 fd, NvBool ctl, void **os_private)
+extern "C" void nv_xnu_put_client(void *priv);
+extern "C" void nv_xnu_note_map_len(NvU64 bytes);
+// NVIDIA 620 dropped the control/device argument: every caller now checks it with nv_verify_nvfp_control_or_put
+// (nv.h), which asks nv_get_state_ptr_from_nvfp and drops the reference on a mismatch.
+nv_file_private_t *NV_API_CALL nv_get_file_private(NvS32 fd, void **os_private)
 {
     TRC; NvBool isCtl = NV_FALSE; nv_file_private_t *fp = nv_xnu_lookup_fd(fd, os_private, &isCtl);
     if (!fp) { kprintf("NVRM-xnu: nv_get_file_private(fd %d) -> none\n", fd); return NULL; }
-    if (!!isCtl != !!ctl) { kprintf("NVRM-xnu: nv_get_file_private(fd %d): wanted %s, is %s\n", fd, ctl ? "ctl" : "device", isCtl ? "ctl" : "device"); return NULL; }
     return fp;
 }
 extern "C" IOMemoryDescriptor *nv_xnu_alloc_md(void *priv, NvU64 *bytes, NvU32 *cache)
@@ -1259,6 +1672,11 @@ NV_STATUS NV_API_CALL nv_alloc_user_mapping(nv_state_t *nv, void *pAllocPrivate,
     addr64_t phys = a->md->getPhysicalSegment((IOByteCount)(pageIndex * PAGE_SIZE), &len, kIOMemoryMapperNone);
     if (!phys) return NV_ERR_GENERIC;
     *pUserAddress = (NvU64)phys + pageOffset; if (ppPrivate) *ppPrivate = NULL;
+    // The bytes RM validated for this user mapping, from page_index's first byte; the map path clamps to them.
+    // An overflowing sum reports 0, which the map path refuses.
+    NvU64 validated = 0;
+    if (!__builtin_add_overflow((NvU64)pageOffset, size, &validated)) nv_xnu_note_map_len(validated);
+    else nv_xnu_note_map_len(0);
     return NV_OK;
 }
 void NV_API_CALL nv_free_user_mapping(nv_state_t *nv, void *pAllocPrivate, NvU64 userAddress, void *pPrivate) { TRC; }
@@ -1273,31 +1691,30 @@ NV_STATUS NV_API_CALL os_match_mmap_offset(void *pAllocPrivate, NvU64 offset, Nv
     kprintf("NVRM-xnu: os_match_mmap_offset: 0x%llx not in a %u-page alloc\n", offset, a->page_count);
     return NV_ERR_OBJECT_NOT_FOUND;
 }
-NV_STATUS NV_API_CALL nv_add_mapping_context_to_file(nv_state_t *nv, nv_usermap_access_params_t *nvuap, NvU32 prot, void *pAllocPriv, NvU64 pageIndex, NvU32 fd)
-{
-    TRC; void *priv = NULL;
-    nv_file_private_t *nvfp = nv_get_file_private((NvS32)fd, NV_IS_CTL_DEVICE(nv), &priv);
-    if (!nvfp) return NV_ERR_INVALID_ARGUMENT;
-    nv_alloc_mapping_context_t *c = nv_xnu_mmap_context(priv);
-    if (!c) return NV_ERR_INVALID_ARGUMENT;
-    if (c->valid) return NV_ERR_STATE_IN_USE;
-    nvx2_memset(c, 0, sizeof *c);
-    if (NV_IS_CTL_DEVICE(nv)) { c->alloc = pAllocPriv; c->page_index = pageIndex; }
-    else {
-        NvU64 n = nvuap->memArea.numRanges;
-        if (n == 0 || n > 4096) return NV_ERR_INVALID_ARGUMENT;
-        c->memArea.pRanges = (MemoryRange *)kern_os_malloc((size_t)(sizeof(MemoryRange) * n));
-        if (!c->memArea.pRanges) return NV_ERR_NO_MEMORY;
-        nvx2_memcpy(c->memArea.pRanges, nvuap->memArea.pRanges, (size_t)(sizeof(MemoryRange) * n));
-        c->memArea.numRanges = n;
-    }
-    c->access_start = nvuap->access_start; c->access_size = nvuap->access_size;
-    c->prot = prot; c->caching = nvuap->caching; c->valid = NV_TRUE;
-    if (nv_xnu_chat()) kprintf("NVRM-xnu: mapping context on fd %u: %s page_index=%llu ranges=%llu access=0x%llx+0x%llx caching=%u prot=0x%x\n",
-            fd, NV_IS_CTL_DEVICE(nv) ? "sysmem" : "device", pageIndex, c->memArea.numRanges, c->access_start, c->access_size, c->caching, prot);
-    return NV_OK;
-}
-void NV_API_CALL nv_put_file_private(void *os_private) { TRC; }
+void NV_API_CALL nv_put_file_private(void *os_private) { TRC; nv_xnu_put_client(os_private); }
+
+// ---- NVIDIA 620 OS-interface additions RM calls ---------------------------------------------------------------------
+// TDISP (trusted device DMA for confidential computing) is never enabled here; Linux sets this only when the kernel
+// and platform support it. RM reads it as data.
+extern "C" NvBool os_tdisp_enabled;
+NvBool os_tdisp_enabled = NV_FALSE;
+// Mapping reference on an allocation (os.c osMapSystemMemory / osUnmapSystemMemory). Linux counts it so nv_free_pages
+// can tell a still-mapped allocation; here a user mapping holds a retained IOMemoryDescriptor of the allocation's pages
+// (nv_xnu_alloc_md), which already keeps them alive, so the count is kept for the leak report and nothing waits on it.
+static volatile SInt64 nv_xnu_user_map_refs = 0;
+void NV_API_CALL nv_inc_alloc_refcount(void *pAllocPrivate) { TRC; if (pAllocPrivate) OSIncrementAtomic64(&nv_xnu_user_map_refs); }
+void NV_API_CALL nv_dec_alloc_refcount(nv_state_t *nv, void *pAllocPrivate) { TRC; if (pAllocPrivate) OSDecrementAtomic64(&nv_xnu_user_map_refs); }
+// Peer-to-peer resource mapping through dma_map_resource has no macOS counterpart; RM falls back when this is false.
+NvBool NV_API_CALL nv_dma_is_map_resource_usable(nv_dma_device_t *dma_dev) { TRC; return NV_FALSE; }
+// A memory carve-out is an SoC (Tegra) concept; discrete GPUs have none.
+NV_STATUS NV_API_CALL nv_get_carveout_info(NvU64 *base, NvU64 *size) { TRC; return NV_ERR_NOT_SUPPORTED; }
+// Linux ftrace tracepoint for GPU operations; nothing listens on macOS.
+NV_STATUS NV_API_CALL nv_emit_tracepoint_gpu_op_event(nv_state_t *nv, const nv_gpu_op_event_t *op_event) { TRC; return NV_OK; }
+// Device-certificate reads serve SPDM attestation for confidential computing, which this driver does not enable.
+NV_STATUS NV_API_CALL os_read_device_certificate(void *nv_state, NvU8 *pBuffer, NvU32 *pBufferSize) { TRC; return NV_ERR_NOT_SUPPORTED; }
+NV_STATUS NV_API_CALL os_read_device_cert_digests(void *nv_state, const NvU8 *pCertChain, NvU32 certChainSize,
+                                                  NvU8 *pTsmDigest, NvU8 *pLocalDigest, NvU32 *pDigestSize)
+{ TRC; return NV_ERR_NOT_SUPPORTED; }
 NvBool NV_API_CALL nv_is_gpu_accessible(nv_state_t *nv) { TRC; return NV_TRUE; }
 static nv_state_t nv_xnu_ctl_state;
 nv_state_t *NV_API_CALL nv_get_ctl_state(void)

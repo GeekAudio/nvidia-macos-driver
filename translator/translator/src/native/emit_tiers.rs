@@ -92,6 +92,7 @@ fn emit_vulkan_spirv_inner(
     let mut source = san_ll;
     let mut spliced_calls = 0usize;
     let mut first_failure = None;
+    let mut inlined_all = false;
     for _ in 0..MAX_CURSOR_CALL_SPLICES {
         let failure = match emit_lowered_air_text(
             &source,
@@ -104,7 +105,13 @@ fn emit_vulkan_spirv_inner(
             Ok(emitted) => return Ok(emitted),
             Err(failure) => failure,
         };
-        let Some(spliced) = (if failure.rejected.cursor_call_sites.is_empty() {
+        let whole_inline = failure.rejected.cursor_call_sites.is_empty()
+            && !inlined_all
+            && failure.error.contains("an unmodeled pointer placeholder");
+        let Some(spliced) = (if whole_inline {
+            inlined_all = true;
+            inline::inline_all_internal_calls(&source)
+        } else if failure.rejected.cursor_call_sites.is_empty() {
             None
         } else {
             inline::inline_cursor_call_sites(&source, &failure.rejected.cursor_call_sites)
@@ -120,7 +127,7 @@ fn emit_vulkan_spirv_inner(
                 },
             });
         };
-        spliced_calls += failure.rejected.cursor_call_sites.len();
+        spliced_calls += failure.rejected.cursor_call_sites.len().max(usize::from(whole_inline));
         first_failure.get_or_insert(failure.error);
         if retry_debug {
             eprintln!(
@@ -160,7 +167,7 @@ fn emit_lowered_air_text(
         );
     }
     let raw_layout_params = if requires_device_addresses {
-        HashSet::new()
+        HashSet::default()
     } else {
         parsed
             .functions
@@ -235,9 +242,9 @@ fn pointer_parameter_roots(function: &ir::LlFunction, value: &str) -> HashSet<us
         .filter(|(_, (_, ty))| matches!(ty, LlType::Ptr(1)))
         .map(|(index, (name, _))| (name.as_str(), index))
         .collect::<HashMap<_, _>>();
-    let mut roots = HashSet::new();
+    let mut roots = HashSet::default();
     let mut pending = vec![value.to_string()];
-    let mut seen = HashSet::new();
+    let mut seen = HashSet::default();
     while let Some(name) = pending.pop() {
         if !seen.insert(name.clone()) {
             continue;
@@ -338,7 +345,7 @@ pub(super) fn requires_device_address_model(parsed: &LlModule) -> bool {
                 continue;
             };
             let mut root = argument;
-            let mut seen = HashSet::new();
+            let mut seen = HashSet::default();
             while seen.insert(root.clone()) {
                 let Some(base) = aliases.get(root) else {
                     break;
@@ -367,7 +374,7 @@ pub(super) fn requires_device_address_model(parsed: &LlModule) -> bool {
         }
     }
 
-    let mut address_consuming_params = HashSet::<(String, usize)>::new();
+    let mut address_consuming_params = HashSet::<(String, usize)>::default();
     for function in &parsed.functions {
         for (index, (param, ty)) in function.params.iter().enumerate() {
             if !matches!(ty, LlType::Ptr(1)) {
@@ -428,7 +435,7 @@ pub(super) fn requires_device_address_model(parsed: &LlModule) -> bool {
         }
     }
 
-    let mut atomic_consuming_params = HashSet::<(String, usize)>::new();
+    let mut atomic_consuming_params = HashSet::<(String, usize)>::default();
     for function in &parsed.functions {
         for inst in function.carrier_insts() {
             let Some(call) = inst.call().as_deref() else {
@@ -762,8 +769,8 @@ pub fn emit_vulkan_spirv_all_buffers_raw(san_ll: &str) -> Result<Vec<u8>, String
         kern.as_ref(),
         entry_name.as_deref(),
         kern.as_ref().map(|meta| &meta.buffer_layouts),
-        &HashSet::new(),
-        &HashSet::new(),
+        &HashSet::default(),
+        &HashSet::default(),
     )?
     .into_bytes())
 }
@@ -797,8 +804,8 @@ pub fn emit_vulkan_spirv_all_buffers_raw_with_workgroup(san_ll: &str) -> Result<
         kern.as_ref(),
         entry_name.as_deref(),
         kern.as_ref().map(|meta| &meta.buffer_layouts),
-        &HashSet::new(),
-        &HashSet::new(),
+        &HashSet::default(),
+        &HashSet::default(),
     )?
     .into_bytes())
 }
@@ -863,8 +870,8 @@ pub fn emit_vulkan_spirv_all_buffers_raw_bda(san_ll: &str) -> Result<Vec<u8>, St
         kern.as_ref(),
         entry_name.as_deref(),
         kern.as_ref().map(|meta| &meta.buffer_layouts),
-        &HashSet::new(),
-        &HashSet::new(),
+        &HashSet::default(),
+        &HashSet::default(),
     )?
     .into_bytes())
 }

@@ -1,16 +1,16 @@
 # NVIDIA card support and validation
 
-The driver uses NVIDIA's r610 open RM, HAL, and GSP stack. That stack targets Turing and later
+The driver uses NVIDIA's r620 open RM, HAL, and GSP stack. That stack targets Turing and later
 ([upstream compatibility](https://github.com/NVIDIA/open-gpu-kernel-modules#compatible-gpus)).
-The installer carries 235 distinct display-card PCI device IDs from NVIDIA's 610.57.04 table in
-[`nvidia_gsp_ids.json`](../app/Resources/nvidia_gsp_ids.json). The kernel matches NVIDIA display
+The installer carries 249 distinct display-card PCI device IDs from NVIDIA's 620.70.06 table (`SUPPORTED_IDS` in
+[`package/install.sh`](../package/install.sh)). The kernel matches NVIDIA display
 and 3D-controller PCI classes, then asks NVIDIA's own supported-device gates to accept the card.
-A device-table match does not establish that a particular laptop's display routing, firmware,
-BAR placement, or macOS installation works.
+A card being in the table doesn't mean a given laptop works: its display wiring, firmware and BAR
+setup still have to cooperate.
 
 | Family | Examples covered by the device table | Physical validation in this release |
 | --- | --- | --- |
-| Turing | GTX 1650/1660, RTX 20, TITAN RTX, Quadro T1000/RTX | Pending |
+| Turing | GTX 1650/1660, RTX 20, TITAN RTX, Quadro T1000/T2000/RTX, NVIDIA T400/T600/T1000, T500/T550/T600/T1200 laptop | Pending |
 | Ampere | RTX 30, RTX A workstation and laptop cards | Pending |
 | Ada | RTX 40, supported RTX workstation and laptop cards | Pending |
 | Blackwell | RTX 50 and supported RTX PRO cards | RTX 5060 automated; RTX 5070/5080 reported working |
@@ -30,8 +30,8 @@ bring-up 40 seconds. The actual settling delay is exposed as `nvrm-autogo-settle
 An RTX 5060 passed a guarded boot with a deliberately forced 100-second settling delay, then
 passed a second boot with the production 500 ms delay. Both runs armed the display, loaded all
 four kexts, and kept WindowServer stable for 60 seconds without a new desktop/kernel crash.
-This reproduces and validates the timing mechanism; it does not establish physical small-BAR
-operation on another card. The existing ReBAR setup remains the validated configuration.
+That shows the timing fix works, but it was not a physical small-BAR card. Resizable BAR on
+is still the tested setup.
 
 ## Desktop presentation
 
@@ -45,6 +45,13 @@ A CPU regression executes the actual method with mocked command buffers, checks 
 paths and error propagation, and proves the previous submission-only method fails the desktop
 ordering test. The physical desktop acceptance also requires page flipping and 60 seconds of
 stable WindowServer operation with no flip-latch timeouts or new desktop/kernel crashes.
+
+When a card still flashes under cursor movement with that ordering in place, `-nvrmnoflip` keeps
+the composited frame on the copy path: NVRM never sets `debug.nvaccel_iop_flip`, so the display
+reads a finished copy instead of the surface the GPU may still be writing. It costs one copy per
+frame and is the supported way to trade that for a stable picture. NVRM turns zero-copy scan-out
+on about 60 seconds after it releases the boot hold (`NVRM::autoGo`), which is why a desktop that
+flashes may look clean for the first minute and then start.
 
 ## Shader target selection
 
@@ -80,5 +87,6 @@ successful device-table lookup cannot prove a card initialized correctly.
 ## Regressions
 
 Run `python3 tools/test_card_support.py` on macOS with command line developer tools. The tests
+check that both installers' `SUPPORTED_IDS` and this page's count match `nvidia_gsp_ids.json`, then
 compile production snippets for startup timing, chip selection, release error classification,
 desktop completion ordering, and upload ordering. They require neither GPU access nor a driver installation.

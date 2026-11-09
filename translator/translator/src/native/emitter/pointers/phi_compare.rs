@@ -187,7 +187,7 @@ impl Emitter {
         let result_type = self.pointer_aware_type_id(&result_ty, pointer_meta.as_ref())?;
         let result = self.result_id(&name, &result_ty)?;
         let mut ops = Vec::new();
-        let mut seen_incoming: HashMap<Word, Word> = HashMap::new();
+        let mut seen_incoming: HashMap<Word, Word> = HashMap::default();
         for (value, label) in incoming {
             let mut edge_instructions = Vec::new();
             let value_id = if let Some(meta) = pointer_meta.as_ref() {
@@ -229,7 +229,7 @@ impl Emitter {
 
     fn forwarded_pointer_value(&self, value: &LlValue) -> LlValue {
         let mut value = value.clone();
-        let mut visited = HashSet::new();
+        let mut visited = HashSet::default();
         while let LlValue::Local(name) = &value {
             if !visited.insert(name.clone()) {
                 break;
@@ -276,7 +276,7 @@ impl Emitter {
                         &selected,
                         &pointee,
                         &[],
-                        &mut HashSet::new(),
+                        &mut HashSet::default(),
                         instructions,
                     )?
                 } else {
@@ -600,6 +600,70 @@ impl Emitter {
         Ok(())
     }
 
+    /// `fcmp ord a, b` is "neither operand is NaN"; `fcmp uno` is "either is NaN". Both are built
+    /// from OpIsNan on each operand (lane-wise for vectors), since Vulkan has no OpOrdered/OpUnordered.
+    pub(in crate::native::emitter) fn emit_fcmp_ordering_resolved(
+        &mut self,
+        ordered: bool,
+        lhs: TypedValue,
+        rhs: TypedValue,
+        name: String,
+        instructions: &mut Vec<Instruction>,
+    ) -> Result<(), String> {
+        let operand_ty = self.resolve_type(&lhs.ty)?;
+        let rhs_ty = self.resolve_type(&rhs.ty)?;
+        if operand_ty != rhs_ty {
+            return Err(format!(
+                "native emitter: fcmp operand type mismatch {operand_ty:?} vs {rhs_ty:?}"
+            ));
+        }
+        if bfloat_lanes(&operand_ty).is_some() {
+            return Err("native emitter: fcmp ord/uno on bfloat operands is unsupported".into());
+        }
+        let result_ty = float_compare_result_type(&operand_ty)?;
+        let result_type = self.type_id(&result_ty)?;
+        let result = self.result_id(&name, &result_ty)?;
+        let lhs_id = self.value_id_in(&lhs.value, &lhs.ty, instructions)?;
+        let rhs_id = self.value_id_in(&rhs.value, &rhs.ty, instructions)?;
+        let lhs_nan = self.fresh();
+        instructions.push(Self::inst(
+            Op::IsNan,
+            Some(result_type),
+            Some(lhs_nan),
+            vec![Operand::IdRef(lhs_id)],
+        ));
+        let rhs_nan = self.fresh();
+        instructions.push(Self::inst(
+            Op::IsNan,
+            Some(result_type),
+            Some(rhs_nan),
+            vec![Operand::IdRef(rhs_id)],
+        ));
+        if ordered {
+            let any_nan = self.fresh();
+            instructions.push(Self::inst(
+                Op::LogicalOr,
+                Some(result_type),
+                Some(any_nan),
+                vec![Operand::IdRef(lhs_nan), Operand::IdRef(rhs_nan)],
+            ));
+            instructions.push(Self::inst(
+                Op::LogicalNot,
+                Some(result_type),
+                Some(result),
+                vec![Operand::IdRef(any_nan)],
+            ));
+        } else {
+            instructions.push(Self::inst(
+                Op::LogicalOr,
+                Some(result_type),
+                Some(result),
+                vec![Operand::IdRef(lhs_nan), Operand::IdRef(rhs_nan)],
+            ));
+        }
+        Ok(())
+    }
+
     pub(in crate::native::emitter) fn emit_icmp_ptr_resolved(
         &mut self,
         pred: Op,
@@ -742,6 +806,14 @@ impl Emitter {
         name: String,
         instructions: &mut Vec<Instruction>,
     ) -> Result<(), String> {
+        let is_bool = match &operand_ty {
+            LlType::Bool => true,
+            LlType::Vector(elem, _) => matches!(elem.as_ref(), LlType::Bool),
+            _ => false,
+        };
+        if is_bool {
+            return self.emit_icmp_bool(pred, lhs, rhs, operand_ty, name, instructions);
+        }
         let result_ty = int_compare_result_type(&operand_ty)?;
         let result_type = self.type_id(&result_ty)?;
         let result = self.result_id(&name, &result_ty)?;
@@ -752,6 +824,69 @@ impl Emitter {
             Some(result_type),
             Some(result),
             vec![Operand::IdRef(lhs_id), Operand::IdRef(rhs_id)],
+        ));
+        Ok(())
+    }
+
+    /// `icmp` on `i1` or `<N x i1>` (Apple's GL compiler emits it for GLSL `bvec` equality, e.g. in WebRender's
+    /// fragment shaders). SPIR-V has no integer compare on booleans, so equality maps to OpLogical(Not)Equal and the
+    /// ordered predicates to their boolean truth tables (i1 is unsigned 0/1, or signed 0/-1).
+    fn emit_icmp_bool(
+        &mut self,
+        pred: Op,
+        lhs: TypedValue,
+        rhs: TypedValue,
+        operand_ty: LlType,
+        name: String,
+        instructions: &mut Vec<Instruction>,
+    ) -> Result<(), String> {
+        let result_type = self.type_id(&operand_ty)?;
+        let result = self.result_id(&name, &operand_ty)?;
+        let lhs_id = self.value_id_in(&lhs.value, &lhs.ty, instructions)?;
+        let rhs_id = self.value_id_in(&rhs.value, &rhs.ty, instructions)?;
+        let direct = match pred {
+            Op::IEqual => Some(Op::LogicalEqual),
+            Op::INotEqual => Some(Op::LogicalNotEqual),
+            _ => None,
+        };
+        if let Some(op) = direct {
+            instructions.push(Self::inst(
+                op,
+                Some(result_type),
+                Some(result),
+                vec![Operand::IdRef(lhs_id), Operand::IdRef(rhs_id)],
+            ));
+            return Ok(());
+        }
+        // (negate lhs, negate rhs, combine): unsigned 1 > 0, signed -1 < 0
+        let (neg_lhs, neg_rhs, combine) = match pred {
+            Op::UGreaterThan | Op::SLessThan => (false, true, Op::LogicalAnd),
+            Op::UGreaterThanEqual | Op::SLessThanEqual => (false, true, Op::LogicalOr),
+            Op::ULessThan | Op::SGreaterThan => (true, false, Op::LogicalAnd),
+            Op::ULessThanEqual | Op::SGreaterThanEqual => (true, false, Op::LogicalOr),
+            other => {
+                return Err(format!(
+                    "native emitter: icmp predicate {other:?} on booleans is not carried"
+                ))
+            }
+        };
+        let not = |emitter: &mut Self, id, instructions: &mut Vec<Instruction>| {
+            let out = emitter.fresh();
+            instructions.push(Self::inst(
+                Op::LogicalNot,
+                Some(result_type),
+                Some(out),
+                vec![Operand::IdRef(id)],
+            ));
+            out
+        };
+        let a = if neg_lhs { not(self, lhs_id, instructions) } else { lhs_id };
+        let b = if neg_rhs { not(self, rhs_id, instructions) } else { rhs_id };
+        instructions.push(Self::inst(
+            combine,
+            Some(result_type),
+            Some(result),
+            vec![Operand::IdRef(a), Operand::IdRef(b)],
         ));
         Ok(())
     }

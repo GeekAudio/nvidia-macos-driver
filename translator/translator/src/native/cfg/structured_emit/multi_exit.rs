@@ -23,7 +23,7 @@ pub(in crate::native) fn split_two_target_critical_edges(
     counter: &mut usize,
 ) -> Option<Vec<(String, usize)>> {
     atomic_rewrite(blocks, |blocks| {
-        if exits.len() != 2 {
+        if exits.len() < 2 {
             return None;
         }
         let mut splits: Vec<(String, Vec<usize>)> = Vec::new();
@@ -76,7 +76,7 @@ pub(in crate::native) fn split_two_target_critical_edges(
                     typed: crate::native::tir::lower_block_carrier(
                         edge,
                         &edge_lines,
-                        &std::collections::HashMap::new(),
+                        &crate::fxhash::HashMap::default(),
                     )
                     .map(Into::into),
                     name: edge.clone(),
@@ -98,7 +98,7 @@ pub(in crate::native) fn synth_multi_exit_merge(
     counter: &mut usize,
 ) -> Option<String> {
     atomic_rewrite(blocks, |blocks| {
-        if exits.len() != 2 {
+        if exits.len() < 2 {
             return None;
         }
         let mut exits = exits.to_vec();
@@ -150,19 +150,27 @@ pub(in crate::native) fn synth_two_target_dispatch(
     counter: &mut usize,
 ) -> Option<String> {
     atomic_rewrite(blocks, |blocks| {
-        if exits.len() != 2
+        if exits.len() < 2
             || preds.is_empty()
             || preds.iter().any(|(_, exit)| *exit >= exits.len())
         {
             return None;
         }
-        let merge = format!("{SPLIT_PREFIX}{counter}");
-        *counter += 1;
-        let sel = format!("{EXIT_SEL_PREFIX}{counter}");
-        *counter += 1;
+        // k exits funnel into a chain of k-1 two-way dispatch blocks: the first holds every carried
+        // value and selector, each later one is dominated by it and tests the next selector.
+        let dispatch_count = exits.len() - 1;
+        let mut merges = Vec::with_capacity(dispatch_count);
+        let mut sels = Vec::with_capacity(dispatch_count);
+        for _ in 0..dispatch_count {
+            merges.push(format!("{SPLIT_PREFIX}{counter}"));
+            *counter += 1;
+            sels.push(format!("{EXIT_SEL_PREFIX}{counter}"));
+            *counter += 1;
+        }
+        let merge = merges[0].clone();
 
         let forest = analyze(blocks);
-        let mut definitions = HashMap::new();
+        let mut definitions = HashMap::default();
         for block in blocks.iter() {
             let carrier = block.typed.as_ref()?;
             for instruction in &carrier.insts {
@@ -184,7 +192,7 @@ pub(in crate::native) fn synth_two_target_dispatch(
                 .map(|block| block.name.clone())
                 .collect::<HashSet<_>>();
             let mut used = Vec::new();
-            let mut used_set = HashSet::new();
+            let mut used_set = HashSet::default();
             for block in blocks.iter().filter(|block| region.contains(&block.name)) {
                 let carrier = block.typed.as_ref()?;
                 for instruction in carrier
@@ -213,7 +221,7 @@ pub(in crate::native) fn synth_two_target_dispatch(
                 }
             }
 
-            let mut substitutions = HashMap::new();
+            let mut substitutions = HashMap::default();
             for value in used {
                 let Some((definition_block, ty)) = definitions.get(&value) else {
                     continue;
@@ -279,8 +287,9 @@ pub(in crate::native) fn synth_two_target_dispatch(
             }
         }
 
-        let dispatch_targets = [exits[0].clone(), exits[1].clone()];
-        let exit_edge_pred = [merge.clone(), merge.clone()];
+        let exit_edge_pred: Vec<String> = (0..exits.len())
+            .map(|ei| merges[ei.min(dispatch_count - 1)].clone())
+            .collect();
 
         type TypedIncomings = Vec<(crate::native::ir::LlValue, String)>;
         let mut typed_value_phis: Vec<(String, crate::native::ir::LlType, TypedIncomings)> =
@@ -337,36 +346,47 @@ pub(in crate::native) fn synth_two_target_dispatch(
             }
         }
 
-        let selector_typed: TypedIncomings = preds
-            .iter()
-            .map(|(name, idx)| (crate::native::ir::LlValue::Bool(*idx == 0), name.clone()))
-            .collect();
-        let branch_line = format!(
-            "br i1 {sel}, label {}, label {}",
-            dispatch_targets[0], dispatch_targets[1]
-        );
-        let mut blk = crate::native::tir::lower_block_carrier(
-            &merge,
-            &[branch_line],
-            &std::collections::HashMap::new(),
-        )?;
-        for (mname, ty, merged_typed) in &typed_value_phis {
-            blk.push_value_phi(mname, ty, merged_typed);
+        let mut dispatch_blocks = Vec::with_capacity(dispatch_count);
+        for j in 0..dispatch_count {
+            let fallthrough = if j + 1 < dispatch_count {
+                merges[j + 1].clone()
+            } else {
+                exits[exits.len() - 1].clone()
+            };
+            let branch_line = format!("br i1 {}, label {}, label {}", sels[j], exits[j], fallthrough);
+            let mut blk = crate::native::tir::lower_block_carrier(
+                &merges[j],
+                &[branch_line],
+                &crate::fxhash::HashMap::default(),
+            )?;
+            if j == 0 {
+                for (mname, ty, merged_typed) in &typed_value_phis {
+                    blk.push_value_phi(mname, ty, merged_typed);
+                }
+                for (name, ty, incoming) in &dispatch_live_phis {
+                    blk.push_value_phi(name, ty, incoming);
+                }
+                for (k, sel) in sels.iter().enumerate() {
+                    let selector_typed: TypedIncomings = preds
+                        .iter()
+                        .map(|(name, idx)| (crate::native::ir::LlValue::Bool(*idx == k), name.clone()))
+                        .collect();
+                    blk.push_value_phi(sel, &crate::native::ir::LlType::Int(1), &selector_typed);
+                }
+            }
+            dispatch_blocks.push(BodyBlock {
+                name: merges[j].clone(),
+                role: role_for_name(&merges[j]),
+                typed: Some(blk.into()),
+            });
         }
-        for (name, ty, incoming) in &dispatch_live_phis {
-            blk.push_value_phi(name, ty, incoming);
-        }
-        blk.push_value_phi(&sel, &crate::native::ir::LlType::Int(1), &selector_typed);
-        let merge_block = BodyBlock {
-            name: merge.clone(),
-            role: role_for_name(&merge),
-            typed: Some(blk.into()),
-        };
         let insert_at = blocks
             .iter()
-            .position(|b| b.name == exits[0] || b.name == exits[1])
+            .position(|b| exits.iter().any(|e| &b.name == e))
             .unwrap_or(blocks.len());
-        blocks.insert(insert_at, merge_block);
+        for (j, block) in dispatch_blocks.into_iter().enumerate() {
+            blocks.insert(insert_at + j, block);
+        }
 
         Some(merge)
     })
@@ -465,7 +485,7 @@ pub(in crate::native) fn synth_multi_latch_continue(
             let mut blk = crate::native::tir::lower_block_carrier(
                 &new_latch,
                 &[format!("br label {header}")],
-                &std::collections::HashMap::new(),
+                &crate::fxhash::HashMap::default(),
             )?;
             for (merged, ty, merged_typed) in &typed_value_phis {
                 blk.push_value_phi(merged, ty, merged_typed);
@@ -500,7 +520,7 @@ mod tests {
             bb("%x", &["ret void"]),
         ];
         let before = format!("{blocks:?}");
-        let region = HashSet::from(["%entry".to_string()]);
+        let region = crate::fxhash::set_from(["%entry".to_string()]);
         let exits = vec!["%x".to_string(), "%y".to_string()];
         let mut counter = 0;
 

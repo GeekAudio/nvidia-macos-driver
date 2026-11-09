@@ -2,7 +2,7 @@ use super::ir::{LlDeclaration, LlFunction, LlGep, LlGlobal, LlType, LlValue, Typ
 pub(super) use super::lex::{
     matching_angle, matching_paren, parse_bfloat_literal, parse_float32_hex_literal,
     parse_float_literal, parse_float_special_literal, parse_half_literal, parse_hex_literal,
-    parse_i64_literal, parse_u32, parse_u64_literal, split_top_level, split_top_level_whitespace,
+    parse_i64_literal, parse_u32, parse_u64_literal, split_instruction_operands, split_top_level, split_top_level_whitespace,
     strip_comment,
 };
 use crate::spirv_module::Operand;
@@ -69,7 +69,7 @@ pub(super) fn parse_function_header(head: &str) -> Result<LlFunction, String> {
         byval_param_pointees,
         is_static_initializer,
         blocks: Vec::new(),
-        loop_controls: std::collections::HashMap::new(),
+        loop_controls: crate::fxhash::HashMap::default(),
     })
 }
 
@@ -459,6 +459,19 @@ fn hex_nibble(byte: u8) -> Option<u8> {
     }
 }
 
+/// `fcmp ord` / `fcmp uno`: Some(true) when both operands must be numbers, Some(false) when either
+/// may be NaN. Vulkan SPIR-V has no OpOrdered/OpUnordered (they need the Kernel capability), so the
+/// emitter builds them from OpIsNan.
+pub(super) fn fcmp_ordering_predicate(s: &str) -> Option<bool> {
+    split_top_level_whitespace(s)
+        .into_iter()
+        .find_map(|tok| match tok {
+            "ord" => Some(true),
+            "uno" => Some(false),
+            _ => None,
+        })
+}
+
 pub(super) fn fcmp_predicate(s: &str) -> Option<Op> {
     let pred = split_top_level_whitespace(s).into_iter().find(|tok| {
         matches!(
@@ -550,11 +563,36 @@ pub(super) fn is_ignored_intrinsic(name: &str) -> bool {
         || name.starts_with("llvm.usub.sat.")
 }
 
+fn is_empty_inline_asm_call(line: &str) -> bool {
+    let line = super::lex::instruction_without_attachments(line).trim();
+    let Some(rest) = line.strip_prefix("call void asm ") else {
+        return false;
+    };
+    let mut rest = rest.trim_start();
+    rest = rest.strip_prefix("sideeffect ").unwrap_or(rest);
+    // Empty assembly with no operands or clobbers has no GPU operation to emit.
+    // Keep rejecting real assembly, including an empty memory-clobber barrier.
+    for token in ["\"\"", ",", "\"\"", "(", ")"] {
+        let Some(next) = rest.trim_start().strip_prefix(token) else {
+            return false;
+        };
+        rest = next;
+    }
+    let suffix = rest.trim();
+    suffix.is_empty()
+        || suffix.strip_prefix('#').is_some_and(|index| {
+            !index.is_empty() && index.bytes().all(|byte| byte.is_ascii_digit())
+        })
+}
+
 pub(super) fn is_ignored_call_line(line: &str) -> bool {
     let line = line.trim();
     let line = line.strip_prefix("tail ").unwrap_or(line);
     if !line.starts_with("call ") {
         return false;
+    }
+    if is_empty_inline_asm_call(line) {
+        return true;
     }
     if line.contains("@llvm.lifetime.") {
         return true;
@@ -717,7 +755,7 @@ pub(super) fn parse_memory_alignment(parts: &[&str]) -> Result<Option<u64>, Stri
 
 pub(super) fn parse_phi(rest: &str) -> Result<(LlType, Vec<(LlValue, String)>), String> {
     let (phi_ty, incoming_text) = split_phi_type_and_incoming(rest)?;
-    let incoming = split_top_level(&incoming_text, ',')
+    let incoming = split_instruction_operands(&incoming_text)
         .into_iter()
         .map(|incoming| {
             let incoming = incoming
@@ -903,7 +941,7 @@ pub(super) fn parse_identity_ptr_bitcast(line: &str) -> Option<(String, String)>
 
 pub(super) fn parse_phi_incoming_values(rest: &str) -> Result<Vec<LlValue>, String> {
     let (_, incoming_text) = split_phi_type_and_incoming(rest)?;
-    split_top_level(&incoming_text, ',')
+    split_instruction_operands(&incoming_text)
         .into_iter()
         .map(|incoming| {
             let incoming = incoming
@@ -1038,6 +1076,14 @@ fn strip_leading_fast_math_flags(mut s: &str) -> &str {
 }
 
 pub(super) fn parse_struct_fields(s: &str) -> Result<Vec<LlType>, String> {
+    // `{}` is a real type and not a parse failure. The shader converter uses it for the user payload inside a
+    // ray's fat payload when the function it is handing the payload to does not know the payload's type: an
+    // intersection function reads only the header, so the second member is declared empty there and spelled
+    // out in the hit shaders. Parsing it as no fields keeps the two views of that memory compatible; without
+    // this the whole type failed to parse, and the GEP through it was reported as an unhandled instruction.
+    if s.trim().is_empty() {
+        return Ok(Vec::new());
+    }
     split_top_level(s, ',')
         .into_iter()
         .map(parse_type)

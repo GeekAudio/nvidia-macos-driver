@@ -30,11 +30,12 @@ struct DriverVersion: Comparable, Sendable {
 }
 
 struct InstalledDriver: Sendable {
+    private static let bundlePath = "/Library/Extensions/NVRM.kext"
     let baseline: String
     let releaseTag: String?
 
     static func read() -> Self? {
-        let url = URL(fileURLWithPath: "/Library/Extensions/NVRM.kext/Contents/Info.plist")
+        let url = URL(fileURLWithPath: bundlePath + "/Contents/Info.plist")
         guard let data = try? Data(contentsOf: url),
               let plist = (try? PropertyListSerialization.propertyList(from: data, options: [], format: nil)) as? [String: Any],
               let baseline = plist["CFBundleVersion"] as? String else { return nil }
@@ -54,12 +55,26 @@ struct InstalledDriver: Sendable {
         if installed == available { return "当前已安装此版本" }
         return installed < available ? "有新版本" : "本机构建更新"
     }
+
+    func permits(_ release: DriverRelease) -> Bool {
+        guard let current = DriverVersion(baseline), current.base == release.version.base else {
+            return DriverVersion(baseline).map { $0 < release.version } ?? false
+        }
+        guard let releaseTag else { return true }
+        return DriverVersion(releaseTag).map { $0.base == current.base && $0 < release.version } ?? false
+    }
+
+    static func permitsInstallation(_ release: DriverRelease) -> Bool {
+        if let installed = read() { return installed.permits(release) }
+        return !FileManager.default.fileExists(atPath: bundlePath)
+    }
 }
 
 struct DriverRelease: Sendable {
     let tag: String
     let version: DriverVersion
     let isPreview: Bool
+    let offersInstaller: Bool
 
     var page: URL { ReleaseFeed.repository.appendingPathComponent("releases/tag/\(tag)") }
 }
@@ -150,7 +165,9 @@ struct ReleaseFeed: Sendable {
                   }) else { return nil }
             let preview = entry.prerelease || version.isPreview
             guard !preview || includePreviews else { return nil }
-            return DriverRelease(tag: entry.tag_name, version: version, isPreview: preview)
+            let names = Set(entry.assets.filter { $0.state == "uploaded" }.map(\.name))
+            return DriverRelease(tag: entry.tag_name, version: version, isPreview: preview,
+                                 offersInstaller: names.contains("driver-update.json") && names.contains("driver-update.json.sig"))
         }.max { $0.version < $1.version }
     }
 }

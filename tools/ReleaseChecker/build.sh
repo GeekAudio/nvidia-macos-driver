@@ -11,6 +11,7 @@ binary="$app/Contents/MacOS/GeekAudioReleaseChecker"
 mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
 cp "$source_dir/Info.plist" "$app/Contents/Info.plist"
 plutil -lint "$app/Contents/Info.plist"
+cp "$source_dir/Installer.sh" "$app/Contents/Resources/Installer.sh"
 
 icon_work=$(mktemp -d "${TMPDIR:-/tmp}/geekaudio-icon.XXXXXX")
 trap 'rm -r "$icon_work"' EXIT
@@ -23,9 +24,19 @@ for size in 16 32 128 256 512; do
 done
 iconutil -c icns "$iconset" -o "$app/Contents/Resources/AppIcon.icns"
 
+helper_hash=$(shasum -a 256 "$app/Contents/Resources/Installer.sh" | cut -d' ' -f1)
+public_key=$(<"$source_dir/driver-public-key.txt")
+[[ "$public_key" =~ ^[A-Za-z0-9+/]{43}=$ ]]
+cat > "$icon_work/InstallerPins.swift" <<EOF
+enum InstallerPins {
+    static let publicKey = "$public_key"
+    static let helperSHA256 = "$helper_hash"
+}
+EOF
 for arch in x86_64 arm64; do
     xcrun swiftc -swift-version 6 -O -target "$arch-apple-macosx15.0" \
-        "$source_dir/ReleaseCheckerApp.swift" "$source_dir/ReleaseFeed.swift" \
+        "$source_dir/ReleaseCheckerApp.swift" "$source_dir/ReleaseFeed.swift" "$source_dir/InstallPlan.swift" \
+        "$source_dir/DriverInstaller.swift" "$icon_work/InstallerPins.swift" \
         -o "$output/$arch"
 done
 xcrun lipo -create "$output/x86_64" "$output/arm64" -output "$binary"

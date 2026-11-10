@@ -10,6 +10,10 @@ from pathlib import Path
 
 
 BASE_SHA256 = 'b624bf07c78cea03043e096383d5c8b01e4fb2c804a6ba377a4e66a2566422ef'
+VULKAN_LINKS = {
+    Path('Library/GPUBundles/nvmtl/libvulkan.dylib'): 'libvulkan.1.dylib',
+    Path('Library/GPUBundles/nvmtl/libvulkan.1.dylib'): 'libvulkan.1.4.362.dylib',
+}
 PLUGIN = Path('Library/GPUBundles/NVMTLDriver.bundle')
 KEXTS = {
     Path('Library/Extensions/NVRM.kext'),
@@ -38,11 +42,14 @@ def run(*args, cwd=None):
     subprocess.run(args, cwd=cwd, check=True)
 
 
-def files(root):
+def files(root, allowed_links=None):
     names = set()
     for path in root.rglob('*'):
         if path.is_symlink():
-            raise ValueError(f'Unexpected symlink: {path}')
+            expected = (allowed_links or {}).get(path.relative_to(root))
+            if expected is None or str(path.readlink()) != expected or not path.is_file():
+                raise ValueError(f'Unexpected symlink: {path}')
+            continue
         if path.is_file():
             names.add(path.relative_to(root))
         elif not path.is_dir():
@@ -65,7 +72,7 @@ def assemble(archive, output):
     with tempfile.TemporaryDirectory(prefix='.geekaudio-assemble-', dir=output.parent) as staging:
         run('/usr/bin/tar', '-xzf', str(archive), '-C', staging)
         root = Path(staging) / 'pkgroot'
-        files(root)
+        files(root, VULKAN_LINKS)
         run('/usr/bin/shasum', '-a', '256', '--strict', '-c', '--quiet', 'SHA256SUMS', cwd=root)
         for name in sorted(PAYLOAD):
             shutil.copy2(payload / name, root / name)
@@ -81,7 +88,7 @@ def assemble(archive, output):
         checksums = root / 'SHA256SUMS'
         checksums.write_text(''.join(
             f'{digest(root / name)}  {name.as_posix()}\n'
-            for name in sorted(files(root)) if name != Path('SHA256SUMS')
+            for name in sorted(files(root, VULKAN_LINKS)) if name != Path('SHA256SUMS')
         ))
         run('/usr/bin/shasum', '-a', '256', '--strict', '-c', '--quiet', 'SHA256SUMS', cwd=root)
         run('/bin/bash', str(root / 'sums_complete.sh'), str(root))

@@ -25,7 +25,6 @@
 #include <IOKit/graphics/IOFramebuffer.h>
 #include <IOKit/graphics/IOGraphicsTypes.h>
 #include <IOKit/graphics/IODisplay.h>
-#include <IOKit/i2c/IOI2CInterface.h>
 #include <IOKit/ndrvsupport/IOMacOSVideo.h>
 #include <libkern/c++/OSNumber.h>
 #include <libkern/c++/OSString.h>
@@ -48,6 +47,7 @@ static inline thread_call_t nvrmfbCall(thread_call_func_t fn, thread_call_param_
 #include "nvrm-hud.h"
 #include "nvrm-fb-safety.h"
 #include <IOKit/i2c/IOI2CInterface.h>
+#include <IOKit/IOMessage.h>
 #include "../nvrm_ddc_abi.h"
 #include "../nvrm_off_bar.h"
 #include "../nvrm_edp_backlight.h"
@@ -91,7 +91,6 @@ extern "C" {
 #pragma clang diagnostic pop
 #include <libkern/OSAtomic.h>
 #include "nvrm_vram_abi.h"
-#include "../nvrm_ddcci.h"
 
 // Surfaces may use half of a resizable BAR1 (>= 4 GB) and three quarters of a smaller one. WAS: a fixed 192 MB below
 // 4 GB, which is 3/4 of the 256 MB firmware window but left a 512 MB or 1 GB BAR1 no better off (issue #27).
@@ -249,31 +248,6 @@ static NvBool nvrmDynamicDisplayInfo(struct NvKmsKapiFunctionsTable *kms, struct
 static const SInt32 kAppleBacklightDefaultMax = 255;
 static const UInt32 kNVRMBacklightSaveDelaySeconds = 2;
 #define BLLOG(fmt, ...) do { IOLog("NVRM-fb: " fmt "\n", ##__VA_ARGS__); kprintf("NVRM-fb: " fmt "\n", ##__VA_ARGS__); } while (0)
-
-// External displays can have no native parameter dictionary when the framebuffer reports zero parameters.
-// Seed the dictionary before IODisplay's first update so a DDC provider can publish a verified brightness range.
-class NVRMDdcParameterHandler : public IODisplayParameterHandler {
-    OSDeclareDefaultStructors(NVRMDdcParameterHandler)
-public:
-    bool setDisplay(IODisplay *display) override
-    {
-        if (!display || strcmp(display->getMetaClass()->getClassName(), "AppleDisplay") != 0) return false;
-        OSObject *existing = display->copyProperty(gIODisplayParametersKey);
-        if (existing) {
-            existing->release();
-            return true;
-        }
-        OSDictionary *params = OSDictionary::withCapacity(1);
-        if (!params) return false;
-        const bool ok = display->setProperty(gIODisplayParametersKey, params);
-        params->release();
-        return ok;
-    }
-    bool doIntegerSet(OSDictionary *, const OSSymbol *, UInt32) override { return false; }
-    bool doDataSet(const OSSymbol *, OSData *) override { return false; }
-    bool doUpdate() override { return true; }
-};
-OSDefineMetaClassAndStructors(NVRMDdcParameterHandler, IODisplayParameterHandler)
 
 class NVRMBacklightHandler : public IODisplayParameterHandler {
     OSDeclareDefaultStructors(NVRMBacklightHandler)
@@ -475,7 +449,41 @@ void NVRMBacklightHandler::persistFire(thread_call_param_t p, thread_call_param_
 // counted as a failed start (nvrm_off.h).
 static int gGuardCleared;
 static void fbGuardCleared(const char *why);
+class NVRMNVDAFramebuffer;
+
+class NVRMDdcTransaction {
+    bool *flag;
+    bool acquired;
+public:
+    explicit NVRMDdcTransaction(bool *busy) : flag(busy), acquired(!__atomic_exchange_n(flag, true, __ATOMIC_ACQUIRE)) {}
+    ~NVRMDdcTransaction() { if (acquired) __atomic_store_n(flag, false, __ATOMIC_RELEASE); }
+    bool held() const { return acquired; }
+};
+
+class NVRMExternalBrightness : public IODisplayParameterHandler {
+    OSDeclareDefaultStructors(NVRMExternalBrightness)
+    NVRMNVDAFramebuffer *fFramebuffer = nullptr;
+    OSDictionary *fParameters = nullptr;
+    UInt32 fGeneration = 0;
+    UInt32 fMaximum = 0;
+    IODisplay *fRetryDisplay = nullptr;
+    UInt32 fRetryGeneration = 0;
+    unsigned fRetriesLeft = 0;
+    bool publishParameters(IODisplay *display, bool &retry);
+public:
+    void retryProbe();
+    void cancelProbe() { OSSafeReleaseNULL(fRetryDisplay); }
+    void setFramebuffer(NVRMNVDAFramebuffer *framebuffer);
+    void free() override;
+    bool setDisplay(IODisplay *display) override;
+    bool doIntegerSet(OSDictionary *params, const OSSymbol *key, UInt32 value) override;
+    bool doDataSet(const OSSymbol *, OSData *) override { return false; }
+    bool doUpdate() override { return true; }
+};
+OSDefineMetaClassAndStructors(NVRMExternalBrightness, IODisplayParameterHandler)
+
 class NVRMNVDAFramebuffer : public IOFramebuffer {
+    friend class NVRMExternalBrightness;
     OSDeclareDefaultStructors(NVRMNVDAFramebuffer)
     struct NvKmsKapiFunctionsTable *fKms = nullptr; NvU32 fGpuId = 0; nvrm_phys_for_va_t fPhysForVa = nullptr;
     struct NvKmsKapiDevice *fDev = nullptr;
@@ -514,16 +522,6 @@ class NVRMNVDAFramebuffer : public IOFramebuffer {
     bool applyVibrance();
     NVRMBacklightHandler *fBacklight = nullptr;   // the panel's brightness control, see NVRMBacklightHandler
     void publishBacklight();
-    const OSSymbol *fDdcFunction = nullptr;
-    NVRMDdcParameterHandler *fDdcParameters = nullptr;
-    bool fDdcDisplayPort = false;
-    uint64_t fDdcWriteAfter = 0; // under NVRMDisplayGate
-    volatile SInt32 fDdcSinkGeneration = 0;
-    IOCommandGate *fDdcWaitGate = nullptr; // active write wait, under the IOGraphics gate
-    void publishDdcInterface();
-    void syncDdcPowerState(bool powered);
-    IOReturn waitForDdcWrite(uint64_t deadline);
-    void drainDdcWrite();
     struct NvKmsKapiDisplayMode fMode = {};
     // the mode NVKMS validated for this display, kept when the boot pair takes the firmware's timing instead (applyMode)
     struct NvKmsKapiDisplayMode fKmsMode = {};
@@ -846,11 +844,27 @@ public:
     // DDC/CI (boot-arg nvrmfbddc=1): one I2C bus per external display, transfers run by NVRM (nvrm_ddc.cpp).
     IOReturn doI2CRequest(UInt32 bus, struct IOI2CBusTiming *timing, struct IOI2CRequest *request) override;
     bool fDdcOn = false;
+    NVRMExternalBrightness *fDdcBrightness = nullptr;
+    IOCommandGate *fDdcBrightnessGate = nullptr;
+    thread_call_t fDdcBrightnessCall = nullptr;
+    thread_call_t fDdcProbeCall = nullptr;
+    bool fDdcInFlight = false;
+    bool fDdcPowered = false;
+    UInt32 fDdcSinkGeneration = 1;
+    UInt64 fDdcPending = 0; // generation in high word, requested VCP value + 1 in low word
+    UInt64 fDdcWriteAfter = 0; // accessed while holding fDdcInFlight
     void publishDdcBus();
+    void publishDdcBrightness();
+    static void ddcBrightnessFire(thread_call_param_t, thread_call_param_t);
+    IOReturn writeDdcBrightness();
+    static void ddcProbeFire(thread_call_param_t, thread_call_param_t);
+    IOReturn ddcProbeGated(void *, void *, void *, void *);
+    void scheduleDdcProbe();
+    bool readDdcBrightness(UInt32 &value, UInt32 &maximum, UInt32 &generation, unsigned delayMs);
+    bool queueDdcBrightness(UInt32 value, UInt32 generation);
     IOReturn ddcTransfer(unsigned op, unsigned addr7, unsigned char *data, unsigned len);
     IOReturn ddcPowerGated(void *on, void *, void *, void *);
     void ddcSetPowered(bool on);
-    IOReturn doDdcBrightnessRequest(UInt32 bus, IOI2CBusTiming *timing, IOI2CRequest *request);
     IOReturn registerForInterruptType(IOSelect type, IOFBInterruptProc proc, OSObject *target, void *ref, void **interruptRef) override;
     IOReturn unregisterInterrupt(void *interruptRef) override { return kIOReturnSuccess; }
     IOReturn setInterruptState(void *interruptRef, UInt32 state) override { return kIOReturnSuccess; }
@@ -1934,7 +1948,7 @@ void NVRMNVDAFramebuffer::hotplugFire(thread_call_param_t, thread_call_param_t)
                     if (!fb->fDpyLost) {
                         FBLOG("hot-plug: display 0x%x went away (fb %u)", handles[i], fb->fIndex);
                         fb->fDpyLost = true;
-                        OSIncrementAtomic(&fb->fDdcSinkGeneration);
+                        __atomic_add_fetch(&fb->fDdcSinkGeneration, 1u, __ATOMIC_RELAXED);
                         fb->fEdidSize = 0;
                         fb->clearDisplayAudioProperties();
                         if (nnotify < sizeof notify / sizeof notify[0]) { fb->retain(); notify[nnotify++] = fb; }
@@ -1950,7 +1964,7 @@ void NVRMNVDAFramebuffer::hotplugFire(thread_call_param_t, thread_call_param_t)
                     }
                     if (swapped) {
                         fb->fEdidSwapped = true;
-                        OSIncrementAtomic(&fb->fDdcSinkGeneration);
+                        __atomic_add_fetch(&fb->fDdcSinkGeneration, 1u, __ATOMIC_RELAXED);
                     }
                     if (nrelight < sizeof relight / sizeof relight[0]) {
                         fb->retain(); relight[nrelight++] = fb;
@@ -1986,7 +2000,7 @@ void NVRMNVDAFramebuffer::hotplugFire(thread_call_param_t, thread_call_param_t)
             FBLOG("hot-plug: known display 0x%x omitted from NVKMS list and confirmed disconnected (fb %u)",
                   gDpy[k].handle, fb->fIndex);
             fb->fDpyLost = true;
-            OSIncrementAtomic(&fb->fDdcSinkGeneration);
+            __atomic_add_fetch(&fb->fDdcSinkGeneration, 1u, __ATOMIC_RELAXED);
             fb->fEdidSize = 0;
             fb->clearDisplayAudioProperties();
             if (nnotify < sizeof notify / sizeof notify[0]) { fb->retain(); notify[nnotify++] = fb; }
@@ -3194,16 +3208,11 @@ bool NVRMNVDAFramebuffer::start(IOService *provider)
             if (gColorBpc || gColorFormat != 3 || gColorRange || gVibrance)
                 FBLOG("colour controls: bpc %d format %d range %d vibrance %d", gColorBpc, gColorFormat, gColorRange, gVibrance); } }
     publishDdcBus();                     // before super::start() too: IOFramebuffer::open creates the I2C interface from it
-    if (!fInternal && !fDdcOn) publishDdcInterface();
-    if (fDdcFunction) {
-        fDdcParameters = OSTypeAlloc(NVRMDdcParameterHandler);
-        if (fDdcParameters && fDdcParameters->init() && fDdcParameters->attach(this))
-            fDdcParameters->registerService(kIOServiceSynchronous);
-        else
-            OSSafeReleaseNULL(fDdcParameters);
-    }
+    if (fDdcOn) publishDdcBrightness();
     if (!super::start(provider)) {
-        if (fDdcParameters) { fDdcParameters->detach(this); OSSafeReleaseNULL(fDdcParameters); }
+        if (fDdcBrightness) { fDdcBrightness->detach(this); OSSafeReleaseNULL(fDdcBrightness); }
+        if (fDdcBrightnessCall) { thread_call_free(fDdcBrightnessCall); fDdcBrightnessCall = nullptr; }
+        if (fDdcProbeCall) { thread_call_free(fDdcProbeCall); fDdcProbeCall = nullptr; }
         NVRMDisplayGate gate; if (gate.valid() && fOwnsHead) { gHeadsTaken &= ~(1u << fHead); fOwnsHead = false; }
         FBLOG("super::start failed after kapiInit succeeded"); return false;
     }
@@ -3269,7 +3278,6 @@ void NVRMNVDAFramebuffer::stop(IOService *provider)
         fStopping = 1;
         IOSimpleLockUnlockEnableInterrupt(fFlipCacheLock, state);
     }
-    if (fDdcDisplayPort) drainDdcWrite();
     if (fHwVblCb && fKms && fDev) {
         fKms->unregisterVblankIntrCallback(fDev, fHead, fHwVblCb); fHwVblCb = nullptr;
     }
@@ -3281,7 +3289,7 @@ void NVRMNVDAFramebuffer::stop(IOService *provider)
         if (sl) IORecursiveLockUnlock(sl);
         if (mine) release();
     }
-    thread_call_t *calls[] = {&fHwVblCall, &fReflip, &fGpuWake, &fBars, &fVblTimer, &fSampler, &fHeadProbe, &fCursorCall, &fConnectNotify, &fAudioCall};
+    thread_call_t *calls[] = {&fHwVblCall, &fReflip, &fGpuWake, &fBars, &fVblTimer, &fSampler, &fHeadProbe, &fCursorCall, &fConnectNotify, &fAudioCall, &fDdcBrightnessCall, &fDdcProbeCall};
     for (unsigned i = 0; i < sizeof calls / sizeof calls[0]; ++i) {
         thread_call_t call = *calls[i];
         if (!call) continue;
@@ -3297,8 +3305,16 @@ void NVRMNVDAFramebuffer::stop(IOService *provider)
     if (fHwVblCb && fKms && fDev) {
         fKms->unregisterVblankIntrCallback(fDev, fHead, fHwVblCb); fHwVblCb = nullptr;
     }
+    if (fDdcBrightness) {
+        fDdcBrightness->cancelProbe();
+        fDdcBrightness->detach(this);
+        OSSafeReleaseNULL(fDdcBrightness);
+    }
+    if (fDdcBrightnessGate) {
+        if (IOWorkLoop *loop = getWorkLoop()) loop->removeEventSource(fDdcBrightnessGate);
+        OSSafeReleaseNULL(fDdcBrightnessGate);
+    }
     if (fBacklight) { fBacklight->detach(this); OSSafeReleaseNULL(fBacklight); }
-    if (fDdcParameters) { fDdcParameters->detach(this); OSSafeReleaseNULL(fDdcParameters); }
     if (fGamma) { IOFree(fGamma, sizeof *fGamma); fGamma = nullptr; fGammaOn = false; }
     if (fWakeGate) { if (IOWorkLoop *wl = getWorkLoop()) wl->removeEventSource(fWakeGate); OSSafeReleaseNULL(fWakeGate); }
     if (fSleepTap) { fSleepTap->remove(); fSleepTap = nullptr; }
@@ -3369,7 +3385,6 @@ IOReturn NVRMNVDAFramebuffer::getAppleSense(IOIndex connectIndex, UInt32 *senseT
 
 void NVRMNVDAFramebuffer::free()
 {
-    OSSafeReleaseNULL(fDdcFunction);
     if (fFlipCacheLock) { IOSimpleLockFree(fFlipCacheLock); fFlipCacheLock = nullptr; }
     if (fCurStateLock) { IOSimpleLockFree(fCurStateLock); fCurStateLock = nullptr; }
     fConsKva = nullptr; OSSafeReleaseNULL(fConsMap); OSSafeReleaseNULL(fConsMem);
@@ -3433,171 +3448,17 @@ bool NVRMNVDAFramebuffer::proxyMap()
     return fPxMap != nullptr;
 }
 
-void NVRMNVDAFramebuffer::publishDdcInterface()
-{
-    int enabled = 0;
-    if (!PE_parse_boot_argn("nvddcci", &enabled, sizeof enabled) || enabled != 1) return;
-    NVRMDisplayGate gate;
-    if (!gate.valid() ||
-        fIndex >= (unsigned)gNDpy || !fDisplay || fEdidSize < 128) return;
-
-    const auto &display = gDpy[fIndex];
-    if (display.mst || (display.hdaConnectorType != 0x400 && display.hdaConnectorType != 0x800)) return;
-    fDdcDisplayPort = display.hdaConnectorType == 0x400;
-    OSDictionary *info = OSDictionary::withCapacity(4);
-    OSArray *buses = OSArray::withCapacity(1);
-    const OSSymbol *function = OSSymbol::withCString(NVRM_DDCCI_FN);
-    auto setNumber = [info](const char *key, uint32_t value) {
-        OSNumber *number = OSNumber::withNumber(value, 32);
-        if (!number) return false;
-        const bool ok = info->setObject(key, number);
-        number->release();
-        return ok;
-    };
-    // IOGraphics creates and registers the actual IOFramebufferI2CInterface when this framebuffer opens.
-    if (info && buses && function &&
-        setNumber(kIOI2CInterfaceIDKey, fIndex + 1) &&
-        setNumber(kIOI2CBusTypeKey, kIOI2CBusTypeI2C) &&
-        setNumber(kIOI2CTransactionTypesKey,
-                  (1u << kIOI2CSimpleTransactionType) | (1u << kIOI2CNoTransactionType)) &&
-        setNumber(kIOI2CSupportedCommFlagsKey, 0) &&
-        buses->setObject(info) && setProperty(kIOFBI2CInterfaceInfoKey, buses)) {
-        fDdcFunction = function;
-        function = nullptr;
-        // This is before the framebuffer starts, so the controller cannot read the state yet.
-        pendingPowerState = fPowerOn ? 1 : 0;
-        setProperty("NVRMDDCTransport", fDdcDisplayPort ? "dp-aux" : "hdmi-ddc");
-        setProperty("NVRMDDCDisplayID", fDisplay, 32);
-    }
-    OSSafeReleaseNULL(function);
-    OSSafeReleaseNULL(info);
-    OSSafeReleaseNULL(buses);
-}
-
-void NVRMNVDAFramebuffer::syncDdcPowerState(bool powered)
-{
-    if (!fDdcFunction) return;
-    // IOGraphics tests pendingPowerState under its framebuffer gate before calling doI2CRequest.
-    // Mirror our power transition there without scheduling the family's own power work.
-    IOWorkLoop *loop = getWorkLoop();
-    if (!loop) {
-        if (!powered && pendingPowerState) OSIncrementAtomic(&fDdcSinkGeneration);
-        pendingPowerState = powered ? 1 : 0;
-        return;
-    }
-    loop->runAction([](OSObject *target, void *on, void *, void *, void *) -> IOReturn {
-        auto *fb = static_cast<NVRMNVDAFramebuffer *>(target);
-        if (!on && fb->pendingPowerState) OSIncrementAtomic(&fb->fDdcSinkGeneration);
-        fb->pendingPowerState = on ? 1 : 0;
-        return kIOReturnSuccess;
-    }, this, powered ? this : nullptr);
-}
-
-IOReturn NVRMNVDAFramebuffer::waitForDdcWrite(uint64_t deadline)
-{
-    IOWorkLoop *loop = getWorkLoop();
-    if (!loop || !loop->inGate() || loop->onThread()) return kIOReturnBusy;
-    if (OSAddAtomic(0, &fStopping)) return kIOReturnOffline;
-    IOCommandGate *waitGate = IOCommandGate::commandGate(this);
-    if (!waitGate) return kIOReturnNoMemory;
-    NVRMCallReference gateRef(waitGate);
-    const IOReturn added = loop->addEventSource(waitGate);
-    if (added != kIOReturnSuccess) return added;
-    // startIO owns the controller gate, sometimes recursively. commandSleep drops the entire gate
-    // and restores it before returning. Neither the NVIDIA display lock nor RM's PM gate is held.
-    fDdcWaitGate = waitGate;
-    const IOReturn slept = waitGate->commandSleep(waitGate, deadline, THREAD_UNINT);
-    fDdcWaitGate = nullptr;
-    waitGate->commandWakeup(&fDdcWaitGate, false);
-    loop->removeEventSource(waitGate);
-    return slept == THREAD_TIMED_OUT ? kIOReturnSuccess : kIOReturnAborted;
-}
-
-void NVRMNVDAFramebuffer::drainDdcWrite()
-{
-    IOWorkLoop *loop = getWorkLoop();
-    if (!loop) return;
-    loop->runAction([](OSObject *target, void *, void *, void *, void *) -> IOReturn {
-        auto *fb = static_cast<NVRMNVDAFramebuffer *>(target);
-        IOCommandGate *waitGate = fb->fDdcWaitGate;
-        if (!waitGate) return kIOReturnSuccess;
-        waitGate->retain();
-        NVRMCallReference gateRef(waitGate);
-        waitGate->commandWakeup(waitGate, false);
-        // Reacquiring the controller gate also waits for startIO to finish unlocking the framebuffer.
-        while (fb->fDdcWaitGate) waitGate->commandSleep(&fb->fDdcWaitGate, THREAD_UNINT);
-        return kIOReturnSuccess;
-    }, this);
-}
-
-IOReturn NVRMNVDAFramebuffer::doDdcBrightnessRequest(UInt32 bus, IOI2CBusTiming *timing, IOI2CRequest *request)
-{
-    if (!fDdcFunction || bus != fIndex + 1) return super::doI2CRequest(bus, timing, request);
-    if (!request || request->completion || request->commFlags || request->sendAddress != 0x6e ||
-        request->sendTransactionType != kIOI2CSimpleTransactionType || !request->sendBuffer)
-        return kIOReturnUnsupportedMode;
-
-    const bool get = request->sendBytes == 5 && request->replyAddress == 0x6f &&
-                     request->replyTransactionType == kIOI2CSimpleTransactionType &&
-                     request->replyBytes == 11 && request->replyBuffer;
-    const bool set = request->sendBytes == 7 && request->replyTransactionType == kIOI2CNoTransactionType;
-    if (!get && !set) return kIOReturnUnsupportedMode;
-    if (fDdcDisplayPort) {
-        IOWorkLoop *loop = getWorkLoop();
-        if (!loop || !loop->inGate() || fDdcWaitGate) return kIOReturnBusy;
-    }
-
-    uint64_t delayNs = 0;
-    absolutetime_to_nanoseconds(request->minReplyDelay, &delayNs);
-    if (delayNs > 200000000) return kIOReturnBadArgument;
-
-    NVRMDdcBrightnessRequest transfer = {};
-    transfer.delayMs = (uint32_t)((delayNs + 999999) / 1000000);
-    transfer.sendLength = (uint8_t)request->sendBytes;
-    nvu_copy(transfer.send, (const void *)request->sendBuffer, transfer.sendLength);
-    if (!nvrmDdcBrightnessCommand(transfer.send, transfer.sendLength)) return kIOReturnBadArgument;
-
-    uint64_t deadline = 0;
-    SInt32 generation = 0;
-    for (;;) {
-        {
-            NVRMDisplayGate gate;
-            IOService *provider = getProvider();
-            if (!gate.valid() || OSAddAtomic(0, &fStopping) || isInactive() || !pendingPowerState ||
-                fDpyLost || fEdidSwapped || fHeadSlept || !fModeSet || fEdidSize < 128 || !provider)
-                return kIOReturnOffline;
-            if (deadline && generation != OSAddAtomic(0, &fDdcSinkGeneration)) return kIOReturnOffline;
-            if (!set || !fDdcDisplayPort || mach_absolute_time() >= fDdcWriteAfter) {
-                transfer.gpuId = fGpuId;
-                transfer.displayId = fDisplay;
-                transfer.displayPort = fDdcDisplayPort;
-                const IOReturn result = provider->callPlatformFunction(fDdcFunction, false, &transfer,
-                                                                       nullptr, nullptr, nullptr);
-                if (get && fDdcDisplayPort && result == kIOReturnSuccess)
-                    clock_interval_to_deadline(kNVRMDdcDpReadToWriteMs, kMillisecondScale, &fDdcWriteAfter);
-                setProperty("NVRMDDCStage", (uint32_t)transfer.stage, 32);
-                setProperty("NVRMDDCRMStatus", transfer.rmStatus, 32);
-                if (transfer.port) setProperty("NVRMDDCPortID", transfer.port, 32);
-                if (result != kIOReturnSuccess) return result;
-
-                if (get) nvu_copy((void *)request->replyBuffer, transfer.reply, sizeof transfer.reply);
-                request->result = kIOReturnSuccess;
-                return kIOReturnSuccess;
-            }
-            // Never write early or extend this request beyond a single wait.
-            if (deadline) return kIOReturnBusy;
-            deadline = fDdcWriteAfter;
-            generation = OSAddAtomic(0, &fDdcSinkGeneration);
-        }
-        const IOReturn waited = waitForDdcWrite(deadline);
-        if (waited != kIOReturnSuccess) return waited;
-    }
-}
-
 IOReturn NVRMNVDAFramebuffer::enableController()
 {
     FBLOG("enableController");
     if (fProxy) return kIOReturnSuccess;
+    if (fDdcBrightness && !fDdcBrightnessGate) {
+        if (IOWorkLoop *loop = getWorkLoop()) {
+            fDdcBrightnessGate = IOCommandGate::commandGate(this);
+            if (fDdcBrightnessGate && loop->addEventSource(fDdcBrightnessGate) != kIOReturnSuccess)
+                OSSafeReleaseNULL(fDdcBrightnessGate);
+        }
+    }
     fEnableAbs = mach_absolute_time();
     const bool ok = applyMode();
     // A failed boot mode set must not fail the open. IOFramebuffer::open() marks a framebuffer whose enableController
@@ -5497,7 +5358,6 @@ IOReturn NVRMNVDAFramebuffer::setPowerState(unsigned long ordinal, IOService *de
         // a failed wake stays retryable (fHeadSlept kept) but WindowServer is still told the display is on, as 1.14.7 did:
         // without the notification it never redraws, and the head can sit black with nothing left to retry it (review)
         (void)setHeadPower(true);
-        syncDdcPowerState(true);
         // A system sleep cleared pagingState (IOGraphics' system work, with kIOFBNotifyWillSleep to every client).
         // This override replaces IOFramebuffer::setPowerState, so the family's wake work never runs, and
         // handleEvent() does nothing off the controller's power thread - so no client ever saw kIOFBNotifyDidWake,
@@ -5508,7 +5368,6 @@ IOReturn NVRMNVDAFramebuffer::setPowerState(unsigned long ordinal, IOService *de
         if (!pagingState && fSysSlept) { fSysSlept = false; familyDidWake(); }
         else handleEvent(kIOFBNotifyDidPowerOn);
     } else {
-        syncDdcPowerState(false);
         handleEvent(kIOFBNotifyWillPowerOff);
         fPowerOn = false;
         (void)setHeadPower(false);
@@ -5650,12 +5509,15 @@ void NVRMNVDAFramebuffer::publishDdcBus()
     fDdcOn = false;
     if (fInternal || !PE_parse_boot_argn("nvrmfbddc", &on, sizeof on) || !on) return;
     OSArray *buses = OSArray::withCapacity(1);
-    OSDictionary *bus = OSDictionary::withCapacity(3);
+    OSDictionary *bus = OSDictionary::withCapacity(4);
+    // IOGraphics requires a bus ID to start the interface. It scopes bus 0 to this framebuffer.
+    OSNumber *id = OSNumber::withNumber((UInt64)0, 32);
     OSNumber *type = OSNumber::withNumber((UInt64)kIOI2CBusTypeI2C, 32);
     OSNumber *tx = OSNumber::withNumber((UInt64)((1u << kIOI2CNoTransactionType) | (1u << kIOI2CSimpleTransactionType) |
                                                  (1u << kIOI2CDDCciReplyTransactionType)), 32);
     OSNumber *flags = OSNumber::withNumber((UInt64)0, 32);
-    if (buses && bus && type && tx && flags) {
+    if (buses && bus && id && type && tx && flags) {
+        bus->setObject(kIOI2CInterfaceIDKey, id);
         bus->setObject(kIOI2CBusTypeKey, type); bus->setObject(kIOI2CTransactionTypesKey, tx);
         bus->setObject(kIOI2CSupportedCommFlagsKey, flags);
         buses->setObject(bus);
@@ -5663,8 +5525,233 @@ void NVRMNVDAFramebuffer::publishDdcBus()
         fDdcOn = true;
         FBLOG("fb%u: DDC/CI bus published (nvrmfbddc=1)", fIndex);
     }
-    OSSafeReleaseNULL(flags); OSSafeReleaseNULL(tx); OSSafeReleaseNULL(type); OSSafeReleaseNULL(bus); OSSafeReleaseNULL(buses);
+    OSSafeReleaseNULL(flags); OSSafeReleaseNULL(tx); OSSafeReleaseNULL(type); OSSafeReleaseNULL(id);
+    OSSafeReleaseNULL(bus); OSSafeReleaseNULL(buses);
 }
+void NVRMExternalBrightness::setFramebuffer(NVRMNVDAFramebuffer *framebuffer)
+{
+    fFramebuffer = framebuffer;
+    fFramebuffer->retain();
+}
+
+void NVRMExternalBrightness::free()
+{
+    OSSafeReleaseNULL(fRetryDisplay);
+    OSSafeReleaseNULL(fParameters);
+    OSSafeReleaseNULL(fFramebuffer);
+    IODisplayParameterHandler::free();
+}
+
+bool NVRMExternalBrightness::setDisplay(IODisplay *display)
+{
+    OSSafeReleaseNULL(fRetryDisplay);
+    OSSafeReleaseNULL(fParameters);
+    if (!display || OSDynamicCast(IOBacklightDisplay, display) || OSAddAtomic(0, &fFramebuffer->fStopping)) return false;
+    bool retry = false;
+    if (publishParameters(display, retry)) return true;
+    if (!retry) return false;
+    fRetryDisplay = display;
+    fRetryDisplay->retain();
+    fRetryGeneration = __atomic_load_n(&fFramebuffer->fDdcSinkGeneration, __ATOMIC_RELAXED);
+    fRetriesLeft = 4;
+    fFramebuffer->scheduleDdcProbe();
+    return true;
+}
+
+void NVRMExternalBrightness::retryProbe()
+{
+    if (!fRetryDisplay) return;
+    if (fRetryDisplay->isInactive() || !fRetryDisplay->getConnection() ||
+        fRetryGeneration != __atomic_load_n(&fFramebuffer->fDdcSinkGeneration, __ATOMIC_RELAXED)) {
+        OSSafeReleaseNULL(fRetryDisplay);
+        return;
+    }
+    bool retry = true;
+    if (publishParameters(fRetryDisplay, retry)) {
+        IODisplay *display = fRetryDisplay;
+        fRetryDisplay = nullptr;
+        display->messageClients(kIOMessageServicePropertyChange);
+        display->release();
+        return;
+    }
+    if (retry && --fRetriesLeft) fFramebuffer->scheduleDdcProbe();
+    else OSSafeReleaseNULL(fRetryDisplay);
+}
+
+bool NVRMExternalBrightness::publishParameters(IODisplay *display, bool &retry)
+{
+    retry = false;
+    OSObject *old = display->copyProperty(gIODisplayParametersKey);
+    OSDictionary *current = OSDynamicCast(OSDictionary, old);
+    OSDictionary *params = current ? OSDictionary::withDictionary(current) : OSDictionary::withCapacity(4);
+    OSSafeReleaseNULL(old);
+    if (!params) return false;
+    UInt32 value = 0;
+    const bool ownsBrightness = !params->getObject(gIODisplayBrightnessKey);
+    bool ok = ownsBrightness &&
+        fFramebuffer->readDdcBrightness(value, fMaximum, fGeneration, fRetryDisplay ? 80 : 40);
+    retry = ownsBrightness && !ok;
+    if (ok) {
+        ok = IODisplay::addParameter(params, gIODisplayBrightnessKey, 0, static_cast<SInt32>(fMaximum)) &&
+            IODisplay::setParameter(params, gIODisplayBrightnessKey, static_cast<SInt32>(value));
+    }
+
+    // Use the external display brightness route with the verified VCP range.
+    // Leave capabilities already published by an Apple or MCCS handler in place.
+    OSData *capability = nullptr;
+    if (ok && !display->getProperty(kIODisplayCapabilityStringKey)) {
+        static constexpr char externalModel[] = "model(EDM)";
+        capability = OSData::withBytes(externalModel, sizeof(externalModel) - 1);
+        ok = capability && display->setProperty(kIODisplayCapabilityStringKey, capability);
+    }
+    if (ok && display->setProperty(gIODisplayParametersKey, params)) {
+        OSSafeReleaseNULL(capability);
+        fParameters = params;
+        BLLOG("external brightness: published for %s at %u/%u", display->getName(), value, fMaximum);
+        return true;
+    }
+    if (capability && display->getProperty(kIODisplayCapabilityStringKey) == capability)
+        display->removeProperty(kIODisplayCapabilityStringKey);
+    OSSafeReleaseNULL(capability);
+    params->release();
+    return false;
+}
+
+bool NVRMExternalBrightness::doIntegerSet(OSDictionary *params, const OSSymbol *key, UInt32 value)
+{
+    if (key != gIODisplayBrightnessKey || !params || !fParameters || value > fMaximum) return false;
+    OSObject *range = fParameters->getObject(key);
+    if (!range || (params != range && params->getObject(key) != range)) return false;
+    return fFramebuffer->queueDdcBrightness(value, fGeneration);
+}
+
+void NVRMNVDAFramebuffer::publishDdcBrightness()
+{
+    fDdcBrightness = OSTypeAlloc(NVRMExternalBrightness);
+    if (!fDdcBrightness) return;
+    if (!fDdcBrightness->init() || !fDdcBrightness->attach(this)) {
+        OSSafeReleaseNULL(fDdcBrightness);
+        return;
+    }
+    fDdcBrightness->setFramebuffer(this);
+    fDdcBrightnessCall = nvrmfbCall(ddcBrightnessFire, this);
+    fDdcProbeCall = nvrmfbCall(ddcProbeFire, this);
+    if (!fDdcBrightnessCall || !fDdcProbeCall) {
+        if (fDdcBrightnessCall) { thread_call_free(fDdcBrightnessCall); fDdcBrightnessCall = nullptr; }
+        if (fDdcProbeCall) { thread_call_free(fDdcProbeCall); fDdcProbeCall = nullptr; }
+        fDdcBrightness->detach(this);
+        OSSafeReleaseNULL(fDdcBrightness);
+        return;
+    }
+    fDdcBrightness->registerService(kIOServiceSynchronous);
+}
+
+void NVRMNVDAFramebuffer::scheduleDdcProbe()
+{
+    uint64_t deadline;
+    clock_interval_to_deadline(350, kMillisecondScale, &deadline);
+    scheduleCall(fDdcProbeCall, deadline);
+}
+
+void NVRMNVDAFramebuffer::ddcProbeFire(thread_call_param_t p0, thread_call_param_t)
+{
+    auto *fb = static_cast<NVRMNVDAFramebuffer *>(p0);
+    NVRMCallReference callReference(fb);
+    if (OSAddAtomic(0, &fb->fStopping) || !fb->fDdcBrightnessGate) return;
+    const IOReturn r = fb->fDdcBrightnessGate->attemptAction(
+        OSMemberFunctionCast(IOCommandGate::Action, fb, &NVRMNVDAFramebuffer::ddcProbeGated));
+    if (r == kIOReturnCannotLock) fb->scheduleDdcProbe();
+}
+
+IOReturn NVRMNVDAFramebuffer::ddcProbeGated(void *, void *, void *, void *)
+{
+    if (OSAddAtomic(0, &fStopping)) return kIOReturnOffline;
+    fDdcBrightness->retryProbe();
+    return kIOReturnSuccess;
+}
+
+bool NVRMNVDAFramebuffer::readDdcBrightness(UInt32 &value, UInt32 &maximum, UInt32 &generation, unsigned delayMs)
+{
+    if (!fDdcBrightnessGate || OSAddAtomic(0, &fStopping)) return false;
+    generation = __atomic_load_n(&fDdcSinkGeneration, __ATOMIC_RELAXED);
+    unsigned char query[] = {0x51, 0x82, 0x01, 0x10, 0xac};
+    unsigned char reply[11] = {};
+    IOI2CRequest rq = {};
+    rq.sendAddress = 0x6e;
+    rq.sendTransactionType = kIOI2CSimpleTransactionType;
+    rq.sendBytes = sizeof query;
+    rq.sendBuffer = (uintptr_t)query;
+    rq.replyAddress = 0x6f;
+    rq.replyTransactionType = kIOI2CDDCciReplyTransactionType;
+    rq.replyBytes = sizeof reply;
+    rq.replyBuffer = (uintptr_t)reply;
+    nanoseconds_to_absolutetime(uint64_t(delayMs) * 1000000, &rq.minReplyDelay);
+    const IOReturn result = doI2CRequest(0, nullptr, &rq);
+    unsigned char checksum = 0x50;
+    for (const unsigned char byte : reply) checksum ^= byte;
+    value = (UInt32(reply[8]) << 8) | reply[9];
+    maximum = (UInt32(reply[6]) << 8) | reply[7];
+    if (result != kIOReturnSuccess || rq.replyBytes != sizeof reply || checksum || !maximum || value > maximum ||
+        reply[0] != 0x6e || reply[1] != 0x88 || reply[2] != 2 || reply[3] || reply[4] != 0x10 || reply[5] ||
+        generation != __atomic_load_n(&fDdcSinkGeneration, __ATOMIC_RELAXED)) {
+        FBLOG("fb%u: external brightness probe failed: rc 0x%x, %u bytes", fIndex, result, rq.replyBytes);
+        return false;
+    }
+    return true;
+}
+
+bool NVRMNVDAFramebuffer::queueDdcBrightness(UInt32 value, UInt32 generation)
+{
+    if (OSAddAtomic(0, &fStopping) || generation != __atomic_load_n(&fDdcSinkGeneration, __ATOMIC_RELAXED))
+        return false;
+    const UInt64 request = (UInt64(generation) << 32) | (UInt64(value) + 1);
+    __atomic_store_n(&fDdcPending, request, __ATOMIC_RELEASE);
+    setProperty("NVRMExternalBrightnessRequested", value, 32);
+    scheduleCall(fDdcBrightnessCall, 0);
+    return true;
+}
+
+void NVRMNVDAFramebuffer::ddcBrightnessFire(thread_call_param_t p0, thread_call_param_t)
+{
+    auto *fb = static_cast<NVRMNVDAFramebuffer *>(p0);
+    NVRMCallReference callReference(fb);
+    if (OSAddAtomic(0, &fb->fStopping) || !__atomic_load_n(&fb->fDdcPending, __ATOMIC_ACQUIRE))
+        return;
+    const IOReturn r = fb->writeDdcBrightness();
+    if (r == kIOReturnCannotLock) {
+        uint64_t deadline;
+        clock_interval_to_deadline(20, kMillisecondScale, &deadline);
+        fb->scheduleCall(fb->fDdcBrightnessCall, deadline);
+    }
+}
+
+IOReturn NVRMNVDAFramebuffer::writeDdcBrightness()
+{
+    NVRMDdcTransaction transaction(&fDdcInFlight);
+    if (!transaction.held()) return kIOReturnCannotLock;
+    if (OSAddAtomic(0, &fStopping)) return kIOReturnOffline;
+    if (mach_absolute_time() < fDdcWriteAfter) {
+        scheduleCall(fDdcBrightnessCall, fDdcWriteAfter);
+        return kIOReturnSuccess;
+    }
+
+    NVRMBoundedGate gate(0);
+    if (!gate.held()) return kIOReturnCannotLock;
+    const UInt64 request = __atomic_exchange_n(&fDdcPending, 0, __ATOMIC_ACQ_REL);
+    if (!request || (request >> 32) != __atomic_load_n(&fDdcSinkGeneration, __ATOMIC_RELAXED) ||
+        fDpyLost || fEdidSwapped || fHidden || fHeadSlept || !fModeSet || !__atomic_load_n(&fDdcPowered, __ATOMIC_ACQUIRE))
+        return kIOReturnOffline;
+
+    const UInt32 value = static_cast<UInt32>(request) - 1;
+    unsigned char msg[] = {0x51, 0x84, 0x03, 0x10, (unsigned char)(value >> 8), (unsigned char)value, 0x6e};
+    for (unsigned i = 0; i + 1 < sizeof msg; ++i) msg[6] ^= msg[i];
+    const IOReturn r = ddcTransfer(kNvrmDdcWrite, 0x37, msg, sizeof msg);
+    setProperty("NVRMExternalBrightnessWriteStatus", (UInt32)r, 32);
+    if (r == kIOReturnSuccess) setProperty("NVRMExternalBrightnessWritten", value, 32);
+    clock_interval_to_deadline(40, kMillisecondScale, &fDdcWriteAfter);
+    return r;
+}
+
 // IOFramebufferI2CInterface::startIO refuses a request while !isPowered() (pendingPowerState == 0). This class replaces
 // setPowerState, which is what sets it in the family, so it stayed 0 and every request was answered "offline" before it
 // reached doI2CRequest. Set it from the framebuffer's own gate: 1 = on, 0 = off, never 2 (restoreFramebuffer's branch),
@@ -5672,6 +5759,7 @@ void NVRMNVDAFramebuffer::publishDdcBus()
 IOReturn NVRMNVDAFramebuffer::ddcPowerGated(void *on, void *, void *, void *)
 {
     pendingPowerState = on ? 1 : 0;
+    __atomic_store_n(&fDdcPowered, on != nullptr, __ATOMIC_RELEASE);
     return kIOReturnSuccess;
 }
 void NVRMNVDAFramebuffer::ddcSetPowered(bool on)
@@ -5703,14 +5791,19 @@ IOReturn NVRMNVDAFramebuffer::ddcTransfer(unsigned op, unsigned addr7, unsigned 
     fn->release();
     return r;
 }
-IOReturn NVRMNVDAFramebuffer::doI2CRequest(UInt32 bus, struct IOI2CBusTiming *timing, struct IOI2CRequest *rq)
+IOReturn NVRMNVDAFramebuffer::doI2CRequest(UInt32 bus, struct IOI2CBusTiming *, struct IOI2CRequest *rq)
 {
-    if (fDdcFunction) return doDdcBrightnessRequest(bus, timing, rq);
     if (!rq) return kIOReturnBadArgument;
     IOReturn res = kIOReturnSuccess;
     if (!fDdcOn || bus != 0 || fDpyLost || !fKms) res = kIOReturnUnsupported;
     else if (rq->commFlags & kIOI2CUseSubAddressCommFlag) res = kIOReturnUnsupportedMode;
     else {
+        NVRMDdcTransaction transaction(&fDdcInFlight);
+        if (!transaction.held()) {
+            rq->result = kIOReturnBusy;
+            if (rq->completion) (*rq->completion)(rq);
+            return kIOReturnBusy;
+        }
         const bool send = rq->sendTransactionType != kIOI2CNoTransactionType && rq->sendBytes;
         const bool reply = rq->replyTransactionType != kIOI2CNoTransactionType && rq->replyBytes;
         const bool simpleSend = rq->sendTransactionType == kIOI2CSimpleTransactionType;
@@ -5729,10 +5822,12 @@ IOReturn NVRMNVDAFramebuffer::doI2CRequest(UInt32 bus, struct IOI2CBusTiming *ti
                 if (send) IOSleep(nvrmDdcReplyDelayMs(ns));
                 unsigned want = rq->replyBytes > kNvrmDdcMax ? kNvrmDdcMax : rq->replyBytes;
                 res = a ? ddcTransfer(kNvrmDdcRead, a, (unsigned char *)(uintptr_t)rq->replyBuffer, want) : kIOReturnBadArgument;
-                if (res == kIOReturnSuccess)
+                if (res == kIOReturnSuccess) {
                     rq->replyBytes = rq->replyTransactionType == kIOI2CDDCciReplyTransactionType
                         ? nvrmDdcReplyLength((const unsigned char *)(uintptr_t)rq->replyBuffer, want) : want;
-                else if (res != kIOReturnBadArgument) res = kIOReturnNoDevice;
+                    if (a == 0x37)
+                        clock_interval_to_deadline(140, kMillisecondScale, &fDdcWriteAfter);
+                } else if (res != kIOReturnBadArgument) res = kIOReturnNoDevice;
             }
         }
     }

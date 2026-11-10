@@ -17,19 +17,14 @@ VULKAN_LINKS = {
 }
 PLUGIN = Path('Library/GPUBundles/NVMTLDriver.bundle')
 NVRM = Path('Library/Extensions/NVRM.kext')
-KEXTS = {
-    NVRM,
-    Path('Library/Extensions/NVRMFB.kext'),
-    Path('Library/Extensions/NVAccel.kext'),
-    Path('Library/NullMoth/kexts/15/NVAccel.kext'),
-    Path('Library/NullMoth/kexts/26/NVAccel.kext'),
+FRAMEBUFFER = Path('Library/Extensions/NVRMFB.kext')
+PAYLOAD = {
+    FRAMEBUFFER / 'Contents/MacOS/NVRMFB',
+    FRAMEBUFFER / 'Contents/Info.plist',
+    FRAMEBUFFER / 'Contents/_CodeSignature/CodeResources',
+    PLUGIN / 'Contents/MacOS/NVMTLDriver',
+    PLUGIN / 'Contents/MacOS/libnvencvt.dylib',
 }
-PAYLOAD = {p / 'Contents/MacOS' / p.stem for p in KEXTS | {PLUGIN}}
-PAYLOAD |= {p / 'Contents/Info.plist' for p in KEXTS if p.stem == 'NVAccel'}
-PAYLOAD |= {PLUGIN / 'Contents/MacOS/libnvencvt.dylib'}
-PAYLOAD |= {Path('licenses') / name for name in (
-    'Lilu-LICENSE.txt', 'VirtualSMC-LICENSE.txt', 'SMCNvidiaGPU-LICENSE.txt'
-)}
 
 
 def digest(path):
@@ -77,6 +72,7 @@ def assemble(archive, output):
         files(root, VULKAN_LINKS)
         run('/usr/bin/shasum', '-a', '256', '--strict', '-c', '--quiet', 'SHA256SUMS', cwd=root)
         for name in sorted(PAYLOAD):
+            (root / name).parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(payload / name, root / name)
         # The base CFBundleVersion stays compatible with the other kexts. The checker reads the overlay tag separately.
         nvrm_plist = root / NVRM / 'Contents/Info.plist'
@@ -85,8 +81,9 @@ def assemble(archive, output):
         nvrm_plist.write_bytes(plistlib.dumps(nvrm_info, sort_keys=False))
         run('/usr/bin/xattr', '-cr', str(root))
         run('/usr/bin/codesign', '--force', '--sign', '-', str(root / PLUGIN / 'Contents/MacOS/libnvencvt.dylib'))
-        for path in sorted(KEXTS | {PLUGIN}):
+        for path in (NVRM, PLUGIN):
             run('/usr/bin/codesign', '--force', '--sign', '-', str(root / path))
+        for path in (NVRM, FRAMEBUFFER, PLUGIN):
             run('/usr/bin/codesign', '--verify', '--deep', '--strict', str(root / path))
         original = root / 'BASELINE-IDENTITY.json'
         shutil.copyfile(original, root / 'UPSTREAM-BASELINE-IDENTITY.json')

@@ -8,24 +8,102 @@ translator/  Based on metal2vulkan, Copyright (C) Anees Iqbal
              (translator/LICENSE, translator/COPYING). Modifications by NullMoth Systems
              are released under the same licence.
 
-kexts/       Builds against NVIDIA's open GPU kernel modules 615.78.08, MIT (with GPL-2.0 alternatives
+kexts/       Builds against NVIDIA's open GPU kernel modules 620.70.06, MIT (with GPL-2.0 alternatives
              where noted), https://github.com/NVIDIA/open-gpu-kernel-modules
              (licenses/NVIDIA-open-gpu-kernel-modules-COPYING.txt).
 
 NVK          Vulkan driver from Mesa, MIT (licenses/Mesa-license.rst). NullMoth's changes ship as patches.
+             NAK's Rust crates (paste, proc-macro2, quote, rustc-hash, syn, unicode-ident; MIT and/or Apache-2.0): licenses/nvk-rust-crates.txt.
 
-GSP firmware gsp_tu10x.bin, gsp_ga10x.bin and the matching ucode images from NVIDIA's 615.78.08 driver,
-             redistributed unmodified under NVIDIA's licence (licenses/NVIDIA-firmware-LICENCE.txt), the same
-             terms under which linux-firmware redistributes these images.
+Vulkan loader  The Khronos Vulkan-Loader v1.4.367 (commit aa6dee8385afe4b2cc0152d086af2184743e16fd), built unmodified from source
+             for x86_64 by build/build_vulkan_loader.sh and offered to applications by package/vulkan-for-apps.sh,
+             Apache-2.0 (licenses/Vulkan-Loader-LICENSE.txt), https://github.com/KhronosGroup/Vulkan-Loader. Built against
+             Vulkan-Headers v1.4.367 (commit 9fbc2a782ee3f8a4db64e7d991e23da75e893f44), Apache-2.0.
+
+GSP firmware gsp_tu10x.bin, gsp_ga10x.bin and the matching ucode images are not part of this package. The installer
+             (package/fw_fetch.sh) reads them, unmodified, from NVIDIA's own 620.70.06 Linux driver package downloaded
+             to the user's Mac and checks each against a pinned SHA-256. They stay under NVIDIA's licence
+             (licenses/NVIDIA-firmware-LICENCE.txt is the text that applies to those files).
+
+kexts/NMGopFB  Finding the firmware framebuffer, checking it against the GPU's memory BARs and mapping it write-combined
+             follow PrimeBridge by myvoow, https://github.com/myvoow/PrimeBridge (BootFramebuffer.cpp), MIT License,
+             Copyright (c) 2026 myvoow (licenses/PrimeBridge-LICENSE.txt), whose author allowed this project to use and link it.
+             The panel-provider design is NullMoth's own; PrimeBridge's patched NVRMFB is not used.
 
 kexts/NMIntelFB  Panel brightness follows the method of WhateverXe's panel PWM (XELP::PanelPWM) by b00t0x,
              https://github.com/b00t0x/WhateverXe, BSD-3-Clause, Copyright (c) 2018 vit9696
              (licenses/WhateverXe-LICENSE.txt). Register layout from Linux i915/xe display headers, MIT.
+             The hybrid-laptop sleep and wake replay (nm_hybrid_resume*.h: display core init, display clock, combo and Cx0 PHY
+             sequences, link training, drive tables), the Type-C connect flow (nm_hybrid_tc.h), and the C20 PHY PLL tables
+             (nm_hybrid_c20tables.h, copied value for value) are ported from the Linux kernel's i915/xe display driver
+             (drivers/gpu/drm/i915/display), MIT, Copyright (c) Intel Corporation and the i915 contributors
+             (licenses/Linux-i915-display-LICENSE.txt).
              No Apple driver code is used or shipped.
 
 NMXAudio     The HD Audio controller and codec layers are FreeBSD's snd_hda (sys/dev/sound/pci/hda: hdac.c,
              hdaa.c, hdacc.c, hdaa_patches.c), BSD-2-Clause (licenses/FreeBSD-snd_hda-LICENSE.txt).
              Installed on macOS 26 only, where macOS has no HD Audio driver.
 
+vendor/nvenc  Video encoders and decoders for NVIDIA's NVENC and NVDEC engines, offered to apps through VideoToolbox
+             (libnvencvt.dylib). mickys/nvenc, https://github.com/mickys/nvenc, MIT, Copyright (c) 2026 mickys
+             (licenses/mickys-nvenc-LICENSE.txt). The source is imported unchanged apart from one added
+             function; vendor/nvenc/SOURCE lists the commit and the change. Builds against NVIDIA's MIT-licensed
+             open-gpu-kernel-modules and open-gpu-doc headers and Apple's decoder interface as published in WebKit (BSD).
+
+translator/  The Rust crates linked into the translator (bitflags, itoa, libc, memchr, serde, syn and others, all MIT and/or
+             Apache-2.0, one Unlicense-or-MIT) keep their licences: licenses/translator-rust-crates.txt has each licence text.
+
+dlss/        dlss/zstd is the Zstandard 1.5.6 reference decoder, BSD-3-Clause (licenses/zstd-LICENSE.txt); dlss/blake3 is BLAKE3 1.8.2 as
+             vendored by Mesa, used under CC0 1.0 (licenses/BLAKE3-LICENSE-CC0.txt). The package carries no NVIDIA DLSS code: NVIDIA's
+             DLSS runtimes, NGX core and nvJitLink are downloaded by the user's Mac from NVIDIA's public sources, checked against
+             pinned hashes, and stay under NVIDIA's licences (package/dlss_fetch.sh).
+
 air-runtime  LLVM (Apache-2.0 with LLVM exceptions) and Zstandard (BSD-3-Clause); their licence texts are in
              NVMTLDriver.bundle/Contents/Resources/air-runtime.
+
+kexts/NVRMFB EDID override files and the opt-in smaller boot rasters follow an idea by mickys
+             (https://github.com/mickys/nvidia-macos-driver, commit 9c023cd), proposed for this project in
+             pull request 468 by GeekAudio. The implementation here is written independently.
+
+kexts/NVRM   BAR1 placement is clipped to the range IOKit can describe and the aperture list is built before any
+             PCI write (nvrm_bar_limits.h, placeLargeBar1). Community contribution: pull requests #431 (GeekAudio)
+             and #473 (Giraffe12311), based on the bar-preflight experiment by yuanjing-hash.
+
+Community ideas  The shared family-VRAM import cache and the browser surface-publication default follow ideas first
+             published by mickys (https://github.com/mickys/nvidia-macos-driver, PolyForm Noncommercial 1.0.0) and
+             proposed to this project by GeekAudio in pull requests 463 and 481. The code here is NullMoth's own.
+
+kexts/NMHDA  Volume and mute controls for display audio sinks (nmhda_gain.h, nmhda_volume.cpp, boot argument nmhdavol=1)
+             follow the idea published in emirercan3459/nullmoth-nvidia-audio (no licence file): give the sink's engine the
+             standard level and mute controls and scale the samples it writes. The implementation here uses IOAudioFamily's
+             public interface only and is NullMoth's own.
+
+tools        The field census names Raptor Lake-U 8086:A7AC after the Intel Core 5 120U driver project by pongpan-bk
+             (no licence file), which reported the id. Nothing of that project is used.
+
+kexts/NMSMN  Opt-in (nmsmn=1) root-only access to the SMU mailbox registers of an AMD host bridge, so a power-limit tool can run.
+             tools/ryzenadj-macos holds NullMoth's macOS layer for RyzenAdj v0.19.0 (FlyGoat/RyzenAdj, LGPL-3.0, commit
+             ea71739b4a3e1a0a624dfd1c9c268a31cb2a4182), which upstream does not have; it is combined with the unmodified tag and
+             its complete source is that folder plus the tag. Idea: LuneFlu/AMDHelper (no licence file).
+
+Community ideas  The hybrid-laptop notes on the Intel panel (sleep leaves the display engine unlit, flat frames before a
+             first image, a start-up delay) come from kitsuneislife/nmx-intel; they were handed to the hybrid work and nothing
+             of that repository is used.
+
+plugin       Opt-in VRAM working copies for buffers (nvmtl_shared_wc.h, NVMTL_SHARED_VRAM, NVMTL_MANAGED_OWNED_VRAM) follow
+             ideas from pull request 524 by emretascii (owned staging memory for caller pages that cannot be imported, with the
+             GPU working in VRAM). The code here is NullMoth's own.
+
+nvk          nvk/nvk-upstream-nak.patch carries commits from the Mesa project (MIT licence), listed in the patch header.
+
+kexts/NVRM, kexts/NVRMFB, plugin
+             The notebook power budget (nvrmtgp, with the GPS and NVPCF _DSM families behind nvrmgps and nvrmnvpcf), the
+             integrated-GPU panel proxy head (nvfbigpu) and the switches for the repeat pipeline bind and the encoder's
+             sampler-variant memo (NVMTL_NO_PSO_SKIP, NVMTL_NO_SV_MEMO) follow ideas first published in
+             watchthelight-labs/NvGfx (PolyForm Noncommercial 1.0.0), a fork of this project. The code here is NullMoth's own.
+kexts/NMKbdBacklight  The keyboard backlight plugin follows the structure of VirtualSMC's SMCLightSensor plugin and builds
+             against Lilu and the VirtualSMC SDK (acidanthera, BSD-3-Clause). The report layouts and method encodings it uses
+             were read from the public Linux drivers hid-apple (Apple keyboard backlight reports), ideapad-laptop (Lenovo KBLC,
+             HALS, SALS), thinkpad_acpi (MLCG, MLCS), dell-laptop and dell-smbios-wmi (Dell SMBIOS keyboard light calls), msi-ec (BeardOverflow/msi-ec, GPL-2.0: the source of the MSI firmware-string table facts and the setter encoding; our code is our own), hid-asus (drivers/hid/hid-asus.c: the ASUS N-KEY handshake and brightness
+             feature reports, tools/asus), and OpenRazer (the Razer feature report, tools/razer), which are GPL-2.0, and from the ACPI tables of laptops whose owners sent
+             them in. No code was copied from them; the code here is NullMoth's own.

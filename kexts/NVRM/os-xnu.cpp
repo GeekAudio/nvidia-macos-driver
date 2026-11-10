@@ -213,7 +213,13 @@ NvU64 NV_API_CALL os_get_monotonic_time_ns_hr(void) { NV_XNU_TRC; uint64_t ns; a
 NV_STATUS NV_API_CALL os_get_system_time(NvU32 *sec, NvU32 *usec) { NV_XNU_TRC; clock_sec_t s; clock_usec_t us; clock_get_calendar_microtime(&s, &us); *sec = (NvU32)s; *usec = (NvU32)us; return NV_OK; }
 // A battery means a notebook, and the firmware asks both questions to decide whether to run its mobile policy at
 // all. Both used to answer a flat no, so a laptop was treated as a desktop no matter what it was running on.
-NvBool NV_API_CALL nv_is_chassis_notebook(void)     { NV_XNU_TRC; bool ac, bat; nv_xnu_power_state(&ac, &bat); return bat ? NV_TRUE : NV_FALSE; }
+extern "C" NvBool nv_xnu_power_is_notebook(void);   // os-xnu2.cpp: the NVPCF device or a battery in ACPI, with a platform-power boot-arg set
+NvBool NV_API_CALL nv_is_chassis_notebook(void)
+{
+    NV_XNU_TRC;
+    bool ac, bat; nv_xnu_power_state(&ac, &bat);
+    return (bat || nv_xnu_power_is_notebook()) ? NV_TRUE : NV_FALSE;
+}
 NvBool NV_API_CALL nv_acpi_is_battery_present(void) { NV_XNU_TRC; bool ac, bat; nv_xnu_power_state(&ac, &bat); return bat ? NV_TRUE : NV_FALSE; }
 NvBool NV_API_CALL nv_platform_supports_s0ix(void)  { NV_XNU_TRC; return NV_FALSE; }
 NvBool NV_API_CALL os_is_nvswitch_present(void)     { NV_XNU_TRC; return NV_FALSE; }
@@ -401,7 +407,7 @@ NvU64 nv_xnu_phys_for_kernel_va(const void *va)
     for (unsigned i = 0; i < nv_xnu_maps_high; i++) {
         const char *base = (const char *)__atomic_load_n(&nv_xnu_maps[i].va, __ATOMIC_ACQUIRE);
         if (base && (const char *)va >= base && (const char *)va < base + nv_xnu_maps[i].size)
-            return nv_xnu_maps[i].phys + ((const char *)va - base);
+            return nv_xnu_maps[i].phys + (NvU64)((const char *)va - base);
     }
     return 0;
 }

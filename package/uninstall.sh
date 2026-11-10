@@ -87,10 +87,14 @@ done
 REMOVING=1
 for k in $KEXTS; do rm -rf "$EXT/$k.kext" || die "cannot remove $k"; done
 for b in NVMTLDriver.bundle NVIDIAShared.bundle nvmtl nvmtl-allow.txt; do rm -rf "$GB/$b" || die "cannot remove $b"; done
+# the optional Safari copy (package/safari_gpu_copy.sh), if one was made
+[ ! -f "$(dirname "$0")/safari_gpu_copy.sh" ] || /bin/bash "$(dirname "$0")/safari_gpu_copy.sh" remove || true
 rm -rf /Library/NullMoth/kexts /Library/NullMoth/nvfw /Library/NullMoth/licenses /Library/NullMoth/dlss /Library/NullMoth/driver-version /Library/NullMoth/update-pending /Library/LaunchDaemons/com.nullmoth.osupdate.plist || die "cannot remove the cached driver or update switcher"
 # the firmware used to live here; an install no longer writes it, so take the leftover with us
 rm -rf /Users/Shared/nvfw 2>/dev/null || true
 # the install's fallback job and the boot guard's counters (a removed driver has nothing to fall back to)
+# the optional GPU boost daemon (package/boost_daemon.sh), if one was installed
+[ ! -f "$(dirname "$0")/boost_daemon.sh" ] || /bin/bash "$(dirname "$0")/boost_daemon.sh" remove || true
 launchctl bootout system/com.nullmoth.lastgood 2>/dev/null || true
 rm -f /Library/LaunchDaemons/com.nullmoth.lastgood.plist /Library/NullMoth/lastgood.sh || die "cannot remove the fallback job"
 launchctl bootout system/com.nullmoth.bootguard 2>/dev/null || true

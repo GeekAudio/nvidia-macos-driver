@@ -9522,7 +9522,7 @@ diff -ruN a/src/nouveau/vulkan/nvkmd/nvrm/nvkmd_nvrm.h b/src/nouveau/vulkan/nvkm
 diff -ruN a/src/nouveau/vulkan/nvkmd/nvrm/nvkmd_nvrm_ctx.c b/src/nouveau/vulkan/nvkmd/nvrm/nvkmd_nvrm_ctx.c
 --- a/src/nouveau/vulkan/nvkmd/nvrm/nvkmd_nvrm_ctx.c	1969-12-31 16:00:00
 +++ b/src/nouveau/vulkan/nvkmd/nvrm/nvkmd_nvrm_ctx.c	2026-10-29 17:38:59
-@@ -0,0 +1,1452 @@
+@@ -0,0 +1,1529 @@
 +/*
 + * Copyright © 2024 Collabora Ltd. and Red Hat Inc.
 + * SPDX-License-Identifier: MIT
@@ -10232,10 +10232,10 @@ diff -ruN a/src/nouveau/vulkan/nvkmd/nvrm/nvkmd_nvrm_ctx.c b/src/nouveau/vulkan/
 +                  NV_STATUS r = nvRmApiControl(&rm, ctx->hTsg, 0xa06c0103 /* NVA06C_CTRL_CMD_SET_TIMESLICE */, &tsp, sizeof tsp);
 +                  fprintf(stderr, "nvrm: tsgsched TSG 0x%x (gfx queue %d) timeslice %llu us -> 0x%x\n", (unsigned)ctx->hTsg, qidx, (unsigned long long)tsp.timesliceUs, (unsigned)r);
 +               }
-+               if (qidx == 0 && hie && hie[0] == '1') {
-+                  NvU32 lv = 2; /* NVA06C_CTRL_INTERLEAVE_LEVEL_HIGH */
++               if (qidx == 0 && hie && (hie[0] == '1' || hie[0] == '0')) {
++                  NvU32 lv = hie[0] == '1' ? 2 : 0; /* NVA06C_CTRL_INTERLEAVE_LEVEL_HIGH, or _LOW for 0 */
 +                  NV_STATUS r = nvRmApiControl(&rm, ctx->hTsg, 0xa06c0107 /* NVA06C_CTRL_CMD_SET_INTERLEAVE_LEVEL */, &lv, sizeof lv);
-+                  fprintf(stderr, "nvrm: tsgsched TSG 0x%x (gfx queue 0) interleave HIGH -> 0x%x\n", (unsigned)ctx->hTsg, (unsigned)r);
++                  fprintf(stderr, "nvrm: tsgsched TSG 0x%x (gfx queue 0) interleave %s -> 0x%x\n", (unsigned)ctx->hTsg, lv == 2 ? "HIGH" : "LOW", (unsigned)r);
 +               }
 +            }
 +         } else {
@@ -10975,6 +10975,83 @@ diff -ruN a/src/nouveau/vulkan/nvkmd/nvrm/nvkmd_nvrm_ctx.c b/src/nouveau/vulkan/
 +      return nvkmd_nvrm_create_exec_ctx(dev, log_obj, engines, ctx_out);
 +   }
 +}
++/*
++ * Game Mode (the plugin calls this through dlsym, with the notify state the policy helper publishes): re-apply the scheduling
++ * of THIS process's graphics channel groups while they run. The groups are the ones nvkmd_nvrm_create_ctx made; the controls
++ * are the same NVA06C_CTRL_CMD_SET_INTERLEAVE_LEVEL (0xa06c0107) and SET_TIMESLICE (0xa06c0103) it applies at creation.
++ *   interleave_level  0 LOW, 1 MEDIUM, 2 HIGH, or -1 to put every group back to what it had before its first change
++ *   timeslice_us      0 leaves the timeslice alone (with -1 the saved timeslice is restored)
++ * The first change of a group records its interleave level and timeslice (GET_INTERLEAVE_LEVEL 0xa06c0108, GET_TIMESLICE
++ * 0xa06c0104), so a restore returns exactly what RM had. Returns the number of groups changed, or -1 for an argument out of
++ * range. A group made after the call is not touched by it.
++ */
++static struct {
++   const void *ctx;
++   NvHandle hTsg;
++   NvU32 level;
++   NvU64 slice;
++   bool have;
++} nvmtl_tsg_saved[NVRM_CTX_MAX];
++
++__attribute__((visibility("default"))) int nvmtl_nvk_tsg_reprioritise_v1(int interleave_level, unsigned long timeslice_us);
++__attribute__((visibility("default"))) int
++nvmtl_nvk_tsg_reprioritise_v1(int interleave_level, unsigned long timeslice_us)
++{
++   if (interleave_level < -1 || interleave_level > 2 || timeslice_us > 1000000UL)
++      return -1;
++   int changed = 0;
++   pthread_mutex_lock(&nvkmd_nvrm_gsub_mtx);
++   for (unsigned i = 0; i < NVRM_CTX_MAX; i++) {
++      struct nvkmd_nvrm_exec_ctx *c = nvkmd_nvrm_slots[i].ctx;
++      if (c == NULL || c->ceOnly || c->hTsg == 0)
++         continue;
++      struct nvkmd_nvrm_dev *dev = nvkmd_nvrm_dev(c->base.dev);
++      struct nvkmd_nvrm_pdev *pdev = nvkmd_nvrm_pdev(dev->base.pdev);
++      struct NvRmApi rm;
++      nvkmd_nvrm_dev_api_ctl(pdev, &rm);
++      if (nvmtl_tsg_saved[i].ctx != c || nvmtl_tsg_saved[i].hTsg != c->hTsg) {   /* a new group in this slot: drop the old record */
++         nvmtl_tsg_saved[i].ctx = c;
++         nvmtl_tsg_saved[i].hTsg = c->hTsg;
++         nvmtl_tsg_saved[i].have = false;
++      }
++      struct { NvU64 timesliceUs; } __attribute__((aligned(8))) ts = { 0 };
++      if (interleave_level < 0) {
++         if (!nvmtl_tsg_saved[i].have)
++            continue;
++         NvU32 lv = nvmtl_tsg_saved[i].level;
++         ts.timesliceUs = nvmtl_tsg_saved[i].slice;
++         NV_STATUS a = nvRmApiControl(&rm, c->hTsg, 0xa06c0107, &lv, sizeof lv);
++         NV_STATUS b = ts.timesliceUs ? nvRmApiControl(&rm, c->hTsg, 0xa06c0103, &ts, sizeof ts) : NV_OK;
++         if (a == NV_OK && b == NV_OK) {
++            nvmtl_tsg_saved[i].have = false;
++            changed++;
++         }
++         continue;
++      }
++      if (!nvmtl_tsg_saved[i].have) {
++         NvU32 cur = 1;   /* MEDIUM is RM's default if it will not say */
++         if (nvRmApiControl(&rm, c->hTsg, 0xa06c0108, &cur, sizeof cur) != NV_OK)
++            cur = 1;
++         if (nvRmApiControl(&rm, c->hTsg, 0xa06c0104, &ts, sizeof ts) != NV_OK)
++            ts.timesliceUs = 0;
++         nvmtl_tsg_saved[i].level = cur;
++         nvmtl_tsg_saved[i].slice = ts.timesliceUs;
++         nvmtl_tsg_saved[i].have = true;
++      }
++      NvU32 lv = (NvU32)interleave_level;
++      NV_STATUS a = nvRmApiControl(&rm, c->hTsg, 0xa06c0107, &lv, sizeof lv);
++      NV_STATUS b = NV_OK;
++      if (timeslice_us) {
++         ts.timesliceUs = timeslice_us;
++         b = nvRmApiControl(&rm, c->hTsg, 0xa06c0103, &ts, sizeof ts);
++      }
++      if (a == NV_OK && b == NV_OK)
++         changed++;
++   }
++   pthread_mutex_unlock(&nvkmd_nvrm_gsub_mtx);
++   return changed;
++}
++
 diff -ruN a/src/nouveau/vulkan/nvkmd/nvrm/nvkmd_nvrm_dev.c b/src/nouveau/vulkan/nvkmd/nvrm/nvkmd_nvrm_dev.c
 --- a/src/nouveau/vulkan/nvkmd/nvrm/nvkmd_nvrm_dev.c	1969-12-31 16:00:00
 +++ b/src/nouveau/vulkan/nvkmd/nvrm/nvkmd_nvrm_dev.c	2026-10-05 13:10:16
@@ -13633,15 +13710,15 @@ diff -ruN a/src/nouveau/vulkan/nvmtl_nvk_sass.c b/src/nouveau/vulkan/nvmtl_nvk_s
 + * THE CBUF0 IS NVIDIA'S, NOT NVK'S. `nvk_root_descriptor_table` is NAK's own convention: it has
 + * nothing at 0x358, 0x37c or 0x380 and no global memory descriptor at all. An nvcc/ptxas cubin
 + * reads all four. So this builds a SECOND, nvcc-shaped constant buffer and binds it to the QMD's
-+ * cbuf0 slot — never the root table. Offsets below were measured by disassembling cubins
-+ * (reference_nvcc_cbuf0_layout_sm120), and cross-checked from the other side on: a cubin
++ * cbuf0 slot — never the root table. Offsets below come from cubins compiled from our own sources
++ * and from tinygrad's launcher (MIT, runtime/ops_nv.py), and are cross-checked from the other side: a cubin
 + * our own compiler produced has .nv.constant0 = 904 bytes = 0x380 + 8 for one 8-byte parameter,
 + * and 912 = 0x380 + 16 for two.
 + *
 + * THE DESCRIPTOR AT 0x358 IS NOT OPTIONAL AND IT MUST NOT BE ZERO. Every nvcc global access on
 + * sm_90+ assembles to `STG.E desc[UR4][R2.64]`, with UR4:UR5 loaded by
 + * `LDCU.64 UR4, c[0x0][0x358]`. With the pair zero the SM raises "Invalid Address Space" before
-+ * touching memory — that cost a GPU run (18:14:35, Xid 13, ESR 0x505730=0x10).
++ * touching memory — the fault reported is Xid 13, ESR 0x505730=0x10.
 + * 1 << 60 is the smallest valid descriptor with no cache policy attached.
 + */
 +

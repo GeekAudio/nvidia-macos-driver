@@ -7,6 +7,12 @@
 #include "nvrm_off.h"
 #include "nv-xnu.h"
 #include "nvrm_utilization.h"
+#include "nvrm_bar_limits.h"
+#include "nvrm_off_bar.h"
+#include "nvrm_startup_policy.h"
+#include "nvrm_bar_recover.h"
+#include "nvrm_shutdown_plan.h"
+#include "nvrm_aspm.h"
 
 extern "C" void nv_xnu_power_refresh(void);   // nv_xnu_power.cpp
 #include <IOKit/IOService.h>
@@ -57,8 +63,40 @@ __private_extern__ int _kext_apple_cc = __APPLE_CC__;
 #define LOG(fmt, ...) do { kprintf("NVRM-xnu: " fmt "\n", ##__VA_ARGS__); IOLog("NVRM-xnu: " fmt "\n", ##__VA_ARGS__); } while (0)
 
 extern "C" { NvBool nvkms_xnu_load(void); }
-static class NVRM *gNVRMService;
+class NVRM;
+#include "nvrm_devtab.h"
+// The GPU objects, newest-start-wins and never cleared unless the boot argument nvmultigpu=1 is present (nvrm_devtab.h).
+static NvrmDevTab<NVRM> gNVRMTab;
+static NvrmStartGate gNVRMGate;
+static NvrmWaitQueue<IOService> gNVRMWait;
+// Offers the oldest refused card to IOKit again. registerService on its PCI device runs matching on it once more, which is
+// how a start() that returned false is retried; the queue holds a reference until then.
+static void nvrmReofferNext(void)
+{
+    if (IOService *p = gNVRMWait.next()) { p->registerService(kIOServiceAsynchronous); p->release(); }
+}
+static bool nvrmMultiGpu(void)
+{
+    static int on = -1;
+    if (on < 0) { uint32_t v = 0; on = (PE_parse_boot_argn("nvmultigpu", &v, sizeof v) && v) ? 1 : 0; if (on) kprintf("NVRM-xnu: nvmultigpu=1: more than one card may be accelerated, one start-up at a time\n"); }
+    return on == 1;
+}
+#include "nv_rtd3_policy.h"
+extern "C" void nv_rtd3_arm(const struct nv_rtd3_ops *ops);
+extern "C" void nvrm_power_start(nv_state_t *nv);   // nvrm_power.cpp
+extern "C" void nvrm_power_stop(void);
+extern "C" void nvrm_power_suspend(void);
+extern "C" void nvrm_power_resume(void);
+extern "C" int  nv_rtd3_before_system_resume(void);
+extern "C" int  nv_rtd3_power_off(IOACPIPlatformDevice *acpi);
+extern "C" int  nv_rtd3_power_on(IOACPIPlatformDevice *acpi);
 extern "C" nv_state_t *nv_xnu_gpu_state(void);
+extern "C" nv_state_t *nv_xnu_gpu_state_at(unsigned index);
+extern "C" void *nv_xnu_gpu_os_device_at(unsigned index);
+struct NVRMDdcRequest;
+extern "C" int nvrm_ddc_transfer(struct NVRMDdcRequest *r);   // nvrm_ddc.cpp
+struct NVRMDpAuxRequest;
+extern "C" int nvrm_dpaux_transfer(struct NVRMDpAuxRequest *r);   // nvrm_ddc.cpp
 extern "C" void nv_xnu_log_init(void);
 extern "C" bool nv_xnu_maps_init(void);
 extern "C" void *nvkms_xnu_kapi_table(void);
@@ -101,6 +139,9 @@ class NVRM : public IOService {
     OSDeclareDefaultStructors(NVRM)
     friend class NVRMUserClient;
     friend nv_state_t *nv_xnu_gpu_state(void);
+    friend nv_state_t *nv_xnu_gpu_state_at(unsigned index);
+    friend void *nv_xnu_gpu_os_device_at(unsigned index);
+    bool startGPU(IOService *provider);
 public:
     virtual IOService *probe(IOService *provider, SInt32 *score) override;
     virtual bool start(IOService *provider) override;
@@ -128,7 +169,19 @@ public:
     virtual IOReturn callPlatformFunction(const OSSymbol *fn, bool wait,
                                          void *p1, void *p2, void *p3, void *p4) override;
     virtual IOReturn setPowerState(unsigned long ordinal, IOService *device) override;
+    virtual void systemWillShutdown(IOOptionBits specifier) override;
 private:
+    // PCIe link power (ASPM L1) and the BAR facts published for the app (nvrm-aspm, nvrm-bar1-*, nvrm-above-4g)
+    UInt16 fOrigEpLnkCtl = 0xffff, fOrigUpLnkCtl = 0xffff;   // what the firmware left; 0xffff = not changed by us
+    void enableAspmL1();
+    void restoreAspm();
+    void publishBarFacts();
+    struct RebarFacts { bool cap; UInt32 supported; UInt64 firmwareSize; } fRebar = {};
+    NvrmBarUndo fBarUndo = {};          // what placeLargeBar1 changed, for systemWillShutdown
+    volatile SInt32 fShutdownDone = 0;  // the quiesce thread's finish flag
+    bool fShutdownHandled = false;
+    static void shutdownQuiesce(void *p0, wait_result_t w);
+    static void shutdownFull(void *p0, wait_result_t w);
     // System sleep (S3). NVRM is a power child of the GPU's IOPCIDevice, so it is told to power off before the slot
     // loses power and to power on once IOPCIFamily has the device back in D0.
     enum { kGpuPmRunning = 0, kGpuPmSuspended = 1, kGpuPmLost = 2 };
@@ -142,6 +195,7 @@ private:
     } fPciSave = {};
     void gpuSuspend();
     void gpuResume();
+    void rtd3Arm();   // opt-in D3cold (nvrtd3=1): kexts/NVRM/nv_rtd3.cpp
     void pciSaveForSleep();
     bool pciRestoreAfterWake();
     bool gpuAnswers();
@@ -334,6 +388,14 @@ private:
     // pending length is applied only while the generation it was recorded at is still current.
     NvU64 fMapGen = 0;
     nv_alloc_mapping_list_node_t *fMapHeadAtAcquire = nullptr;   // list head when RM took the write hold
+    // Token mappings (selector 7 advertises them, selector 8 forgets one; see clientMemoryForType). A memory type with
+    // kNvMapTokenBit set names one mapping: its first clientMemoryForType consumes the pending context and keeps the
+    // descriptor it built under that token, so the unmap - which IOKit resolves by calling clientMemoryForType again
+    // with the same type and looking the mapping up on the descriptor it gets back - finds it. Under fMapLock.
+    struct NvMapToken { uint32_t token; IOOptionBits options; IOMemoryDescriptor *md; };
+    NvMapToken *fTok = nullptr;
+    unsigned fNTok = 0;
+    unsigned fTokCap = 0;                // entries fTok has room for (nvrm_tok_table.h)
     bool fIsCtl = true;
     int  fFd = -1;
     int  fPid = 0;
@@ -359,6 +421,8 @@ private:
     static IOReturn sBindFd(OSObject *target, void *reference, IOExternalMethodArguments *args);
     static IOReturn sRetired(OSObject *target, void *reference, IOExternalMethodArguments *args);
     static IOReturn sWaitEvent(OSObject *target, void *reference, IOExternalMethodArguments *args);
+    static IOReturn sCaps(OSObject *target, void *reference, IOExternalMethodArguments *args);
+    static IOReturn sForgetToken(OSObject *target, void *reference, IOExternalMethodArguments *args);
 public:
     volatile UInt32 fEvtSeq = 0;
     UInt32 fEvtMagic = 0x4e564556u;
@@ -564,9 +628,23 @@ static inline bool nvrmNameIsUnknown(const char *s)
     return true;
 }
 
+// Driver off with nvoffbar=1 and this card's BAR1 lost (nvrm_off_bar.h): NVRM claims the card only to repair BAR1.
+static bool nvrmOffBarWanted(IOService *provider)
+{
+    UInt32 on = 0;
+    if (!nvrm_driver_off() || !PE_parse_boot_argn("nvoffbar", &on, sizeof on) || !on) return false;
+    IOPCIDevice *pci = OSDynamicCast(IOPCIDevice, provider);
+    if (!pci || pci->getProperty("nvrm-bar1-placed")) return false;       // not a PCI device, or already repaired this boot
+    if (pci->configRead16(0x00) != 0x10de || pci->configRead8(0x0B) != 0x03) return false;
+    NvrmApertureSpan ap[8]; unsigned n = 0;
+    for (IOItemCount i = 0; i < pci->getDeviceMemoryCount() && n < 8; i++)
+        if (IOMemoryDescriptor *m = pci->getDeviceMemoryWithIndex(i)) { ap[n].base = (UInt64)m->getPhysicalSegment(0, 0, kIOMemoryMapperNone); ap[n].length = m->getLength(); n++; }
+    return nvrmBar64Lost(pci->configRead32(0x10 + 4), pci->configRead32(0x10 + 8), ap, n);    // BAR1 is the 64-bit BAR at 0x14/0x18
+}
+
 IOService *NVRM::probe(IOService *provider, SInt32 *score)
 {
-    { if (nvrm_driver_off()) return NULL; }
+    if (nvrm_driver_off()) return nvrmOffBarWanted(provider) ? super::probe(provider, score) : NULL;
     if (!nvrm_kernel_supported()) { LOG("Darwin %d is not supported by this driver: not claiming the GPU", version_major); return NULL; }
     IOService *res = super::probe(provider, score);
     IOPCIDevice *pci = OSDynamicCast(IOPCIDevice, provider);
@@ -589,7 +667,41 @@ IOService *NVRM::probe(IOService *provider, SInt32 *score)
 
 bool NVRM::start(IOService *provider)
 {
-    { if (nvrm_driver_off()) return false; }
+    // Without nvmultigpu=1 the gate is not there and this is startGPU() unchanged. With it, one card starts at a time and a
+    // card the primary selector did not mark waits for the marked one (the overlapping start-up of the four-card report).
+    const bool multi = nvrmMultiGpu();
+    uint32_t selector = 0; PE_parse_boot_argn("nvselector", &selector, sizeof selector);
+    const bool marked = provider && provider->getProperty("nullmoth-auto-primary") == kOSBooleanTrue;
+    if (!nvrm_gate_enter(&gNVRMGate, multi, marked, selector != 0)) {
+        if (provider && gNVRMWait.add(provider)) provider->retain();
+        LOG("nvmultigpu: another card is starting, or the primary card is not running yet; this card waits to be offered again");
+        // the start that refused us may have finished while we queued: then nobody is left to re-offer us
+        if (!__atomic_load_n(&gNVRMGate.starting, __ATOMIC_ACQUIRE)) nvrmReofferNext();
+        return false;
+    }
+    const bool ok = startGPU(provider);
+    nvrm_gate_leave(&gNVRMGate, multi, ok);
+    if (multi) nvrmReofferNext();   // one waiting card per finished start
+    return ok;
+}
+
+bool NVRM::startGPU(IOService *provider)
+{
+    if (nvrm_driver_off()) {
+        if (nvrmOffBarWanted(provider) && super::start(provider)) {
+            fPCI = OSDynamicCast(IOPCIDevice, provider);
+            if (fPCI) {
+                LOG("driver off, BAR1 lost: placing it so the firmware screen can be shown (nvoffbar=1)");
+                const bool placed = placeLargeBar1();
+                LOG("driver off: BAR1 placement %s", placed ? "done" : "not possible; left as IOPCIFamily had it");
+                fPCI->registerService(kIOServiceAsynchronous);        // matching runs again: NVRMBootFB reads nvrm-bar1-placed
+                // Stay attached with nothing started: systemWillShutdown() puts BAR1, BAR3 and the root port window back as the
+                // firmware left them (fBarUndo), without which some boards do not POST after a shutdown.
+                if (placed) return true;
+            }
+        }
+        return false;
+    }
     if (!nvrm_kernel_supported()) return false;
     nvrm_guard_count_start();
     if (!super::start(provider)) return false;
@@ -597,7 +709,7 @@ bool NVRM::start(IOService *provider)
     if (!fPCI) return false;
     // An unavailable telemetry lock disables this optional interface, not the GPU.
     fUtilizationLock = IOLockAlloc();
-    gNVRMService = this;
+    gNVRMTab.add(this, nvrmMultiGpu(), provider->getProperty("nullmoth-auto-primary") == kOSBooleanTrue);
     nv_xnu_log_init();
     // The kernel mapping table is serialised, so its lock has to exist before RM maps anything.
     if (!nv_xnu_maps_init()) { LOG("IOLockAlloc FAILED for the kernel mapping table"); return false; }
@@ -634,9 +746,18 @@ bool NVRM::start(IOService *provider)
     nv->regs = &nv->bars[NV_GPU_BAR_INDEX_REGS];
     nv->fb   = &nv->bars[NV_GPU_BAR_INDEX_FB];
     snapshotBootScreen();
+    // Firmware leaves bus mastering on for the card it used as console. Until pass 2 the RM has not touched the GPU, and
+    // the first kernel panics of a fresh install were "element modified after free" in 16-byte kalloc elements (values 1
+    // and 0x8040) inside rm_init_rm and rm_init_adapter, on a boot-to-boot random pattern (#529). Bus mastering stays
+    // off until pass 2 turns it on, so nothing the card might still write can reach memory the kernel is reusing.
+    {
+        const UInt16 cmd0 = fPCI->configRead16(0x04);
+        if (cmd0 & 0x4) { fPCI->configWrite16(0x04, (UInt16)(cmd0 & ~0x4u)); LOG("bus mastering was on from firmware (command 0x%04x): off until the RM starts the card", cmd0); }
+    }
     const bool bar1Placed = placeLargeBar1();
     fBar1Placed = bar1Placed;
     readBARs();
+    publishBarFacts();
     {
         const char *nm = rm_get_device_name(nv->pci_info.device_id, nv->subsystem_vendor, nv->subsystem_id);
         if (nm && nm[0] && !nvrmNameIsUnknown(nm)) {
@@ -655,8 +776,8 @@ bool NVRM::start(IOService *provider)
     {
         char nogo[8] = { 0 };
         thread_t th = THREAD_NULL;
-        fAutoGoSettleMs = bar1Placed ? (nvrmIsTuringDeviceId(nv->pci_info.device_id) ? 10000 : 500) : 100000;
-        { uint32_t ms = 0; if (PE_parse_boot_argn("nvrmsettle", &ms, sizeof(ms))) fAutoGoSettleMs = ms; }
+        { uint32_t ms = 0; const bool haveArg = PE_parse_boot_argn("nvrmsettle", &ms, sizeof(ms));
+          fAutoGoSettleMs = nvrmAutoGoSettleMs(bar1Placed, nvrmIsTuringDeviceId(nv->pci_info.device_id), haveArg, ms); }
         if (PE_parse_boot_argn("-nvrmnogo", nogo, sizeof(nogo))) {
             setProperty("nvrm-autogo", "off (-nvrmnogo)"); LOG("auto-go OFF (-nvrmnogo): idle until `nvrmctl go <pass>`");
         } else {
@@ -677,6 +798,9 @@ bool NVRM::start(IOService *provider)
             if (kernel_thread_start(&NVRM::autoGo, this, &th) == KERN_SUCCESS) {
                 thread_deallocate(th);
                 setProperty("nvrm-autogo-settle-ms", fAutoGoSettleMs, 32);
+                // NVAccel reads it from the PCI device it shares with this service to place its headless deadline
+                // after the settle delay instead of inside it.
+                fPCI->setProperty("nvrm-autogo-settle-ms", fAutoGoSettleMs, 32);
                 setProperty("nvrm-autogo", "scheduled");
                 LOG("auto-go: go(2) in %u ms on its own thread (BAR1 %s); registry held busy until the display is armed (cap settle + 40 s)",
                     fAutoGoSettleMs, bar1Placed ? "placed outside the console" : "not placed");
@@ -833,7 +957,7 @@ void NVRM::measureBootRaster()
             h, wraps, moves, maxv, mhz / 1000, mhz % 1000, ok ? "MEASURED" : "(not running / unknown)", ht, vt, pc, calc / 1000, calc % 1000);
         if (ok && fBootHead < 0 && ht && vt && pc) { fBootHead = (int)h; fBootPclk = pc; fBootHt = ht; fBootVt = vt; }
         if (ok && gSmoothHead < 0 && ht && vt && pc) { gSmoothHead = (int)h; gSmoothPclk = pc; gSmoothHt = ht; gSmoothVt = vt; }
-        if (ok && o < (int)sizeof(out) - 40) o += snprintf(out + o, sizeof(out) - o, "%shead%u %u.%03uHz", o ? " " : "", h, mhz / 1000, mhz % 1000);
+        if (ok && o < (int)sizeof(out) - 40) o += snprintf(out + o, sizeof(out) - (size_t)o, "%shead%u %u.%03uHz", o ? " " : "", h, mhz / 1000, mhz % 1000);
     }
     setProperty("nvrm-boot-raster", o ? out : "unknown");
     map->release(); md->release();
@@ -918,6 +1042,22 @@ void NVRM::bootHoldCap(thread_call_param_t p0, thread_call_param_t)
     s->release();
 }
 
+// connected-displays of every display nub NVRMFB has enumerated; see nvrmNoDisplayOnAnyConnector
+static bool nvrmNoDisplayAnywhere()
+{
+    int counts[8]; unsigned n = 0;
+    if (OSIterator *it = IOService::getMatchingServices(IOService::serviceMatching("NVRMDisplay"))) {
+        while (OSObject *o = it->getNextObject()) {
+            IOService *sv = OSDynamicCast(IOService, o);
+            if (!sv || n >= 8) continue;
+            OSNumber *cd = OSDynamicCast(OSNumber, sv->getProperty("connected-displays"));
+            counts[n++] = cd ? (int)cd->unsigned32BitValue() : -1;
+        }
+        it->release();
+    }
+    return nvrmNoDisplayOnAnyConnector(counts, n);
+}
+
 void NVRM::autoGo(void *p0, wait_result_t)
 {
     NVRM *s = (NVRM *)p0;
@@ -963,9 +1103,20 @@ void NVRM::autoGo(void *p0, wait_result_t)
     } else {
         s->setProperty("nvrm-autogo", "up");
         int want = 1; if (!PE_parse_boot_argn("nvfbheads", &want, sizeof(want)) || want < 1) want = 1;
+        // Hybrid laptops (boot-arg nmhybrid 1 or 2): the panel is another GPU's framebuffer, published as head 4 of this
+        // accelerator. Arming before it exists leaves it without a pipe until a second write and a WindowServer restart,
+        // so wait for it, bounded by the same 20 s as the NVIDIA heads.
+        bool hyWait = false;
+        { int lv = 0; const int present = PE_parse_boot_argn("nmhybrid", &lv, sizeof(lv)); hyWait = present && lv >= 1 && lv <= 4; }
         int mask = 0, last = -1, still = 0, i;
         for (i = 0; i < 20; i++) {
             if (nvrmSysR("debug.nvaccel_heads_published", &mask) != 0) mask = 0;
+            if (hyWait) {
+                if (mask & 0x10) { LOG("auto-go: hybrid: the other GPU's panel published as head 4 after %d s", i); break; }
+                if (i == 0) LOG("auto-go: hybrid: waiting up to 20 s for the other GPU's panel (head 4) before arming");
+                IOSleep(1000);
+                continue;
+            }
             if ((int)nvrmPop((unsigned)mask) >= want) break;
             still = (mask && mask == last) ? still + 1 : 0; last = mask;
             if (still >= 3) break;
@@ -973,15 +1124,20 @@ void NVRM::autoGo(void *p0, wait_result_t)
                 OSNumber *cd = OSDynamicCast(OSNumber, gDisplayNub0->getProperty("connected-displays"));
                 if (cd && cd->unsigned32BitValue() > 0 && (int)nvrmPop((unsigned)mask) >= (int)cd->unsigned32BitValue()) break;
             }
+            // Every connector list is enumerated and none carries a display (a panel on the Intel or AMD GPU): no head
+            // will ever publish, so waiting out the full twenty seconds only holds the registry for nothing.
+            if (!mask && nvrmNoDisplayAnywhere()) { LOG("auto-go: no display on any NVIDIA connector - not waiting for heads"); break; }
             IOSleep(1000);
         }
         LOG("auto-go: heads published mask 0x%x (%u of nvfbheads %d) after %d s", mask, nvrmPop((unsigned)mask), want, i);
         s->fBringUp = 0;   // the cap may fire from here on; the next line decides whether it got there first
+        const bool earlyRelease = nvrmReleaseBeforeArming((unsigned)mask, nvrmNoDisplayAnywhere());
         if (!OSCompareAndSwap(1, 2, &s->fBootHold)) {
             LOG("auto-go: the hold was already released (cap) — NOT arming with WindowServer up; heads 0x%x", mask);
             s->setProperty("nvrm-display", "not armed: hold released by the cap first");
             s->release(); thread_terminate(current_thread()); return;
         }
+        if (earlyRelease) s->releaseBootHold("no NVIDIA display head can arm yet; arming continues for a later hotplug");
         int armed = 0;
         for (i = 0; i < 10; i++) { nvrmSysW("debug.nvaccelfb", 1); nvrmSysR("debug.nvaccelfb", &armed); if (armed == 1) break; IOSleep(1000); }
         if (armed == 1) nvrmSysW("debug.nvaccelfb", 4);
@@ -999,7 +1155,7 @@ void NVRM::autoGo(void *p0, wait_result_t)
         snprintf(sum, sizeof sum, "heads 0x%x accel %d agdc %d k5 %d iop %d", mask, armed == 1 ? 4 : 0, ag, k5, iop);
         s->setProperty("nvrm-display", sum);
         LOG("auto-go: display stack: %s", sum);
-        s->releaseBootHold(armed == 1 && ag == 1 && iop == 1 ? "display armed" : "display PARTIAL");
+        if (!earlyRelease) s->releaseBootHold(armed == 1 && ag == 1 && iop == 1 ? "display armed" : "display PARTIAL");
         if (armed == 1 && iop == 1 && !PE_parse_boot_argn("-nvrmnoflip", nb, sizeof(nb))) {
             // Zero-copy scan-out shows only what sits in this GPU's VRAM. One setup blacks the screen (cursor only) the
             // moment it starts, and every report was fixed by -nvrmnoflip: a second accelerated GPU (Intel/AMD iGPU;
@@ -1063,7 +1219,8 @@ static void nv_xnu_dump_gsp_regs(nv_state_t *nv)
 // bridge's ACPI _CRS 64-bit window, clipped to the CPU's MAXPHYADDR, top-down, away from every other device and bridge.
 
 // The largest 64-bit memory window in the host bridge's _CRS (QWord Address Space descriptors, ACPI 6.5 6.4.3.5.1).
-static bool nvrmHostWindow(IOService *dev, UInt64 *outMin, UInt64 *outMax)
+static bool nvrmHostWindow(IOService *dev, UInt64 *outMin, UInt64 *outMax,
+                           UInt64 addressMax, bool *advertisedWindow)
 {
     IOACPIPlatformDevice *acpi = NULL;
     IOService *s = dev;
@@ -1084,8 +1241,13 @@ static bool nvrmHostWindow(IOService *dev, UInt64 *outMin, UInt64 *outMax)
                 if (t == 0x8A && len >= 43 && p[i + 3] == 0) {   // QWord Address Space, resource type 0 = memory
                     UInt64 mn, mx, tra;
                     memcpy(&mn, p + i + 14, 8); memcpy(&mx, p + i + 22, 8); memcpy(&tra, p + i + 30, 8);
-                    if (tra == 0 && mn >= (4ULL << 30) && mx > mn && (!found || mx - mn > *outMax - *outMin)) {
-                        *outMin = mn; *outMax = mx; found = true;
+                    if (tra == 0 && mn >= (4ULL << 30) && mx > mn) {
+                        *advertisedWindow = true;
+                        UInt64 clippedMax = 0;
+                        if (nvrmClipBarWindow(mn, mx, addressMax, &clippedMax)
+                            && (!found || clippedMax - mn > *outMax - *outMin)) {
+                            *outMin = mn; *outMax = clippedMax; found = true;
+                        }
                     }
                 }
                 i += 3 + len;
@@ -1181,6 +1343,31 @@ static bool nvrmBusRangeHasOtherDevices(UInt8 first, UInt8 last, IOPCIDevice *se
     return found;
 }
 
+// -nvrmkeepbar1: leave a BAR1 the firmware sized above 8 GB at that size (the behaviour before the 8 GB cap)
+static bool nvrmKeepBar1Size()
+{
+    char nb[8] = { 0 };
+    return PE_parse_boot_argn("-nvrmkeepbar1", nb, sizeof nb);
+}
+
+// True when something is known to be decoded above 4 GB on this machine: this card's own BAR3, or any PCI device's
+// memory aperture. Firmware with Above 4G Decoding off places every BAR below 4 GB.
+static bool nvrmAbove4GRouted(UInt64 ownBar3)
+{
+    if (ownBar3 >= (4ULL << 30)) return true;
+    bool above = false;
+    if (OSIterator *it = IOService::getMatchingServices(IOService::serviceMatching("IOPCIDevice"))) {
+        while (!above) {
+            IOService *d = OSDynamicCast(IOService, it->getNextObject());
+            if (!d) break;
+            for (unsigned i = 0, n = d->getDeviceMemoryCount(); i < n && !above; i++)
+                if (IODeviceMemory *dm = d->getDeviceMemoryWithIndex(i)) above = dm->getPhysicalAddress() >= (4ULL << 30);
+        }
+        it->release();
+    }
+    return above;
+}
+
 bool NVRM::placeLargeBar1()
 {
     static const UInt64 kBigBase = 0x10000000000ULL;
@@ -1198,6 +1385,7 @@ bool NVRM::placeLargeBar1()
         if ((h & 0xffff) == 0x15) { cap = off; break; }
         off = h >> 20;
     }
+    fRebar = {};
     if (!cap) { LOG("bar1: no Resizable BAR capability — BAR1 left as IOPCIFamily placed it"); return false; }
     UInt32 nbars = (fPCI->extendedConfigRead32(cap + 8) >> 5) & 7;
     UInt64 bar1Size = 0;
@@ -1211,6 +1399,7 @@ bool NVRM::placeLargeBar1()
     }
     LOG("bar1: Resizable BAR capability @0x%x says BAR1 = %llu MB (sizes supported mask 0x%x)", cap, bar1Size >> 20, rbSupported);
     const UInt64 fwBar1Size = bar1Size;   // the size the firmware decoded, before any resize below
+    fRebar.cap = true; fRebar.supported = rbSupported; fRebar.firmwareSize = bar1Size;
     // 10-07: with "Resizable BAR" off in the BIOS (or a card the firmware leaves at 256 MB) the firmware places a small
     // BAR1 over the boot screen and the driver had nothing to move. The card itself can resize: take the largest size it
     // supports between 4 GB and 8 GB, written below once the destination is proven free.
@@ -1222,6 +1411,10 @@ bool NVRM::placeLargeBar1()
         newSize = 256ULL << 20;
         LOG("bar1: -nvrmsmallbar set — BAR1 %llu MB will be sized to 256 MB, as on a card without Resizable BAR", bar1Size >> 20);
         bar1Size = newSize;
+    } else if (const UInt64 shrunk = nvrmBar1ShrinkTarget(bar1Size, rbSupported, nvrmKeepBar1Size())) {
+        if (!rbCtlOff) { LOG("bar1: BAR1 is %llu MB and larger than the proven 8 GB, but no resize control was found - left as is", bar1Size >> 20); return false; }
+        LOG("bar1: BAR1 is %llu MB; will resize it to %llu MB (the size proven on hardware; -nvrmkeepbar1 keeps the firmware's)", bar1Size >> 20, shrunk >> 20);
+        newSize = shrunk; bar1Size = shrunk;
     } else if (bar1Size < (4ULL << 30)) {
         for (int k = 13; k >= 12; k--) if (rbCtlOff && (rbSupported >> k) & 1) { newSize = 1ULL << (20 + k); break; }
         // Turing cards offer 64-256 MB only (sizes mask 0x1c0), and some firmware leaves them at 64 MB: a GTX 1630, a
@@ -1308,12 +1501,19 @@ bool NVRM::placeLargeBar1()
     if ((!bar0 && !bar0Size) || !bar3Size) { LOG("bar1: BAR0/BAR3 apertures not found in the nub (bar0 %d bar3 %llu) — not placing", bar0 != NULL, bar3Size); return false; }
     UInt64 wMin = 0, wMax = 0;
     const unsigned physBits = nvrmPhysBits();
-    const UInt64 physTop = physBits >= 63 ? ~0ULL : (1ULL << physBits) - 1;
+    const UInt64 physTop = nvrmBarAddressMax(physBits, PAGE_SHIFT);
     const UInt64 fwBar1 = ((UInt64)old18 << 32) | (lo14 & ~0xFULL);
-    if (nvrmHostWindow(fPCI, &wMin, &wMax)) {
+    bool advertisedWindow = false;
+    if (nvrmHostWindow(fPCI, &wMin, &wMax, physTop, &advertisedWindow)) {
         LOG("bar1: host bridge 64-bit window 0x%llx-0x%llx (ACPI _CRS), CPU reaches %u bits", wMin, wMax, physBits);
-    } else if (fwBar1 < (4ULL << 30)) {
-        // Its BAR1 is fine where it is: with no 64-bit window in _CRS and BAR1 below 4 GB, nothing above 4 GB is routed.
+    } else if (advertisedWindow) {
+        // A real _CRS resource existed, but this API cannot describe any of it.
+        // Do not invent an address outside that resource or touch live BARs.
+        LOG("bar1: advertised host windows exceed CPU/IOKit physical range; keeping firmware BARs untouched");
+        return false;
+    } else if (!nvrmFallbackWindowAllowed(fwBar1, newSize, newSize >= (4ULL << 30) && nvrmAbove4GRouted(bar3Old))) {
+        // Its BAR1 is fine where it is: with no 64-bit window in _CRS and BAR1 below 4 GB, nothing above 4 GB is routed,
+        // unless the card must grow past 4 GB and other devices already sit above it (see nvrmFallbackWindowAllowed).
         LOG("bar1: no 64-bit window in the host bridge's _CRS and the firmware left BAR1 below 4 GB (0x%llx) - not placing", fwBar1);
         return false;
     } else if (const char *why = nvrmIntel39Window(physBits, fwBar1)) {
@@ -1361,10 +1561,50 @@ bool NVRM::placeLargeBar1()
         if (tries >= 16 || bar1Base < wMin + bar1Size) { LOG("bar1: destination is in use — not placing"); return false; }
         bar1Base -= bar1Size; bar3Base = bar1Base + bar1Size; winEnd = bar3Base + bar3Size - 1;
     }
+    // Fully construct the replacement list before changing any hardware. Every
+    // early return below releases staging without publishing it to IOPCIFamily.
+    struct StagedApertures {
+        OSArray *arr;
+        IODeviceMemory *m1, *m3, *m0;
+        ~StagedApertures() {
+            OSSafeReleaseNULL(arr); OSSafeReleaseNULL(m1);
+            OSSafeReleaseNULL(m3); OSSafeReleaseNULL(m0);
+        }
+    } staged = { OSArray::withCapacity((mem ? mem->getCount() : 0) + 3),
+        IODeviceMemory::withRange(bar1Base, bar1Size),
+        IODeviceMemory::withRange(bar3Base, bar3Size),
+        bar0 ? NULL : IODeviceMemory::withRange(lo10 & ~0xFULL, bar0Size) };
+    if (!staged.arr || !staged.m1 || !staged.m3 || (!bar0 && !staged.m0)) {
+        LOG("bar1: preflight descriptor creation failed (array %d BAR1 %d BAR3 %d BAR0 %d); firmware BARs untouched",
+            staged.arr != NULL, staged.m1 != NULL, staged.m3 != NULL, bar0 != NULL || staged.m0 != NULL);
+        return false;
+    }
+    OSArray *arr = staged.arr;
+    if (!arr->setObject(bar0 ? bar0 : staged.m0)
+        || !arr->setObject(staged.m1) || !arr->setObject(staged.m3)) {
+        LOG("bar1: preflight aperture insertion failed; firmware BARs untouched");
+        return false;
+    }
+    const UInt64 bar1Old = ((UInt64)old18 << 32) | (lo14 & ~0xFULL);
+    for (unsigned i = 0; mem && i < mem->getCount(); i++) {
+        IOMemoryDescriptor *m = OSDynamicCast(IOMemoryDescriptor, mem->getObject(i));
+        if (!m || m == bar0) continue;
+        UInt64 pa = m->getPhysicalAddress();
+        if (pa == bar3Old || pa == bar1Old) continue;
+        if (!arr->setObject(m)) {
+            LOG("bar1: preflight could not retain another aperture; firmware BARs untouched");
+            return false;
+        }
+    }
+    LOG("bar1: preflight ready; descriptors and complete aperture list built before PCI writes");
     LOG("bar1: placing BAR1 %llu MB @0x%llx, BAR3 %llu MB @0x%llx, root port window 0x%llx-0x%llx (was 0x%08x %08x/%08x)",
         bar1Size >> 20, bar1Base, bar3Size >> 20, bar3Base, bar1Base, winEnd, rp24, rp28, rp2c);
 
     UInt16 cmd = fPCI->configRead16(0x04);
+    NvrmBarUndo undo = {};
+    undo.cmd = cmd; undo.resized = newSize != 0; undo.rbCtlOff = rbCtlOff; undo.rbCtlOld = rbCtlOld;
+    undo.lo14 = lo14; undo.hi18 = old18; undo.lo1c = lo1c; undo.hi20 = hi20;
+    undo.rp24 = rp24; undo.rp28 = rp28; undo.rp2c = rp2c;
     fPCI->configWrite16(0x04, cmd & ~0x2);
     if (newSize) {   // PCIe 7.8.6: change the size only while memory decode is off
         fPCI->extendedConfigWrite32(rbCtlOff, (rbCtlOld & ~0x3f00u) | ((UInt32)(__builtin_ctzll(newSize) - 20) << 8));
@@ -1397,33 +1637,8 @@ bool NVRM::placeLargeBar1()
     }
     fPCI->configWrite16(0x04, cmd | 0x2);
 
-    const unsigned memCount = mem ? mem->getCount() : 0;
-    OSArray *arr = OSArray::withCapacity(memCount + 3);
-    IODeviceMemory *m1 = IODeviceMemory::withRange(bar1Base, bar1Size), *m3 = IODeviceMemory::withRange(bar3Base, bar3Size);
-    IODeviceMemory *m0 = bar0 ? NULL : IODeviceMemory::withRange(lo10 & ~0xFULL, bar0Size);
-    if (!arr || !m1 || !m3 || (!bar0 && !m0)) {
-        // Put the hardware back as the read-back path above does: returning with BAR1/BAR3 moved but the nub's apertures
-        // unchanged left RM a table that no longer matched the card (NVIDIA's driver restores on every failure path).
-        LOG("bar1: placed in hardware but the aperture list could not be built (no memory) - restoring what IOPCIFamily left");
-        OSSafeReleaseNULL(arr); OSSafeReleaseNULL(m1); OSSafeReleaseNULL(m3); OSSafeReleaseNULL(m0);
-        fPCI->configWrite16(0x04, cmd & ~0x2);
-        rp->configWrite32(0x24, 0x0000fff0); rp->configWrite32(0x28, rp28); rp->configWrite32(0x2c, rp2c); rp->configWrite32(0x24, rp24);
-        if (newSize) fPCI->extendedConfigWrite32(rbCtlOff, rbCtlOld);
-        fPCI->configWrite32(0x14, lo14); fPCI->configWrite32(0x18, old18); fPCI->configWrite32(0x1c, lo1c); fPCI->configWrite32(0x20, hi20);
-        fPCI->configWrite16(0x04, cmd);
-        return false;
-    }
-    arr->setObject(bar0 ? bar0 : m0); arr->setObject(m1); arr->setObject(m3);
-    OSSafeReleaseNULL(m0);
-    for (unsigned i = 0; i < memCount; i++) {
-        IOMemoryDescriptor *m = OSDynamicCast(IOMemoryDescriptor, mem->getObject(i));
-        if (!m || m == bar0) continue;
-        UInt64 pa = m->getPhysicalAddress();
-        if (pa == bar3Old || pa == (old18 & ~0xFULL)) { LOG("bar1: dropping stale aperture 0x%llx+0x%llx", pa, (UInt64)m->getLength()); continue; }
-        arr->setObject(m);
-    }
     fPCI->setDeviceMemory(arr);
-    m1->release(); m3->release(); arr->release();
+    undo.valid = true; fBarUndo = undo;
     fPCI->setProperty("nvrm-bar1-placed", bar1Base, 64);
     LOG("bar1: PLACED — BAR1 %llu MB live at 0x%llx", bar1Size >> 20, bar1Base);
     {
@@ -1474,7 +1689,7 @@ void NVRM::publishGpuProfile()
     const bool staticBar1 = vram && bar1 >= vram;
     OSDictionary *d = OSDictionary::withCapacity(16);
     if (!d) return;
-    auto num = [&](const char *k, UInt64 v, int bits) { if (OSNumber *o = OSNumber::withNumber(v, bits)) { d->setObject(k, o); o->release(); } };
+    auto num = [&](const char *k, UInt64 v, int bits) { if (OSNumber *o = OSNumber::withNumber(v, (unsigned)bits)) { d->setObject(k, o); o->release(); } };
     auto str = [&](const char *k, const char *v) { if (OSString *o = OSString::withCString(v)) { d->setObject(k, o); o->release(); } };
     num("arch", arch, 32); num("impl", impl, 32);
     str("chip", chip); str("generation", gen);
@@ -1486,6 +1701,16 @@ void NVRM::publishGpuProfile()
     str("native-shaders", arch == 0x1B0 ? "sm_120" : "none");
     fPCI->setProperty("nvrm-gpu-profile", d);
     d->release();
+    // The RM named no model for this PCI id at start (see start()), so the card would show as 10DE:xxxx only. The
+    // profile knows the generation and chip; publish those so System Information and the app say what the card is.
+    if (!fPCI->getProperty("model")) {
+        char nm[64];
+        const int len = nvrmFallbackModelName(nm, sizeof nm, gen, chip, fNv.pci_info.device_id);
+        if (len > 0 && (unsigned)len < sizeof nm) {
+            fPCI->setProperty("model", (void *)nm, (unsigned)len + 1);
+            LOG("published model=\"%s\" from the GPU profile (the RM's released-chip table has no name for this id)", nm);
+        }
+    }
     LOG("gpu profile: %s %s, 3d 0x%x copy 0x%x nvenc 0x%x nvdec 0x%x, BAR1 %llu MB of %llu MB VRAM -> scanout %s",
         gen, chip, (unsigned)c3d, (unsigned)ccopy, (unsigned)cenc, (unsigned)cdec, bar1 >> 20, vram >> 20,
         staticBar1 ? "static-bar1" : "by-handle");
@@ -1510,7 +1735,7 @@ void NVRM::readBARs()
             bool is64 = ((lo >> 1) & 3) == 2;
             UInt64 a = lo & ~0xFULL;
             if (is64 && bar < 5) a |= (UInt64)fPCI->configRead32(0x14 + bar * 4) << 32;
-            if (a == (phys & ~0xFULL)) { off = 0x10 + bar * 4; break; }
+            if (a == (phys & ~0xFULL)) { off = (UInt8)(0x10 + bar * 4); break; }   // BAR registers 0x10..0x24
             if (is64) bar++;
         }
         if (off == 0 || size == 0) { kprintf("NVRM-xnu: aperture idx %u phys 0x%llx size 0x%llx: %s — skipped\n", idx, phys, size, off == 0 ? "no BAR register matches" : "zero length"); continue; }
@@ -1522,7 +1747,58 @@ void NVRM::readBARs()
         nv->bars[curNvBar].offset      = off;
         nv->bars[curNvBar].cpu_address = phys;
         nv->bars[curNvBar].size        = size;
-        tn += snprintf(table + tn, sizeof table - tn, "bar%u@0x%02x:0x%llx+0x%llx ", curNvBar, off, phys, size);
+        tn += (unsigned)snprintf(table + tn, sizeof table - tn, "bar%u@0x%02x:0x%llx+0x%llx ", curNvBar, off, phys, size);
+    }
+    // A BIOS without Above 4G Decoding or Resizable BAR can leave the device memory list empty while the BARs are
+    // programmed ("BARS (empty)", os_map_kernel_space start=0x0, RM refuses the device). Take each missing BAR from
+    // assigned-addresses, then from the BAR register itself, and publish the recovered apertures so the framebuffer
+    // and accelerator see the same list as RM.
+    {
+        static const struct { unsigned slot; UInt8 off; } kSlots[] = {
+            { NV_GPU_BAR_INDEX_REGS, 0x10 }, { NV_GPU_BAR_INDEX_FB, 0x14 }, { NV_GPU_BAR_INDEX_IMEM, 0x1c } };
+        OSData *aa = OSDynamicCast(OSData, fPCI->getProperty("assigned-addresses"));
+        const UInt32 *cells = aa ? (const UInt32 *)aa->getBytesNoCopy() : NULL;
+        const unsigned nCells = aa ? aa->getLength() / 4 : 0;
+        IODeviceMemory *made[3] = { NULL, NULL, NULL }; unsigned nMade = 0;
+        for (unsigned k = 0; k < 3; k++) {
+            const unsigned slot = kSlots[k].slot; const UInt8 off = kSlots[k].off;
+            if (nv->bars[slot].size) continue;
+            const UInt32 lo = fPCI->configRead32(off);
+            if (lo & 1) continue;                                   // an I/O BAR, not a memory aperture
+            const bool is64 = ((lo >> 1) & 3) == 2;
+            UInt64 live = lo & ~0xFULL;
+            if (is64) live |= (UInt64)fPCI->configRead32(off + 4) << 32;
+            if (!live) { kprintf("NVRM-xnu: BAR @0x%02x has no address in config space - nothing to recover\n", off); continue; }
+            UInt64 a = 0, sz = 0; const char *src = "assigned-addresses";
+            if (!nvrmAssignedLookup(cells, nCells, off, &a, &sz) || a != live) {
+                // Size it the way firmware does: all ones with memory decode off, then put everything back.
+                src = "config space";
+                const UInt16 cmd = fPCI->configRead16(0x04);
+                const UInt32 hiOld = is64 ? fPCI->configRead32(off + 4) : 0;
+                fPCI->configWrite16(0x04, cmd & ~0x3);
+                fPCI->configWrite32(off, 0xffffffffU); if (is64) fPCI->configWrite32(off + 4, 0xffffffffU);
+                const UInt32 loP = fPCI->configRead32(off), hiP = is64 ? fPCI->configRead32(off + 4) : 0;
+                fPCI->configWrite32(off, lo); if (is64) fPCI->configWrite32(off + 4, hiOld);
+                fPCI->configWrite16(0x04, cmd);
+                a = live; sz = nvrmBarSizeFromProbe(loP, hiP, is64);
+            }
+            if (!sz) { kprintf("NVRM-xnu: BAR @0x%02x at 0x%llx: size unknown - not recovered\n", off, a); continue; }
+            nv->bars[slot].offset = off; nv->bars[slot].cpu_address = a; nv->bars[slot].size = sz;
+            tn += (unsigned)snprintf(table + tn, sizeof table - tn, "bar%u@0x%02x:0x%llx+0x%llx(%s) ", slot, off, a, sz, src);
+            kprintf("NVRM-xnu: BAR @0x%02x recovered from %s: 0x%llx+0x%llx\n", off, src, a, sz);
+            if (nMade < 3) made[nMade++] = IODeviceMemory::withRange(a, sz);
+        }
+        if (nMade) {
+            OSArray *cur = fPCI->getDeviceMemory();
+            OSArray *arr = OSArray::withCapacity((cur ? cur->getCount() : 0) + nMade);
+            bool okArr = arr != NULL;
+            for (unsigned i = 0; okArr && cur && i < cur->getCount(); i++) okArr = arr->setObject(cur->getObject(i));
+            for (unsigned i = 0; i < nMade; i++) { if (okArr && made[i]) okArr = arr->setObject(made[i]); else if (!made[i]) okArr = false; }
+            if (okArr) { fPCI->setDeviceMemory(arr); LOG("bar recovery: %u aperture%s added to the device memory list", nMade, nMade == 1 ? "" : "s"); }
+            else LOG("bar recovery: could not build the aperture list - RM still has the recovered addresses");
+            for (unsigned i = 0; i < nMade; i++) OSSafeReleaseNULL(made[i]);
+            OSSafeReleaseNULL(arr);
+        }
     }
     if (!nv->bars[NV_GPU_BAR_INDEX_FB].size)
         LOG("BAR1 (the VRAM window) has no address from macOS: the GPU cannot start. Enable \"Above 4G Decoding\" in the BIOS, "
@@ -1563,6 +1839,10 @@ IOReturn NVRM::go(uint32_t pass)
             LOG("event locks created for the control device and the GPU");
             rm_write_registry_string(NULL, NULL, "RmMsg", ":", 1);
             rm_write_registry_dword(NULL, NULL, "ResmanDebugLevel", 0);
+            // Tell a wedged GSP from a slow one: with classification on, an RPC that times out while the GSP heartbeat is
+            // dead fails the GPU at the first timeout instead of the third (see nvrmGspTimeoutFatal). A live heartbeat keeps
+            // the RM's own count. Set before nvregdwords so RmGspTimeoutClassification=0 there still wins.
+            rm_write_registry_dword(NULL, NULL, "RmGspTimeoutClassification", 1);
             {   // NVIDIA's registry options, as NVreg_RegistryDwords: nvregdwords=Key=Value;Key2=Value2
                 static char regdw[256];
                 if (PE_parse_boot_argn("nvregdwords", regdw, sizeof regdw) && regdw[0]) {
@@ -1627,6 +1907,8 @@ IOReturn NVRM::go(uint32_t pass)
         fAdapter = true;
         LOG("PASS 2 REACHED: the adapter is up — GSP-RM is running on the card under macOS");
         fPassDone = 2;
+        enableAspmL1();
+        rtd3Arm();
         {
             NvU32 ramKb = 0, totalKb = 0, qst = 0;
             if (nvrm_query_vram_kb(nv->gpu_id, &ramKb, &totalKb, &qst) && ramKb) {
@@ -1642,6 +1924,7 @@ IOReturn NVRM::go(uint32_t pass)
         }
         publishGpuProfile();
         if (nvkms_xnu_load()) nvrm_display_publish(this, fNv.gpu_id);
+        nvrm_power_start(&fNv);   // boot-arg nvrmtgp=1: the notebook power budget while on mains power (nvrm_power.cpp)
     }
     return kIOReturnSuccess;
 }
@@ -1664,6 +1947,7 @@ void NVRM::interruptOccurred(IOInterruptEventSource *src, int count)
 
 void NVRM::stop(IOService *provider)
 {
+    nvrm_power_stop();
     // Keep the lock until free(): another service can retain this object and
     // call its platform interface after stop(), when it must answer NotReady.
     if (fUtilizationLock) {
@@ -1686,7 +1970,164 @@ void NVRM::stop(IOService *provider)
     if (fIntSrc) { fIntSrc->disable(); if (fWorkLoop) fWorkLoop->removeEventSource(fIntSrc); fIntSrc->release(); fIntSrc = NULL; }
     if (fWorkLoop) { fWorkLoop->release(); fWorkLoop = NULL; }
     if (fPrivateState) { rm_free_private_state(NULL, &fNv); fPrivateState = false; }
+    gNVRMTab.remove(this, nvrmMultiGpu());   // a no-op without nvmultigpu=1: the old pointer was never cleared
     super::stop(provider);
+}
+
+// System power-off and restart. Nothing used to run here: the GPU was left running, mastering the bus, with the BAR
+// layout placeLargeBar1 made, and the platform firmware found that on the next start. This does what Linux's
+// nv_pci_shutdown does in spirit: bring the GPU down the way system sleep does (display, user channels, RM standby),
+// then hand the device back (bus mastering off, the firmware's own BAR and root port values restored). The RM step is
+// bounded: a hang there must not turn into a shutdown that never finishes. -nvrmnoshutdown keeps the old behaviour.
+void NVRM::shutdownQuiesce(void *p0, wait_result_t)
+{
+    NVRM *s = (NVRM *)p0;
+    s->gpuSuspend();
+    OSCompareAndSwap(0, 1, &s->fShutdownDone);
+    s->release();   // the retain taken before the thread started
+    thread_terminate(current_thread());
+}
+
+extern "C" { void nvkms_xnu_suspend(NvU32 gpuId); }
+// The full path: display off, user channels stopped, then the RM's own adapter shutdown (what stop() runs after the
+// clients have gone). Reached only through nvrmShutdownMode.
+void NVRM::shutdownFull(void *p0, wait_result_t)
+{
+    NVRM *s = (NVRM *)p0;
+    OSCompareAndSwap(kGpuPmRunning, kGpuPmSuspended, &s->fGpuPm);
+    s->notifyFramebuffers(0);
+    nvkms_xnu_suspend(s->fNv.gpu_id);
+    const int busy = nv_xnu_pm_close(3000);
+    if (busy) LOG("shutdown: %d RM call(s) still running after 3 s", busy);
+    rm_stop_user_channels(NULL, &s->fNv);
+    if (s->fAdapter) { rm_shutdown_adapter(NULL, &s->fNv); s->fAdapter = false; }
+    OSCompareAndSwap(0, 1, &s->fShutdownDone);
+    s->release();
+    thread_terminate(current_thread());
+}
+
+void NVRM::systemWillShutdown(IOOptionBits specifier)
+{
+    char off[8] = { 0 };
+    if (!fShutdownHandled && !PE_parse_boot_argn("-nvrmnoshutdown", off, sizeof off) && fPCI) {
+        fShutdownHandled = true;
+        LOG("shutdown: %s - quiescing the GPU", specifier == kIOMessageSystemWillRestart ? "restart" : "power off");
+        // The interrupt stays on through the standby, as it does on the system-sleep path this reuses (gpuSuspend turns it
+        // off itself once the RM is in standby); it is switched off below, before the BAR layout goes back.
+        if (fAdapter && OSAddAtomic(0, &fGpuPm) == kGpuPmRunning) {
+            thread_t th = THREAD_NULL;
+            char mode[16] = { 0 }; unsigned open = 0;
+            for (int i = 0; i < NV_XNU_MAX_CLIENTS; i++) if (gNvClients[i]) open++;
+            const bool askedFull = PE_parse_boot_argn("nvrmshutdown", mode, sizeof mode) && mode[0] == 'f';
+            const bool full = nvrmShutdownMode(askedFull, open, fAdapter) == kShutdownFull;
+            if (askedFull && !full) LOG("shutdown: full shutdown asked for but %u user client(s) are still open - standby instead", open);
+            retain();
+            if (kernel_thread_start(full ? &NVRM::shutdownFull : &NVRM::shutdownQuiesce, this, &th) == KERN_SUCCESS) {
+                thread_deallocate(th);
+                unsigned waited = 0;
+                while (!OSAddAtomic(0, &fShutdownDone) && waited < 8000) { IOSleep(10); waited += 10; }
+                LOG("shutdown: GPU %s after %u ms", OSAddAtomic(0, &fShutdownDone) ? (full ? "shut down" : "in standby") : "did not finish in time, going on", waited);
+            } else { release(); LOG("shutdown: could not start the quiesce thread - going on"); }
+        }
+        if (fIntSrc) fIntSrc->disable();
+        NvrmStep plan[16];
+        const unsigned n = nvrmBuildShutdownPlan(&fBarUndo, plan, 16);
+        if (n) {
+            // the root port above the bridge this card sits behind (type spelled through fPCI: IOPCIDevice is deprecated)
+            decltype(fPCI) rp = NULL;
+            if (IOService *pp = fPCI->getProvider())
+                if (IOService *up = pp->getProvider()) if (up->metaCast("IOPCIDevice")) rp = static_cast<decltype(fPCI)>(up);
+            for (unsigned i = 0; i < n; i++) {
+                switch (plan[i].kind) {
+                    case kStepCmd16:     fPCI->configWrite16((IOByteCount)plan[i].off, (UInt16)plan[i].value); break;
+                    case kStepExt32:     fPCI->extendedConfigWrite32(plan[i].off, plan[i].value); break;
+                    case kStepCfg32:     fPCI->configWrite32((IOByteCount)plan[i].off, plan[i].value); break;
+                    case kStepRootPort32: if (rp) rp->configWrite32((IOByteCount)plan[i].off, plan[i].value); break;
+                }
+            }
+            LOG("shutdown: BAR1/BAR3 and the root port window put back as the firmware left them (%u writes)", n);
+        } else {
+            fPCI->configWrite16(0x04, (UInt16)(fPCI->configRead16(0x04) & ~0x4u));   // bus mastering off, nothing else moved
+            LOG("shutdown: bus mastering off (the BAR layout was never changed)");
+        }
+    }
+    restoreAspm();
+    super::systemWillShutdown(specifier);
+}
+
+// ---- PCIe link power (ASPM L1) -------------------------------------------------------------------------------------
+// The PCI Express capability's offset in a device's config space, 0 when there is none.
+template <class D> static UInt8 nvrmPcieCap(D *d)
+{
+    for (UInt8 c = d->configRead8(0x34) & 0xfc, n = 0; c && n < 48; c = d->configRead8(c + 1) & 0xfc, n++)
+        if (d->configRead8(c) == 0x10) return c;
+    return 0;
+}
+
+void NVRM::enableAspmL1()
+{
+    char off[8] = { 0 };
+    if (PE_parse_boot_argn("-nvrmnoaspm", off, sizeof off)) { fPCI->setProperty("nvrm-aspm", "off (-nvrmnoaspm)"); return; }
+    // Opt-in (nvrmaspm=1). Linux's default policy keeps the link as the firmware set it, and NVIDIA's own driver turns
+    // L1 on only for chipsets it lists; a desktop link pushed into L1 without the common-clock, L1 substate and LTR set-up
+    // the PCI core does can drop the card off the bus when it idles. Laptop firmware that wants L1 has already set it.
+    { uint32_t on = 0; if (!PE_parse_boot_argn("nvrmaspm", &on, sizeof on) || on != 1) { fPCI->setProperty("nvrm-aspm", "as the firmware set it (nvrmaspm=1 asks for L1)"); return; } }
+    decltype(fPCI) up = NULL;   // the port above the card (IOPCIDevice is deprecated: spelled through fPCI)
+    if (IOService *pp = fPCI->getProvider())
+        if (IOService *u = pp->getProvider()) if (u->metaCast("IOPCIDevice")) up = static_cast<decltype(fPCI)>(u);
+    const UInt8 ec = nvrmPcieCap(fPCI), uc = up ? nvrmPcieCap(up) : 0;
+    NvrmAspmEnd ep = {}, ue = {};
+    if (ec) { ep.present = true; ep.devCap = fPCI->configRead32(ec + 4); ep.lnkCap = fPCI->configRead32(ec + 0x0c); ep.lnkCtl = fPCI->configRead16(ec + 0x10); }
+    if (uc) { ue.present = true; ue.devCap = up->configRead32(uc + 4); ue.lnkCap = up->configRead32(uc + 0x0c); ue.lnkCtl = up->configRead16(uc + 0x10); }
+    unsigned epCtl = 0, upCtl = 0;
+    const NvrmAspmWhy why = nvrmAspmPlan(&ep, &ue, &epCtl, &upCtl);
+    if (why == kAspmEnabled) {
+        if (fOrigEpLnkCtl == 0xffff) { fOrigEpLnkCtl = (UInt16)ep.lnkCtl; fOrigUpLnkCtl = (UInt16)ue.lnkCtl; }
+        up->configWrite16(uc + 0x10, (UInt16)upCtl);   // upstream first, as the PCI core does
+        fPCI->configWrite16(ec + 0x10, (UInt16)epCtl);
+        const bool ok = (fPCI->configRead16(ec + 0x10) & 2) && (up->configRead16(uc + 0x10) & 2);
+        fPCI->setProperty("nvrm-aspm", ok ? "L1" : "L1 requested, not accepted");
+        LOG("aspm: L1 %s on the card's link (card Link Control 0x%04x, upstream 0x%04x)", ok ? "enabled" : "requested but not accepted",
+            fPCI->configRead16(ec + 0x10), up->configRead16(uc + 0x10));
+    } else {
+        fPCI->setProperty("nvrm-aspm", nvrmAspmWhyString(why));
+        LOG("aspm: L1 not changed - %s", nvrmAspmWhyString(why));
+    }
+}
+
+// Puts the firmware's ASPM setting back before power-off, so the next start sees the link as it left it.
+void NVRM::restoreAspm()
+{
+    if (fOrigEpLnkCtl == 0xffff) return;
+    decltype(fPCI) up = NULL;
+    if (IOService *pp = fPCI->getProvider())
+        if (IOService *u = pp->getProvider()) if (u->metaCast("IOPCIDevice")) up = static_cast<decltype(fPCI)>(u);
+    const UInt8 ec = nvrmPcieCap(fPCI), uc = up ? nvrmPcieCap(up) : 0;
+    if (ec) fPCI->configWrite16(ec + 0x10, fOrigEpLnkCtl);
+    if (uc) up->configWrite16(uc + 0x10, fOrigUpLnkCtl);
+    fOrigEpLnkCtl = 0xffff;
+}
+
+// What the app shows about the BAR: sizes in MB and whether the platform decodes above 4 GB. Keys on the PCI device:
+//   nvrm-bar1-firmware-mb  BAR1 as the firmware sized it (0 when the card has no Resizable BAR capability and it was not read)
+//   nvrm-bar1-mb           BAR1 now
+//   nvrm-bar1-addr         BAR1 base address now
+//   nvrm-rebar             "none" (no capability), "off" (capability, BAR1 not above 256 MB), "on" (BAR1 above 256 MB from firmware)
+//   nvrm-rebar-max-mb      the largest size the card offers (0 when there is no capability)
+//   nvrm-above-4g          "yes" when anything is decoded above 4 GB, "no" otherwise
+void NVRM::publishBarFacts()
+{
+    const UInt64 now = fNv.bars[NV_GPU_BAR_INDEX_FB].size;
+    UInt64 maxSz = 0;
+    for (int k = 31; fRebar.cap && k >= 0; k--) if ((fRebar.supported >> k) & 1) { maxSz = 1ULL << (20 + k); break; }
+    const UInt64 fw = fRebar.cap ? fRebar.firmwareSize : 0;
+    fPCI->setProperty("nvrm-bar1-mb", now >> 20, 64);
+    fPCI->setProperty("nvrm-bar1-firmware-mb", fw >> 20, 64);
+    fPCI->setProperty("nvrm-bar1-addr", fNv.bars[NV_GPU_BAR_INDEX_FB].cpu_address, 64);
+    fPCI->setProperty("nvrm-rebar-max-mb", maxSz >> 20, 64);
+    fPCI->setProperty("nvrm-rebar", nvrmRebarState(fRebar.cap, fw));
+    const UInt64 bar3 = fNv.bars[NV_GPU_BAR_INDEX_IMEM].cpu_address;
+    fPCI->setProperty("nvrm-above-4g", nvrmAbove4GRouted(bar3 > fNv.bars[NV_GPU_BAR_INDEX_FB].cpu_address ? bar3 : fNv.bars[NV_GPU_BAR_INDEX_FB].cpu_address) ? "yes" : "no");
 }
 
 void NVRM::free()
@@ -1702,7 +2143,7 @@ IOReturn NVRM::setPowerState(unsigned long ordinal, IOService *device)
     nv_xnu_power_refresh();        // a wake can be a change of power source; this runs before the firmware asks
     const SInt32 pm = OSAddAtomic(0, &fGpuPm);
     if (ordinal == 0 && pm == kGpuPmRunning && fAdapter) gpuSuspend();
-    else if (ordinal != 0 && pm == kGpuPmSuspended) gpuResume();
+    else if (ordinal != 0 && pm == kGpuPmSuspended) { nv_rtd3_before_system_resume(); gpuResume(); }
     else LOG("power: setPowerState %lu (gpu %s, adapter %s) - nothing to do", ordinal,
              pm == kGpuPmRunning ? "running" : pm == kGpuPmSuspended ? "suspended" : "lost", fAdapter ? "up" : "down");
     return kIOPMAckImplied;
@@ -1714,6 +2155,7 @@ void NVRM::gpuSuspend()
 {
     uint64_t t0 = mach_absolute_time();
     fPmCycles++;
+    nvrm_power_suspend();
     OSCompareAndSwap(kGpuPmRunning, kGpuPmSuspended, &fGpuPm);
     setProperty("nvrm-pm", "suspended");
     LOG("sleep #%u: suspending the GPU (NVKMS, then RM standby)", fPmCycles);
@@ -1743,6 +2185,7 @@ void NVRM::gpuResume()
     LOG("wake #%u: resuming the GPU", fPmCycles);
     nv_xnu_pm_take();
     bool ok = pciRestoreAfterWake() && gpuAnswers();
+    if (ok) enableAspmL1();   // the link comes back with whatever IOPCIFamily restored
     if (fIntSrc) fIntSrc->enable();
     NV_STATUS st = ok ? rm_power_management(NULL, &fNv, NV_PM_ACTION_RESUME) : NV_ERR_GPU_IS_LOST;
     ok = st == NV_OK;
@@ -1750,12 +2193,65 @@ void NVRM::gpuResume()
     OSCompareAndSwap(kGpuPmSuspended, ok ? kGpuPmRunning : kGpuPmLost, &fGpuPm);
     nvkms_xnu_resume(fNv.gpu_id, ok);
     nv_xnu_pm_open();   // also when lost: RM then answers the waiting calls with errors instead of leaving them blocked
+    if (ok) nvrm_power_resume();
     setProperty("nvrm-pm", ok ? "running" : "lost (resume failed)");
     uint64_t ns = 0; absolutetime_to_nanoseconds(mach_absolute_time() - t0, &ns);
     LOG("wake #%u: rm_power_management(RESUME) -> 0x%x, user channels restarted -> 0x%x, %llu ms - %s", fPmCycles,
         (unsigned)st, (unsigned)cst, ns / 1000000ULL,
         ok ? "GPU running, telling the framebuffers" : "GPU LOST: NVKMS refuses all display work until a restart");
     notifyFramebuffers(ok ? 1 : 2);
+}
+
+// Opt-in D3cold. The driver's own system-sleep and wake paths do the suspend and resume; nv_rtd3.cpp decides when.
+static IOACPIPlatformDevice *rtd3Acpi(NVRM *n)
+{
+    IOService *s = n; IOACPIPlatformDevice *a = NULL;
+    for (int i = 0; s && i < 16 && !a; i++) { s = s->getProvider(); a = OSDynamicCast(IOACPIPlatformDevice, s); }
+    return a;
+}
+static int rtd3Heads(void *) {
+    // Every framebuffer: this GPU's own heads, and (hybrid switch on) another GPU's panel published as a head of ours.
+    int hy = 0; { int lv = 0; const int present = PE_parse_boot_argn("nmhybrid", &lv, sizeof(lv)); hy = present && lv >= 1 && lv <= 4; }
+    OSDictionary *m = IOService::serviceMatching("IOFramebuffer"); if (!m) return 1;   // cannot look: treat as lit
+    OSIterator *it = IOService::getMatchingServices(m); m->release();
+    int own = 0, foreign = 0;
+    if (it) {
+        while (OSObject *o = it->getNextObject()) {
+            IOService *s = OSDynamicCast(IOService, o); if (!s) continue;
+            if (s->metaCast("NVRMNVDAFramebuffer")) own++;
+            else if (OSNumber *id = OSDynamicCast(OSNumber, s->getProperty("IOFBDependentID"))) { if (id->unsigned64BitValue() == 0x4E56524D00000001ull) foreign++; }
+        }
+        it->release();
+    }
+    return nv_rtd3_heads_lit(own, foreign, hy);
+}
+static int rtd3Clients(void *ctx) {
+    IOService *n = (IOService *)ctx; int rm = 0, accel = 0;
+    if (OSIterator *it = n->getClientIterator()) { while (OSObject *o = it->getNextObject()) if (OSDynamicCast(IOUserClient, o)) rm++; it->release(); }
+    // Metal applications attach to the accelerator, not to NVRM
+    if (OSDictionary *m = IOService::serviceMatching("IOAccelerator")) {
+        if (OSIterator *it = IOService::getMatchingServices(m)) {
+            while (OSObject *o = it->getNextObject()) {
+                IOService *a = OSDynamicCast(IOService, o); const char *cn = a ? a->getMetaClass()->getClassName() : nullptr;
+                if (!cn || strncmp(cn, "NV", 2)) continue;
+                if (OSIterator *ci = a->getClientIterator()) { while (OSObject *c = ci->getNextObject()) if (OSDynamicCast(IOUserClient, c)) accel++; ci->release(); }
+            }
+            it->release();
+        }
+        m->release();
+    }
+    return nv_rtd3_clients_total(rm, accel);
+}
+void NVRM::rtd3Arm()
+{
+    const struct nv_rtd3_ops ops = {
+        this, rtd3Heads, rtd3Clients,
+        [](void *c) { ((NVRM *)c)->gpuSuspend(); },
+        [](void *c) { ((NVRM *)c)->gpuResume(); },
+        [](void *c) { return nv_rtd3_power_off(rtd3Acpi((NVRM *)c)); },
+        [](void *c) { return nv_rtd3_power_on(rtd3Acpi((NVRM *)c)); },
+    };
+    nv_rtd3_arm(&ops);
 }
 
 void NVRM::pciSaveForSleep()
@@ -1916,6 +2412,16 @@ IOReturn NVRM::callPlatformFunction(const OSSymbol *fn, bool wait, void *p1, voi
         NvU32 *percent = (NvU32 *)p1; if (!percent) return kIOReturnBadArgument;
         return nvkms_xnu_backlight(p2 != NULL, percent) ? kIOReturnSuccess : kIOReturnNotFound;
     }
+    if (fn && fn->isEqualTo("NVRMDdcTransfer")) {     // NVRMFB: one DDC/CI write or read for a display (nvrm_ddc.cpp)
+        if (!p1) return kIOReturnBadArgument;
+        NvXnuPmUse pmUse(true);
+        return nvrm_ddc_transfer((struct NVRMDdcRequest *)p1) == 0 ? kIOReturnSuccess : kIOReturnIOError;
+    }
+    if (fn && fn->isEqualTo("NVRMDpAux")) {            // NVRMFB: one DPCD transaction (eDP backlight fallback, nvrm_ddc.cpp)
+        if (!p1) return kIOReturnBadArgument;
+        NvXnuPmUse pmUse(true);
+        return nvrm_dpaux_transfer((struct NVRMDpAuxRequest *)p1) == 0 ? kIOReturnSuccess : kIOReturnIOError;
+    }
     if (fn && fn->isEqualTo("NVRMGpuReady"))         // NVRMFB: may the display engine be touched (not in system sleep)?
         return OSAddAtomic(0, &fGpuPm) == kGpuPmRunning ? kIOReturnSuccess : kIOReturnNotReady;
     if (fn && fn->isEqualTo("NVRMGpuPower"))         // sent down to the framebuffers; an older NVRMFB passes it back up
@@ -2055,14 +2561,46 @@ void NVRMUserClient::free(void)
     if (fMapLock) IOLockLock(fMapLock);
     nvMapListFree(&fMapList);
     fMapLen = 0; fMapLenNode = nullptr; fMapGen++;
+    if (fTok) {
+        for (unsigned i = 0; i < fNTok; i++) if (fTok[i].md) fTok[i].md->release();
+        kern_os_free(fTok); fTok = nullptr; fNTok = 0; fTokCap = 0;
+    }
     if (fMapLock) IOLockUnlock(fMapLock);
     if (fGate) { IOLockFree(fGate); fGate = nullptr; }
     if (fMapLock) { IOLockFree(fMapLock); fMapLock = nullptr; }
     super::free();
 }
+// Token mappings - many CPU mappings on one connection.
+// Type 0 is the original contract: map whatever context is pending, and leave it pending (the userland driver opens
+// one connection per mapping and closes it with the mapping). That costs a user-client connection per live mapping;
+// Cyberpunk held ~275 of them. With a token type (kNvMapTokenBit set, chosen by the caller, unique per mapping on this
+// client) the first call consumes the pending context - the way Linux's per-file mapping list is used once per mmap -
+// so RM accepts the next RM_MAP_MEMORY on the same fd, and the descriptor is kept under the token. Every later call with
+// that token returns the SAME descriptor: IOKit's unmap (is_io_connect_unmap_memory_from_task) calls clientMemoryForType
+// with the type it is given and finds the mapping with kIOMapReference on the returned descriptor's own mapping list,
+// so a fresh descriptor would never match and the mapping would stay until the connection closed. That is the shape of
+// the 10-14 bug (8494d18): a cleared context made the unmap lookup fail and VRAM stayed mapped until exit.
+// The caller forgets the token (selector 8) after unmapping, which drops the descriptor. RM's own unmap
+// (NV_ESC_RM_UNMAP_MEMORY -> Nv04UnmapMemoryWithSecInfo, on the ctl fd, by hClient/hDevice/hMemory/pLinearAddress) never
+// reads the per-file list, and nv_free_user_mapping is a no-op here, so consuming the node takes nothing RM needs.
+// The pages stay alive through the descriptor, not the node (see nv_inc_alloc_refcount in os-xnu2.cpp).
+#include "nvrm_tok_table.h"
+static const uint32_t kNvMapTokenBit = 0x80000000u;
+static const unsigned kNvMapTokensPerClient = 4096;
 IOReturn NVRMUserClient::clientMemoryForType(UInt32 type, IOOptionBits *options, IOMemoryDescriptor **memory)
 {
     Gate g(fGate);
+    const bool tokenMode = (type & kNvMapTokenBit) != 0;
+    // any other type keeps the original behaviour (it was never checked, so nothing is refused that was accepted)
+    if (tokenMode) {
+        IOMemoryDescriptor *have = nullptr; IOOptionBits haveOpts = 0;
+        IOLockLock(fMapLock);
+        for (unsigned i = 0; i < fNTok; i++)
+            if (fTok[i].token == type) { have = fTok[i].md; haveOpts = fTok[i].options; have->retain(); break; }
+        IOLockUnlock(fMapLock);
+        if (have) { *options |= haveOpts; *memory = have; return kIOReturnSuccess; }
+    }
+    nv_alloc_mapping_list_node_t *snapNode = nullptr; NvU64 snapGen = 0;
     // Everything below reads this private copy. RM or a bind can replace the live context at any moment, and the ranges
     // that are checked must be the ranges that are mapped.
     nv_alloc_mapping_context_t snapshot;
@@ -2075,6 +2613,7 @@ IOReturn NVRMUserClient::clientMemoryForType(UInt32 type, IOOptionBits *options,
         return kIOReturnBadArgument;
     }
     snapshot = fMapList->context;
+    snapNode = fMapList; snapGen = fMapGen;
     snapLen = (fMapLenNode == fMapList) ? fMapLen : 0;   // a length belongs to one node only
     if (!fIsCtl) {
         const NvU64 count = snapshot.memArea.numRanges;
@@ -2135,10 +2674,62 @@ IOReturn NVRMUserClient::clientMemoryForType(UInt32 type, IOOptionBits *options,
         kprintf("NVRM-xnu: map fd %d: device %llu range(s) first 0x%llx+0x%llx caching %u\n", fFd, n, c->memArea.pRanges[0].start, c->memArea.pRanges[0].size, caching);
     }
     if (!md) return kIOReturnNoMemory;
-    if (caching == NV_MEMORY_UNCACHED) *options |= kIOMapInhibitCache;
-    else if (caching == NV_MEMORY_WRITECOMBINED) *options |= kIOMapWriteCombineCache;
-    if (!(c->prot & NV_PROTECT_WRITEABLE)) *options |= kIOMapReadOnly;
+    IOOptionBits add = 0;
+    if (caching == NV_MEMORY_UNCACHED) add |= kIOMapInhibitCache;
+    else if (caching == NV_MEMORY_WRITECOMBINED) add |= kIOMapWriteCombineCache;
+    if (!(c->prot & NV_PROTECT_WRITEABLE)) add |= kIOMapReadOnly;
+    if (tokenMode) {
+        IOReturn r = kIOReturnSuccess;
+        IOLockLock(fMapLock);
+        if (fMapList != snapNode || fMapGen != snapGen) r = kIOReturnBusy;   // RM replaced the context meanwhile
+        else {
+            // room for one more: the table grows with what the client holds (nvrm_tok_table.h says why)
+            const unsigned cap = nvrm_tok_next_capacity(fTokCap, fNTok, kNvMapTokensPerClient);
+            if (!cap) r = kIOReturnNoResources;
+            else if (cap != fTokCap) {
+                NvMapToken *grown = (NvMapToken *)kern_os_malloc(sizeof(NvMapToken) * cap);
+                if (!grown) r = kIOReturnNoMemory;
+                else {
+                    if (fTok) { nvu_memcpy(grown, fTok, sizeof(NvMapToken) * fNTok); kern_os_free(fTok); }
+                    fTok = grown; fTokCap = cap;
+                }
+            }
+        }
+        if (r == kIOReturnSuccess) {
+            nv_alloc_mapping_list_node_t *one = fMapList;
+            fMapList = one->pNext; one->pNext = nullptr;
+            nvMapListFree(&one);
+            fMapLen = 0; fMapLenNode = nullptr; fMapGen++;
+            md->retain();
+            fTok[fNTok].token = type; fTok[fNTok].options = add; fTok[fNTok].md = md; fNTok++;
+        }
+        IOLockUnlock(fMapLock);
+        if (r != kIOReturnSuccess) { md->release(); return r; }
+    }
+    *options |= add;
     *memory = md;
+    return kIOReturnSuccess;
+}
+// Selector 7: what this kext supports. bit0 = token mappings (clientMemoryForType above).
+IOReturn NVRMUserClient::sCaps(OSObject *target, void *reference, IOExternalMethodArguments *args)
+{
+    if (!OSDynamicCast(NVRMUserClient, target)) return kIOReturnNotAttached;
+    args->scalarOutput[0] = 1;
+    return kIOReturnSuccess;
+}
+// Selector 8: forget a token after its mapping is unmapped; drops the descriptor. An unknown token is not an error.
+IOReturn NVRMUserClient::sForgetToken(OSObject *target, void *reference, IOExternalMethodArguments *args)
+{
+    NVRMUserClient *me = OSDynamicCast(NVRMUserClient, target);
+    if (!me) return kIOReturnNotAttached;
+    const uint64_t v = args->scalarInput[0];
+    if (v > 0xFFFFFFFFull || !((uint32_t)v & kNvMapTokenBit)) return kIOReturnBadArgument;
+    IOMemoryDescriptor *drop = nullptr;
+    IOLockLock(me->fMapLock);
+    for (unsigned i = 0; i < me->fNTok; i++)
+        if (me->fTok[i].token == (uint32_t)v) { drop = me->fTok[i].md; me->fTok[i] = me->fTok[--me->fNTok]; break; }
+    IOLockUnlock(me->fMapLock);
+    if (drop) drop->release();
     return kIOReturnSuccess;
 }
 IOReturn NVRMUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments *args,
@@ -2153,13 +2744,19 @@ IOReturn NVRMUserClient::externalMethod(uint32_t selector, IOExternalMethodArgum
         { sRetired, 0, 0, 0, 0 },
         { sRetired, 0, 0, 0, 0 },
         { sWaitEvent, 2, 0, 1, 0 },
+        { sCaps, 0, 0, 1, 0 },
+        { sForgetToken, 1, 0, 0, 0 },
     };
     if (selector >= sizeof tbl / sizeof tbl[0]) return kIOReturnBadArgument;
     IOExternalMethodDispatch d = tbl[selector];
     return super::externalMethod(selector, args, &d, this, reference);
 }
-extern "C" nv_state_t *nv_xnu_gpu_state(void) { return gNVRMService ? &gNVRMService->fNv : NULL; }
-extern "C" void *nv_xnu_gpu_os_device(void) { return gNVRMService; }
+extern "C" nv_state_t *nv_xnu_gpu_state(void) { NVRM *s = gNVRMTab.primary(); return s ? &s->fNv : NULL; }
+extern "C" void *nv_xnu_gpu_os_device(void) { return gNVRMTab.primary(); }
+// the same answers for card number `index` (0 is the first started); only meaningful with nvmultigpu=1, where the table holds every card
+extern "C" nv_state_t *nv_xnu_gpu_state_at(unsigned index) { NVRM *s = gNVRMTab.at(index); return s ? &s->fNv : NULL; }
+extern "C" void *nv_xnu_gpu_os_device_at(unsigned index) { return gNVRMTab.at(index); }
+extern "C" unsigned nv_xnu_gpu_count(void) { return gNVRMTab.count(); }
 
 // Selectors 4 and 5 handed a caller's buffer to NVKMS as a kernel-space client, which trusts the pointers inside it
 // (flip heads, LUT ramps, clip lists) as kernel addresses: root could make the kernel read and write where it chose.
@@ -2295,16 +2892,16 @@ IOReturn NVRMUserClient::esc(uint32_t cmd, void *data, uint32_t size)
         if (!fIsCtl) return kIOReturnBadArgument;
         nvu_memset(data, 0, size);
         if (size < sizeof(nv_ioctl_card_info_t)) return kIOReturnBadArgument;
-        nv_state_t *g = &fOwner->fNv;
+        nv_state_t *ad = &fOwner->fNv;
         nv_ioctl_card_info_t *ci = (nv_ioctl_card_info_t *)data;
         ci->valid              = NV_TRUE;
-        ci->pci_info           = g->pci_info;
-        ci->gpu_id             = g->gpu_id;
-        ci->interrupt_line     = (NvU16)g->interrupt_line;
-        ci->reg_address        = g->bars[NV_GPU_BAR_INDEX_REGS].cpu_address;
-        ci->reg_size           = g->bars[NV_GPU_BAR_INDEX_REGS].size;
-        ci->fb_address         = g->bars[NV_GPU_BAR_INDEX_FB].cpu_address;
-        ci->fb_size            = g->bars[NV_GPU_BAR_INDEX_FB].size;
+        ci->pci_info           = ad->pci_info;
+        ci->gpu_id             = ad->gpu_id;
+        ci->interrupt_line     = (NvU16)ad->interrupt_line;
+        ci->reg_address        = ad->bars[NV_GPU_BAR_INDEX_REGS].cpu_address;
+        ci->reg_size           = ad->bars[NV_GPU_BAR_INDEX_REGS].size;
+        ci->fb_address         = ad->bars[NV_GPU_BAR_INDEX_FB].cpu_address;
+        ci->fb_size            = ad->bars[NV_GPU_BAR_INDEX_FB].size;
         ci->minor_number       = 0;
         return kIOReturnSuccess;
     }

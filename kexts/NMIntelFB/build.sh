@@ -10,7 +10,7 @@ mkdir -p "$OUT" || exit 1
 
 SDK=$(xcrun --show-sdk-path)
 KHDR="$SDK/System/Library/Frameworks/Kernel.framework/Headers"
-CFLAGS=( -arch x86_64 -fapple-kext -mkernel -nostdinc -I"$KHDR" -I"$SRC"
+CFLAGS=( -arch x86_64 -fapple-kext -mkernel -nostdinc -I"$KHDR" -I"$SRC" -I"$SRC/../NVRM/accel" -I"$SRC/../NVRM"
   -DKERNEL -DKERNEL_PRIVATE -DDRIVER_PRIVATE -DAPPLE -DNeXT
   -mmacosx-version-min=15.0 -g0
   -ffile-prefix-map="$SRC"=driver -ffile-prefix-map="$HOME"=/build
@@ -34,6 +34,7 @@ for VARIANT in real virtual; do
         continue
     fi
     echo "  compiled: $(grep -c "warning:" "$E") warnings"
+    bash "$SRC/../../build/warn_ceiling.sh" nmintelfb "$(grep -c ": warning:" "$E")" "$E" || exit 4
     K="$OUT/$NAME.kext"
     mkdir -p "$K/Contents/MacOS"
     xcrun clang++ -arch x86_64 -mmacosx-version-min=15.0 -fapple-kext -nostdlib \
@@ -42,6 +43,7 @@ for VARIANT in real virtual; do
     if [ $lrc -ne 0 ]; then
         echo "  LINK FAILED (rc=$lrc)"; head -12 "$OUT/$NAME.link.err"; continue
     fi
+    bash "$SRC/../../build/warn_ceiling.sh" nmintelfb-link "$(grep -c 'warning' "$OUT/$NAME.link.err")" "$OUT/$NAME.link.err" || exit 4
     cp "$PLIST" "$K/Contents/Info.plist"
     # A kext without _kmod_info is silently left out of a kernel collection, and the metaclasses are what prove
     # the IOKit classes survived the link.

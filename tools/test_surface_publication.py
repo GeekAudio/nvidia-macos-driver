@@ -9,9 +9,16 @@ source = (root / 'plugin/NVMTLObjects.m').read_text()
 start = source.index('static id nvmtl_surface_sync(')
 end = source.index('- (NSUInteger)width ', start)
 methods = source[start:end]
+# The 4:2:2 surface reader (packed video frames, decoded by the CPU) sits in this stretch and has its own tests
+# (tools/test_yuv422.c, tools/test_y422_convert.c); the stand-in texture below is not a 4:2:2 one, so the method is left out and its flag stays NULL.
+y0 = methods.index('- (void)nvmtlY422SurfaceIn {'); y1 = methods.index('\n}\n', y0) + 3
+assert methods[y1:].startswith('- (void)nvmtlSurfaceIn {'), 'the 4:2:2 reader is no longer right before nvmtlSurfaceIn'
+methods = methods[:y0] + methods[y1:]
 fixture = r'''
 #import <Foundation/Foundation.h>
 #include <assert.h>
+#include <os/lock.h>
+#include <stdatomic.h>
 #include <dispatch/dispatch.h>
 #include <stdint.h>
 #include <string.h>
@@ -53,6 +60,12 @@ static int dirtyAnswer=1, tryAnswer=-1; static unsigned blockingDirties, tries;
 static int nvmtl_vk_surface_dirty(unsigned s, unsigned p) { blockingDirties++; return dirtyAnswer; }
 static int nvmtl_vk_surface_dirty_try(unsigned s, unsigned p) { tries++; return tryAnswer; }
 static int nvmtl_noseed(void) { return 0; }
+// own-write tracking across planes (nvmtl_plane_seed.h) is off unless NVMTL_PLANE_SEED=1; its surface-property and page-key
+// calls are stubs here, so every arm below runs the default path
+static size_t IOSurfaceGetPlaneCount(IOSurfaceRef s) { (void)s; return 1; }
+static CFTypeRef IOSurfaceCopyValue(IOSurfaceRef s, CFStringRef k) { (void)s; (void)k; return NULL; }
+static void IOSurfaceSetValue(IOSurfaceRef s, CFStringRef k, CFTypeRef v) { (void)s; (void)k; (void)v; }
+static void nvmtl_vk_host_pages_key(uint32_t surface, uint64_t cookie) { (void)surface; (void)cookie; }
 // cross-process busy marks (PR #398): who wrote the surface last, and the waits for another process's write
 static int busyForeign=0, busyWaits=0;
 static int nvmtl_busy_foreign(IOSurfaceRef s, NSUInteger p) { (void)s; (void)p; return busyForeign; }
@@ -74,7 +87,9 @@ static int nvmtl_vk_image_read(void *q, Image *i, void *base, size_t row) {
 @interface NVMTLTexture : NSObject {
 @public NVMTLTexture *_parent; IOSurfaceRef _surf; BOOL _vramOn, _surfSynced, _clientWritten; void *_hostPages;
     uint32_t _surfSeed, _surfGen; NSUInteger _plane; Image _i; void *_q;
+    IOSurfaceRef _y422Surf;   // NULL: not a 4:2:2 texture
 }
+- (void)nvmtlY422SurfaceIn;
 - (BOOL)nvmtlSurfaceCopyable;
 - (void)nvmtlSurfaceIn;
 - (BOOL)nvmtlSurfaceOut;
@@ -82,6 +97,7 @@ static int nvmtl_vk_image_read(void *q, Image *i, void *base, size_t row) {
 @end
 @implementation NVMTLTexture
 - (BOOL)nvmtlSurfaceCopyable { return YES; }
+- (void)nvmtlY422SurfaceIn { assert(!"a non-4:2:2 texture took the 4:2:2 path"); }
 '''
 checks = r'''
 @end
@@ -152,7 +168,7 @@ int main(int argc, char **argv) { @autoreleasepool {
 with tempfile.TemporaryDirectory() as directory:
     path = pathlib.Path(directory)
     (path / 'test.m').write_text(fixture + methods + checks)
-    subprocess.run(['clang', '-fobjc-arc', '-framework', 'Foundation',
+    subprocess.run(['clang', '-fobjc-arc', '-I', str(root / 'plugin'), '-framework', 'Foundation',
                     str(path / 'test.m'), '-o', str(path / 'test')], check=True)
     subprocess.run([str(path / 'test')], check=True)
     subprocess.run([str(path / 'test'), 'shared'], check=True)

@@ -1120,7 +1120,9 @@ entry:
         "{asm}"
     );
     assert!(asm.contains("OpTypeSampler"), "{asm}");
-    assert!(asm.contains("Binding 37"), "{asm}");
+    // Sampled textures are reached through the descriptor heap (an array of images in set 2, indexed by the slot the
+    // argument table holds), not through one descriptor binding per Metal texture index.
+    assert!(asm.contains("OpTypeRuntimeArray") && asm.contains("DescriptorSet 2"), "{asm}");
     assert!(asm.contains("Binding 162"), "{asm}");
     if std::process::Command::new("spirv-val")
         .arg("--version")
@@ -1224,7 +1226,10 @@ entry:
             .expect("reflected descriptor");
         assert_eq!(reflected.set, 0);
         assert_eq!(reflected.binding, binding);
-        assert!(asm.contains(&format!("Binding {binding}")), "{asm}");
+        // samplers keep one binding per Metal index; sampled textures live in the descriptor heap
+        if kind == crate::reflect::ResourceKind::Sampler {
+            assert!(asm.contains(&format!("Binding {binding}")), "{asm}");
+        }
     }
     reflection
         .validate_descriptor_abi()
@@ -1302,7 +1307,9 @@ entry:
         .expect("storage descriptor");
     assert_eq!(sampled.binding, 72);
     assert_eq!(storage.binding, 520);
-    assert!(asm.contains("Binding 72"), "{asm}");
+    // Sampled textures are reached through the descriptor heap (an array of images in set 2, indexed by the slot the
+    // argument table holds), not through one descriptor binding per Metal texture index.
+    assert!(asm.contains("OpTypeRuntimeArray") && asm.contains("DescriptorSet 2"), "{asm}");
     assert!(asm.contains("Binding 520"), "{asm}");
     reflection
         .validate_descriptor_abi()
@@ -1814,7 +1821,7 @@ declare { float, i8 } @air.sample_compare_depth_2d.f32(ptr addrspace(1), ptr add
 }
 
 #[test]
-fn runtime_sampler_specialization_refuses_pointer_selected_state_loss() {
+fn runtime_sampler_specialization_keeps_each_selected_sampler_state() {
     let ll = r#"
 target triple = "spirv-unknown-vulkan1.2"
 define void @k(ptr addrspace(1) %tex, ptr addrspace(2) %sampler0, ptr addrspace(2) %sampler1, ptr addrspace(1) %out, i32 %lane) {
@@ -1854,9 +1861,13 @@ declare { <4 x float>, i8 } @air.sample_texture_2d.v4f32(ptr addrspace(1), ptr a
         .unwrap()
         .with_runtime_sampler(1, state)
         .unwrap();
-    let error = crate::translate_sanitized_native_with_options(ll, Stage::Kernel, &tmp, options)
-        .expect_err("pointer-selected runtime sampler state must not silently disappear");
-    assert!(error.contains("pointer selection"), "{error}");
+    // The sample runs once with each candidate sampler and the chosen result is kept, so each sampler's own state
+    // is used and none is lost to the selection.
+    let spv = crate::translate_sanitized_native_with_options(ll, Stage::Kernel, &tmp, options)
+        .expect("a selected runtime sampler samples with each candidate");
+    let asm = crate::disassemble(&spv).expect("disassemble");
+    // pixel-coordinate sampling reads with OpImageFetch: one read per candidate sampler
+    assert_eq!(asm.lines().filter(|l| l.contains("OpImageFetch")).count(), 2, "{asm}");
 }
 
 #[test]
@@ -4335,7 +4346,9 @@ entry:
     let asm = disassemble(&spv).expect("disassemble");
     assert!(asm.contains("OpTypeImage"), "{asm}");
     assert!(asm.contains(" 1D "), "{asm}");
-    assert!(asm.contains("Binding 32"), "{asm}");
+    // Sampled textures are reached through the descriptor heap (an array of images in set 2, indexed by the slot the
+    // argument table holds), not through one descriptor binding per Metal texture index.
+    assert!(asm.contains("OpTypeRuntimeArray") && asm.contains("DescriptorSet 2"), "{asm}");
     if std::process::Command::new("spirv-val")
         .arg("--version")
         .output()

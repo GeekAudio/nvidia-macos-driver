@@ -36,9 +36,9 @@ Metal app ─► NVMTLDriver.bundle ─► translator (Apple AIR → SPIR-V) ─
 |---|---|---|
 | Metal driver plugin | `/Library/GPUBundles/NVMTLDriver.bundle` | `plugin/` |
 | Shader translator | inside the plugin (`libnvmtl_translate.dylib`) | `translator/` (LGPL-3.0, based on metal2vulkan) |
-| Vulkan back end (NVK) | `/Library/GPUBundles/nvmtl/` | `nvk/nvk-macos.patch` on Mesa `17ca6174` |
+| Vulkan back end (NVK) | `/Library/GPUBundles/nvmtl/` | `nvk/nvk-macos.patch` and the chain in `build/build_nvk.sh` on Mesa `90a959eb` (26.3.0-rc3) |
 | Kernel extensions | `/Library/Extensions/NVRM, NVAccel, NVRMFB, NVRMAGDC` | `kexts/` |
-| GPU firmware (GSP) | `/Library/NullMoth/nvfw/nvidia/615.78.08` | NVIDIA, unmodified |
+| GPU firmware (GSP) | `/Library/NullMoth/nvfw/nvidia/620.70.06` | NVIDIA, unmodified; fetched from NVIDIA's driver package at install (`package/fw_fetch.sh`) |
 
 The kernel side runs NVIDIA's own open GPU kernel modules (r610) under macOS. NVRMFB is the display framebuffer,
 NVAccel the accelerator WindowServer composites through, NVRMAGDC the display-policy shim.
@@ -152,7 +152,7 @@ sudo ./uninstall.sh && sudo shutdown -r now
 
 ## Build from source
 
-Requires Xcode 16, Rust (stable), Meson/Ninja, and NVIDIA's `open-gpu-kernel-modules` at tag `615.78.08`.
+Requires Xcode 16, Rust (stable), Meson/Ninja, and NVIDIA's `open-gpu-kernel-modules` at tag `620.70.06`.
 
 ```bash
 build/build_xlate.sh
@@ -163,7 +163,7 @@ build/accel_build_all.sh kexts/NVRM <out>
 ```
 
 In order: the translator (`libnvmtl_translate.dylib`); the plugin (`NVMTLDriver.bundle`; `RELEASE=1` strips every
-diagnostic); NVK (apply `nvk/nvk-macos.patch` to Mesa `17ca6174` first); the kexts; and NVAccel for macOS 15 and 26
+diagnostic); NVK (`build/build_nvk.sh`: the patch chain on Mesa `90a959eb`, 26.3.0-rc3); the kexts; and NVAccel for macOS 15 and 26
 (`NM_TAHOE=1`), written to `<out>/15` and `<out>/26`.
 
 Rebuild both accelerators whenever `nvrm_vram_abi.h` or `nvrm_gpuva_abi.h` changes: an accelerator built against an

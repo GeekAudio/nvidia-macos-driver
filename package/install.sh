@@ -145,17 +145,18 @@ kpath() {
 }
 ioreg -r -c IOPCIDevice -d 1 | grep -q '"vendor-id" = <de100000>' || die "no NVIDIA GPU found on PCI"
 # The driver runs the cards NVIDIA's GSP firmware supports (Turing and later). The same list the Windows builder uses
-# (open-gpu-kernel-modules 620.70.06: 615's list + 2BBD RTX PRO 5500 Blackwell, 2E13 RTX Spark N1X; the datacenter
+# (open-gpu-kernel-modules 620.70.06: 615's list + 2BBD RTX PRO 5500 Blackwell, 2E13 RTX Spark N1X, and the two data-centre cards that carry
+# DisplayPort outputs, A40 2235 and L40 26B5; the datacenter
 # VR NVL72 3041 left out like the other datacenter parts). Installing it for an older card (GTX 10 and before)
 # would switch the firmware screen off and leave nothing to draw: those PCs run macOS in basic display instead.
 SUPPORTED_IDS="
 1E02 1E04 1E07 1E30 1E36 1E78 1E81 1E82 1E84 1E87 1E89 1E90 1E91 1E93 1EB0 1EB1 1EB5 1EB6 1EC2 1EC7 1ED0 1ED1 1ED3
 1EF5 1F02 1F03 1F06 1F07 1F08 1F0A 1F10 1F11 1F12 1F14 1F15 1F36 1F42 1F47 1F50 1F51 1F54 1F55 1F76 1F82 1F83 1F91
 1F95 1F96 1F97 1F98 1F99 1F9C 1F9D 1F9F 1FA0 1FB0 1FB1 1FB2 1FB6 1FB7 1FB8 1FB9 1FBA 1FBB 1FBC 1FDD 1FF0 1FF2 1FF9
-2182 2184 2187 2188 2191 2192 21C4 21D1 2203 2204 2206 2207 2208 220A 2216 2230 2231 2232 2233 2414 2420 2438 2460
+2182 2184 2187 2188 2191 2192 21C4 21D1 2203 2204 2206 2207 2208 220A 2216 2230 2231 2232 2233 2235 2414 2420 2438 2460
 2482 2484 2486 2487 2488 2489 249C 249D 24A0 24B0 24B1 24B6 24B7 24B8 24B9 24BA 24BB 24C7 24C9 24DC 24DD 24E0 24FA
 2503 2504 2507 2508 2520 2521 2523 2531 2544 2560 2563 2571 2582 2584 25A0 25A2 25A5 25A6 25A7 25A9 25AA 25AB 25AC
-25AD 25B0 25B2 25B8 25B9 25BA 25BB 25BC 25BD 25E0 25E2 25E5 25EC 25ED 25F9 25FA 25FB 2684 2685 2689 26B1 26B2 26B3
+25AD 25B0 25B2 25B8 25B9 25BA 25BB 25BC 25BD 25E0 25E2 25E5 25EC 25ED 25F9 25FA 25FB 2684 2685 2689 26B1 26B2 26B3 26B5
 2702 2704 2705 2709 2717 2730 2757 2770 2782 2783 2786 2788 27A0 27B0 27B1 27B2 27BA 27BB 27E0 27FB 2803 2805 2808
 2820 2822 2838 2860 2882 28A0 28A1 28A3 28B0 28B8 28B9 28BA 28BB 28E0 28E1 28E3 28F8 2B85 2B87 2B8C 2BB1 2BB3 2BB4
 2BB5 2BB9 2BBD 2C02 2C05 2C09 2C18 2C19 2C31 2C33 2C34 2C38 2C39 2C3A 2C58 2C59 2C77 2C79 2D04 2D05 2D18 2D19 2D30
@@ -167,7 +168,7 @@ CARD=""; for i in $NV_IDS; do case " $(echo $SUPPORTED_IDS) " in *" $i "*) CARD=
 # Every device id from 1E00 up is Turing or newer (TU102 is 1E02; Volta and older sit below it), which RM drives through GSP.
 # The list above names the GeForce/RTX ids measured so far; a Quadro T1200 laptop (1FBC) was refused as "older".
 [ -n "$CARD" ] || for i in $NV_IDS; do case $i in *[!0-9A-F]*|"") ;; *) [ $((16#$i)) -ge $((16#1E00)) ] && CARD=$i;; esac; done
-[ -n "$CARD" ] || die "this NVIDIA card (device $(echo $NV_IDS)) is older than the driver supports (RTX 20 / Turing and newer); macOS keeps running on it in basic display, with no changes made"
+[ -n "$CARD" ] || die "this NVIDIA card (device $(echo $NV_IDS)) is older than the driver supports (Turing and newer: GTX 16, RTX 20 and later); GTX 900/10, TITAN X/Xp/V and Kepler cards are not supported, see docs/CARD-SUPPORT.md. macOS keeps running on it in basic display, with no changes made"
 ok "macOS $v, x86_64, NVIDIA GPU present"
 
 step "2. package integrity"
@@ -187,6 +188,11 @@ HERE="$STAGE/pkgroot"
 VAR="$HERE/Library/NullMoth/kexts/$MAJ"
 # --strict: without it shasum skips a malformed line and still reports success
 (cd "$HERE" && shasum -a 256 --strict -c SHA256SUMS --quiet) || die "SHA256SUMS mismatch: re-download the package"
+# shasum -c reads only the files the list names; a file it leaves out would still be copied below. sums_complete.sh was just
+# verified as one of the listed files, and a package without it is refused.
+[ -f "$HERE/sums_complete.sh" ] && grep -qE '^[0-9a-f]{64} [ *](\./)?sums_complete\.sh$' "$HERE/SHA256SUMS" \
+  || die "this package does not carry a verified sums_complete.sh: re-download the package"
+bash "$HERE/sums_complete.sh" "$HERE" || die "the package holds files SHA256SUMS does not list: re-download the package"
 for target in 15 26; do
   [ -f "$HERE/Library/NullMoth/kexts/$target/NVAccel.kext/Contents/MacOS/NVAccel" ] && \
     [ -f "$HERE/Library/NullMoth/kexts/$target/NVAccel.kext/Contents/Info.plist" ] || die "this package lacks the complete macOS $target accelerator"
@@ -301,6 +307,10 @@ if [ "$MAJ" -ge 26 ]; then
     KEXTS="$KEXTS NMXAudio"
   fi
 fi
+# The video codecs (vendor/nvenc) are one library beside the plugin. A package built without it would install and then
+# silently leave Ada without a hardware encoder and Safari on the wrong decoder, so the install stops before it changes anything.
+[ -f "$HERE/Library/GPUBundles/NVMTLDriver.bundle/Contents/MacOS/libnvencvt.dylib" ] || \
+  die "this package has no libnvencvt.dylib in NVMTLDriver.bundle (the video codecs); rebuild it with package/stage_nvencvt.sh"
 # kmutil builds the auxiliary collection from every kext in /Library/Extensions, so one that names a dependency this
 # macOS lacks stops the build for all of them. 2.5.3 report: a Realtek USB Wi-Fi kext (RtWlanU1827) needed
 # com.apple.iokit.IOUSBFamily, which macOS 15 no longer has, and the stop said only "test kernel collection build
@@ -335,6 +345,19 @@ INS=$(kmutil inspect -a x86_64 -A "$T/aux.kc" 2>/dev/null) || die "cannot inspec
 for k in $KEXTS; do printf '%s\n' "$INS" | grep -oE '(com\.nullmoth\.[A-Za-z0-9]+|org\.hackintosh\.experimental\.NVPrimarySelector)' | grep -Fxq "$(primary_bundle_id "$k")" || { tail -20 "$T/kmutil.log"; die "kmutil refused com.nullmoth.$k (log above)"; }; done
 ok "test collection holds all four kexts"
 [ "${CHECK:-0}" = 1 ] && { rm -rf "$T"; echo; echo "CHECK PASS (nothing changed)"; exit 0; }
+
+# The GPU firmware is NVIDIA's and is not part of this download: it is read from NVIDIA's own driver package, or reused
+# from an earlier install when it still matches its pinned SHA-256 (package/fw_fetch.sh). A package that does carry it
+# (Users/Shared/nvfw, e.g. a stick prepared by the 1401 app) is used as it is. This happens before anything is changed,
+# so a Mac with no network and no earlier install stops here with nothing touched.
+FWSRC="$HERE/Users/Shared/nvfw"
+if [ ! -d "$FWSRC" ]; then
+  [ -x "$HERE/fw_fetch.sh" ] || die "this package lacks fw_fetch.sh; no changes made"
+  # NULLMOTH_FW_RUN: NVIDIA's driver package already on this Mac or on the install stick (the 1401 apps put it there);
+  # fw_fetch.sh copies it first and checks its SHA-256, so a wrong or replaced file is refused, never trusted.
+  mkdir -m 700 "$T/fw" && "$HERE/fw_fetch.sh" --dest "$T/fw" --installed "$FW" ${NULLMOTH_FW_RUN:+--run "$NULLMOTH_FW_RUN"} || die "the GPU firmware is not available (see above); no changes made"
+  FWSRC="$T/fw"
+fi
 
 BK=$(mktemp -d "/Library/NullMoth/backup-$(date +%Y%m%d-%H%M%S).XXXXXX") && [ -n "$BK" ] && [ -d "$BK" ] || die "create unique backup directory"
 [ "${CHECK:-0}" = 1 ] || printf 'bk=%s\n' "$BK" >> "$LOCKDIR/owner" || die "cannot record the backup in the installer guard"
@@ -401,11 +424,15 @@ for c in aircache spvcache; do
 done
 # A user's own settings survive updates: the lines between these two markers in nvrm610.conf are put back after the
 # copy below. An RTX 3050 (GA106, GH #130) ran only with NVMTL_NO_SURFACE_PAGEOFF=1 and uncached command pools, and every
-# update wrote the file fresh and dropped them. Only driver knobs (NVMTL_/NVK_/NVRM_ with plain values) are kept.
+# update wrote the file fresh and dropped them. Only driver knobs (NVMTL_/NVK_/NVRM_ with plain values) are kept; a value may carry , = * so that
+# the per-application frame-rate list (NVMTL_FPS_LIMIT=Game=60,*=0) survives, and no shell metacharacter.
 MYCONF_START='# --- my settings, kept on update ---'; MYCONF_END='# --- end my settings ---'
 [ ! -f "$GB/nvmtl/nvrm610.conf" ] || sed -n "/^$MYCONF_START\$/,/^$MYCONF_END\$/p" "$GB/nvmtl/nvrm610.conf" \
-  | grep -E "^($MYCONF_START|$MYCONF_END|(NVMTL|NVK|NVRM)_[A-Z0-9_]+=[A-Za-z0-9._-]{0,64})\$" > "$T/my-conf" || : > "$T/my-conf"
-for b in NVMTLDriver.bundle NVIDIAShared.bundle nvmtl; do rm -rf "$GB/$b" && ditto "$HERE/Library/GPUBundles/$b" "$GB/$b" || die "copy $b (restore from $BK)"; done
+  | grep -E "^($MYCONF_START|$MYCONF_END|(NVMTL|NVK|NVRM)_[A-Z0-9_]+=[A-Za-z0-9._,=*-]{0,160})\$" > "$T/my-conf" || : > "$T/my-conf"
+for b in NVMTLDriver.bundle nvmtl; do rm -rf "$GB/$b" && ditto "$HERE/Library/GPUBundles/$b" "$GB/$b" || die "copy $b (restore from $BK)"; done
+# Packages up to 2.8.1 installed NVIDIAShared.bundle, which held two of NVIDIA's closed compiler libraries. This package
+# does not carry it (the plugin only ever used it when a developer switch was set), and an update takes the old copy away.
+rm -rf "$GB/NVIDIAShared.bundle" || die "remove the old NVIDIAShared.bundle (restore from $BK)"
 if [ -s "$T/my-conf" ] && [ -f "$GB/nvmtl/nvrm610.conf" ]; then
   cat "$T/my-conf" >> "$GB/nvmtl/nvrm610.conf" || die "keep your settings in nvrm610.conf (restore from $BK)"
   ok "kept your settings in nvrm610.conf ($(grep -cvE '^#' "$T/my-conf") line(s))"
@@ -416,7 +443,7 @@ if [ -d "$EXT/NMXGPU.kext" ] && [ -d /Library/NullMoth/gpu-userland ]; then
   ditto /Library/NullMoth/gpu-userland "$GB/nvmtl" || die "copy the AMD/Intel Vulkan drivers (restore from $BK)"
 fi
 cp "$HERE/Library/GPUBundles/nvmtl-allow.txt" "$GB/" || die "copy bundle allow list"
-ditto "$HERE/Users/Shared/nvfw" "$FW" || die "copy firmware"
+ditto "$FWSRC" "$FW" || die "copy firmware"
 chown -R root:wheel "$FW" && chmod -R go-w,a+rX "$FW" || die "firmware permissions"
 # nothing reads the old location any more; leaving it behind leaves a writable folder with our name on it
 rm -rf "$FWOLD" 2>/dev/null || true
@@ -442,11 +469,11 @@ if [ -f "$KPDB" ] && [ -x /usr/bin/sqlite3 ]; then
       || echo "   note: the approval record for $k is read-only here; macOS may ask to allow it again"
   done
 fi
-chown -R root:wheel "$GB/NVMTLDriver.bundle" "$GB/NVIDIAShared.bundle" "$GB/nvmtl" "$GB/nvmtl-allow.txt" || die "bundle permissions"
+chown -R root:wheel "$GB/NVMTLDriver.bundle" "$GB/nvmtl" "$GB/nvmtl-allow.txt" || die "bundle permissions"
 # WindowServer runs as _windowserver and must read the bundles and the allow list. WAS: cp under the app's privileged
 # helper (umask 077) left nvmtl-allow.txt at 0600, WindowServer got no Metal device, and CoreDisplay aborted
 # ("Failed to create MetalDevice") on every start: the crash loop after install on many machines.
-chmod -R go-w,a+rX "$GB/NVMTLDriver.bundle" "$GB/NVIDIAShared.bundle" "$GB/nvmtl" && chmod 644 "$GB/nvmtl-allow.txt" || die "bundle permissions"
+chmod -R go-w,a+rX "$GB/NVMTLDriver.bundle" "$GB/nvmtl" && chmod 644 "$GB/nvmtl-allow.txt" || die "bundle permissions"
 sudo -u _windowserver /bin/test -r "$GB/nvmtl-allow.txt" || die "WindowServer cannot read $GB/nvmtl-allow.txt (restore from $BK)"
 # Create the shared shader caches the plugin looks for. Without them NVMTL_AIRCACHE_DIR never resolves, so
 # WindowServer, which compiles the compositor's pipelines on demand, re-translates them from scratch at every start
@@ -552,6 +579,13 @@ step "6c. counting a start as good once the desktop is up"
 # not always reach it: two boots that missed it switched a healthy driver off, leaving the Mac with no NVIDIA card in
 # Metal at all. A desktop that comes up and stays up is also a good start, so this job says so. A boot that never
 # reaches a desktop keeps its count, which is what the guard is for.
+# A lit head is not a desktop. When WindowServer cannot get a Metal device for a display this driver drives (the plugin
+# refused at load, or a crash in it), CoreDisplay asserts "Failed to create MetalDevice" and launchd restarts
+# WindowServer every ten seconds: a black screen with only the cursor, boot after boot (477 such crashes since 10-31,
+# 92 of them 12 or more in a row, on 2.7.2 too). The head lit, so the kernel had already cleared its count, and a
+# WindowServer was running at both of this job's looks, so the start was called good. Now "stayed up" means the SAME
+# WindowServer for the whole wait with no new WindowServer report, and a WindowServer that keeps dying while the
+# driver drives the display turns the driver off for the next boot, exactly like the kernel's guard.
 BG=/Library/NullMoth/bootguard.sh; BGP=/Library/LaunchDaemons/com.nullmoth.bootguard.plist
 launchctl bootout system/com.nullmoth.bootguard 2>/dev/null || true
 mkdir -p /Library/NullMoth /Library/LaunchDaemons || die "create the boot-guard job's folders"
@@ -560,15 +594,54 @@ cat > "$BG.tmp" <<'EOF' || die "write the boot-guard job"
 # Written by the NVIDIA driver install: the desktop came up, so this start counts as good.
 PATH=/usr/bin:/bin:/usr/sbin:/sbin
 V=7C436110-AB2A-4BBB-A880-FE41995C9F82; LOG=/Library/NullMoth/bootguard.log
-n=0
+DR=/Library/Logs/DiagnosticReports
+# kern.boottime reads "{ sec = 1762500000, usec = 912475 } ...": the first number, not usec's
+BOOT=$(sysctl -n kern.boottime 2>/dev/null | sed -n 's/^{ sec = \([0-9][0-9]*\),.*/\1/p')
+# WindowServer reports written since this boot (crashes and watchdog hangs); 0 when the boot time cannot be read
+ws_reports() {
+  [ -n "$BOOT" ] || { echo 0; return; }
+  c=0
+  for f in "$DR"/WindowServer*.ips; do
+    [ -f "$f" ] || continue
+    m=$(stat -f %m "$f" 2>/dev/null) || continue
+    [ "$m" -ge "$BOOT" ] && c=$((c + 1))
+  done
+  echo $c
+}
+pids=""; n=0
 while [ "$n" -lt 48 ]; do
-  if pgrep -x WindowServer >/dev/null 2>&1; then
+  p=$(pgrep -x WindowServer 2>/dev/null | head -1)
+  if [ -n "$p" ]; then
+    case " $pids " in *" $p "*) ;; *) pids="$pids $p";; esac
+    r0=$(ws_reports)
     sleep 45
-    pgrep -x WindowServer >/dev/null 2>&1 || { n=$((n + 1)); continue; }
-    nvram -d $V:nullmoth-nv-starts 2>/dev/null
-    nvram $V:nullmoth-nv-ok=1 2>/dev/null
-    echo "$(date) the desktop came up and stayed up; this start counts as good" >> $LOG
-    exit 0
+    p2=$(pgrep -x WindowServer 2>/dev/null | head -1)
+    r1=$(ws_reports)
+    if [ "$p2" = "$p" ] && [ "$r1" = "$r0" ]; then
+      nvram -d $V:nullmoth-nv-starts 2>/dev/null
+      nvram $V:nullmoth-nv-ok=1 2>/dev/null
+      nvram -d $V:nullmoth-ws-loop 2>/dev/null
+      echo "$(date) the desktop came up and stayed up (WindowServer $p for 45 s); this start counts as good" >> $LOG
+      exit 0
+    fi
+    [ -n "$p2" ] && case " $pids " in *" $p2 "*) ;; *) pids="$pids $p2";; esac
+    set -- $pids
+    # Only a display this driver drives makes WindowServer's Metal device ours: debug.nvaccelfb reads 1 once armed.
+    if { [ "$r1" -ge 3 ] || [ "$#" -ge 4 ]; } && [ "$(sysctl -n debug.nvaccelfb 2>/dev/null)" = 1 ]; then
+      prev=$(nvram $V:nullmoth-ws-loop 2>/dev/null | cut -f2)
+      nvram $V:nullmoth-nv-starts=%02 2>/dev/null
+      nvram -d $V:nullmoth-nv-ok 2>/dev/null
+      nvram $V:nullmoth-ws-loop=$r1 2>/dev/null
+      echo "$(date) WindowServer keeps dying ($r1 reports since boot, $# processes seen) on the NVIDIA display; the driver is off for the next boot" >> $LOG
+      # At the login window nothing is open yet, and the screen stays black until a restart. Restart once; a second
+      # loop (the previous driver, or the next boot still looping) is left to the user.
+      if [ -z "$prev" ] && [ "$(stat -f %Su /dev/console 2>/dev/null)" = root ]; then
+        echo "$(date) restarting from the login window" >> $LOG
+        shutdown -r now
+      fi
+      exit 0
+    fi
+    n=$((n + 9)); continue
   fi
   n=$((n + 1)); sleep 5
 done
@@ -615,6 +688,31 @@ elif [ -f "$HERE/dlss_fetch.sh" ]; then
   else
     echo "   DLSS 4 / 4.5 is optional: install with sudo env NULLMOTH_DLSS=1 ./install.sh (dlss_fetch.sh runs only from the installer's checked root-owned copy)."
   fi
+fi
+
+# Optional, off by default: a copy of the driver bundle where Safari's sandboxed graphics process looks for GPU bundles
+# (WebGL in Safari). Run only from the checked root-owned copy; a failure never undoes the driver install.
+if [ "${NULLMOTH_SAFARI_GPU_COPY:-0}" = 1 ]; then
+  if [ -f "$HERE/safari_gpu_copy.sh" ] && grep -qE '[ *]safari_gpu_copy\.sh$' "$HERE/SHA256SUMS" 2>/dev/null; then
+    step "Safari WebGL: driver copy for Safari's graphics process"
+    /bin/bash "$HERE/safari_gpu_copy.sh" install "$GB/NVMTLDriver.bundle" || echo "   NOTE: the Safari copy was not made; the driver itself is installed."
+  else
+    echo "   NOTE: this package's SHA256SUMS does not cover safari_gpu_copy.sh; the Safari copy was skipped."
+  fi
+fi
+
+# Optional, off by default: the GPU boost daemon (a run-time switch for the system-wide boost request). Run only from the
+# checked root-owned copy; a failure never undoes the driver install.
+if [ "${NULLMOTH_GPU_BOOST:-0}" = 1 ]; then
+  if [ -f "$HERE/boost_daemon.sh" ] && grep -qE '[ *]boost_daemon\.sh$' "$HERE/SHA256SUMS" 2>/dev/null \
+     && grep -qE '[ *]Library/NullMoth/boost/nvmtl-boost$' "$HERE/SHA256SUMS" 2>/dev/null; then
+    step "GPU boost daemon"
+    /bin/bash "$HERE/boost_daemon.sh" install "$HERE" || echo "   NOTE: the boost daemon was not installed; the driver itself is."
+  else
+    echo "   NOTE: this package's SHA256SUMS does not cover the boost daemon; it was skipped."
+  fi
+else
+  echo "   The GPU boost switch is optional: install with sudo env NULLMOTH_GPU_BOOST=1 ./install.sh (turn it on or off later from the Mac app)."
 fi
 
 echo; echo "Done. Reboot now: sudo shutdown -r now"

@@ -25,7 +25,7 @@ fixture = r'''
 #include <vector>
 #include "nvrm_ddc_abi.h"
 typedef int IOReturn; typedef uint32_t UInt32; typedef uint32_t IOOptionBits;
-enum { kIOReturnSuccess=0, kIOReturnUnsupported=-1, kIOReturnUnsupportedMode=-2, kIOReturnBadArgument=-3, kIOReturnNoDevice=-4, kIOReturnBadArgumentX=-9 };
+enum { kIOReturnSuccess=0, kIOReturnUnsupported=-1, kIOReturnUnsupportedMode=-2, kIOReturnBadArgument=-3, kIOReturnNoDevice=-4, kIOReturnBadArgumentX=-9, kIOReturnBusy=-10, kMillisecondScale=1000 };
 enum { kIOI2CNoTransactionType=0, kIOI2CSimpleTransactionType=1, kIOI2CDDCciReplyTransactionType=2, kIOI2CUseSubAddressCommFlag=2 };
 struct IOI2CBusTiming; struct IOI2CRequest {
     IOOptionBits sendTransactionType, replyTransactionType; uint32_t sendAddress, replyAddress; uint8_t sendSubAddress, replySubAddress;
@@ -34,10 +34,19 @@ struct IOI2CBusTiming; struct IOI2CRequest {
 };
 static void absolutetime_to_nanoseconds(uint64_t a, uint64_t *n) { *n = a; }
 static unsigned gSlept; static void IOSleep(unsigned ms) { gSlept += ms; }
+static void clock_interval_to_deadline(unsigned ms, int, uint64_t *deadline) { *deadline = ms; }
+class NVRMDdcTransaction {
+    bool *flag;
+    bool acquired;
+public:
+    explicit NVRMDdcTransaction(bool *busy) : flag(busy), acquired(!__atomic_exchange_n(flag, true, __ATOMIC_ACQUIRE)) {}
+    ~NVRMDdcTransaction() { if (acquired) __atomic_store_n(flag, false, __ATOMIC_RELEASE); }
+    bool held() const { return acquired; }
+};
 struct Call { unsigned op, addr, len; std::vector<unsigned char> w; };
 static std::vector<Call> gCalls; static IOReturn gFail = 0; static std::vector<unsigned char> gReply;
 struct FB {
-    bool fDdcOn = true, fDpyLost = false; void *fKms = this;
+    bool fDdcOn = true, fDpyLost = false; void *fKms = this; bool fDdcInFlight = false; uint64_t fDdcWriteAfter = 0;
     IOReturn ddcTransfer(unsigned op, unsigned addr, unsigned char *d, unsigned len) {
         Call c{op, addr, len, {}};
         if (op == kNvrmDdcWrite) c.w.assign(d, d + len); else memcpy(d, gReply.data(), len < gReply.size() ? len : gReply.size());

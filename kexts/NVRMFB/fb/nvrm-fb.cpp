@@ -24,6 +24,7 @@
 #include <IOKit/graphics/IOFramebuffer.h>
 #include <IOKit/graphics/IOGraphicsTypes.h>
 #include <IOKit/graphics/IODisplay.h>
+#include <IOKit/i2c/IOI2CInterface.h>
 #include <IOKit/ndrvsupport/IOMacOSVideo.h>
 #include <libkern/c++/OSNumber.h>
 #include <libkern/c++/OSString.h>
@@ -71,6 +72,7 @@ extern "C" {
 #pragma clang diagnostic pop
 #include <libkern/OSAtomic.h>
 #include "nvrm_vram_abi.h"
+#include "../nvrm_ddcci.h"
 
 
 // Surfaces may use half of a resizable BAR1 (>= 4 GB) and three quarters of a smaller one. WAS: a fixed 192 MB below
@@ -417,6 +419,9 @@ class NVRMNVDAFramebuffer : public IOFramebuffer {
     bool fInternal = false;     // NVKMS static display info: laptop panel (eDP/LVDS)
     NVRMBacklightHandler *fBacklight = nullptr;   // the panel's brightness control, see NVRMBacklightHandler
     void publishBacklight();
+    const OSSymbol *fDdcFunction = nullptr;
+    bool fDdcDisplayPort = false;
+    void publishDdcInterface();
     struct NvKmsKapiDisplayMode fMode = {};
     // the mode NVKMS validated for this display, kept when the boot pair takes the firmware's timing instead (applyMode)
     struct NvKmsKapiDisplayMode fKmsMode = {};
@@ -720,6 +725,7 @@ public:
     IOItemCount getConnectionCount() override { return 1; }
     bool hasDDCConnect(IOIndex) override { return !fDpyLost && fEdidSize >= 128; }
     IOReturn getDDCBlock(IOIndex connectIndex, UInt32 blockNumber, IOSelect blockType, IOOptionBits options, UInt8 *data, IOByteCount *length) override;
+    IOReturn doI2CRequest(UInt32 bus, IOI2CBusTiming *timing, IOI2CRequest *request) override;
     IOReturn registerForInterruptType(IOSelect type, IOFBInterruptProc proc, OSObject *target, void *ref, void **interruptRef) override;
     IOReturn unregisterInterrupt(void *interruptRef) override { return kIOReturnSuccess; }
     IOReturn setInterruptState(void *interruptRef, UInt32 state) override { return kIOReturnSuccess; }
@@ -2865,6 +2871,7 @@ bool NVRMNVDAFramebuffer::start(IOService *provider)
     }
     setName("NVRMFramebuffer");
     if (fInternal) publishBacklight();   // before super::start(): IOFramebuffer::open looks for "backlight"
+    else publishDdcInterface();
     if (!super::start(provider)) {
         NVRMDisplayGate gate; if (gate.valid() && fOwnsHead) { gHeadsTaken &= ~(1u << fHead); fOwnsHead = false; }
         FBLOG("super::start failed after kapiInit succeeded"); return false;
@@ -2993,10 +3000,89 @@ IOReturn NVRMNVDAFramebuffer::getAppleSense(IOIndex connectIndex, UInt32 *senseT
 
 void NVRMNVDAFramebuffer::free()
 {
+    OSSafeReleaseNULL(fDdcFunction);
     if (fFlipCacheLock) { IOSimpleLockFree(fFlipCacheLock); fFlipCacheLock = nullptr; }
     if (fCurStateLock) { IOSimpleLockFree(fCurStateLock); fCurStateLock = nullptr; }
     fConsKva = nullptr; OSSafeReleaseNULL(fConsMap); OSSafeReleaseNULL(fConsMem);
     super::free();
+}
+
+void NVRMNVDAFramebuffer::publishDdcInterface()
+{
+    int enabled = 0;
+    if (!PE_parse_boot_argn("nvddcci", &enabled, sizeof enabled) || enabled != 1) return;
+    NVRMDisplayGate gate;
+    if (!gate.valid() ||
+        fIndex >= (unsigned)gNDpy || !fDisplay || fEdidSize < 128) return;
+
+    const auto &display = gDpy[fIndex];
+    if (display.mst || (display.hdaConnectorType != 0x400 && display.hdaConnectorType != 0x800)) return;
+    fDdcDisplayPort = display.hdaConnectorType == 0x400;
+    OSDictionary *info = OSDictionary::withCapacity(4);
+    OSArray *buses = OSArray::withCapacity(1);
+    const OSSymbol *function = OSSymbol::withCString(NVRM_DDCCI_FN);
+    auto setNumber = [info](const char *key, uint32_t value) {
+        OSNumber *number = OSNumber::withNumber(value, 32);
+        if (!number) return false;
+        const bool ok = info->setObject(key, number);
+        number->release();
+        return ok;
+    };
+    // IOGraphics creates and registers the actual IOFramebufferI2CInterface when this framebuffer opens.
+    if (info && buses && function &&
+        setNumber(kIOI2CInterfaceIDKey, fIndex + 1) &&
+        setNumber(kIOI2CBusTypeKey, kIOI2CBusTypeI2C) &&
+        setNumber(kIOI2CTransactionTypesKey,
+                  (1u << kIOI2CSimpleTransactionType) | (1u << kIOI2CNoTransactionType)) &&
+        setNumber(kIOI2CSupportedCommFlagsKey, 0) &&
+        buses->setObject(info) && setProperty(kIOFBI2CInterfaceInfoKey, buses)) {
+        fDdcFunction = function;
+        function = nullptr;
+        setProperty("NVRMDDCTransport", fDdcDisplayPort ? "dp-aux" : "hdmi-ddc");
+        setProperty("NVRMDDCDisplayID", fDisplay, 32);
+    }
+    OSSafeReleaseNULL(function);
+    OSSafeReleaseNULL(info);
+    OSSafeReleaseNULL(buses);
+}
+
+IOReturn NVRMNVDAFramebuffer::doI2CRequest(UInt32 bus, IOI2CBusTiming *timing, IOI2CRequest *request)
+{
+    if (!fDdcFunction || bus != fIndex + 1) return super::doI2CRequest(bus, timing, request);
+    if (!request || request->completion || request->commFlags || request->sendAddress != 0x6e ||
+        request->sendTransactionType != kIOI2CSimpleTransactionType || !request->sendBuffer)
+        return kIOReturnUnsupportedMode;
+
+    const bool get = request->sendBytes == 5 && request->replyAddress == 0x6f &&
+                     request->replyTransactionType == kIOI2CSimpleTransactionType &&
+                     request->replyBytes == 11 && request->replyBuffer;
+    const bool set = request->sendBytes == 7 && request->replyTransactionType == kIOI2CNoTransactionType;
+    if (!get && !set) return kIOReturnUnsupportedMode;
+
+    uint64_t delayNs = 0;
+    absolutetime_to_nanoseconds(request->minReplyDelay, &delayNs);
+    if (delayNs > 200000000) return kIOReturnBadArgument;
+
+    NVRMDisplayGate gate;
+    if (!gate.valid() || OSAddAtomic(0, &fStopping) || fDpyLost || fEdidSize < 128 ||
+        !getProvider()) return kIOReturnOffline;
+
+    NVRMDdcRequest transfer = {};
+    transfer.gpuId = fGpuId;
+    transfer.displayId = fDisplay;
+    transfer.displayPort = fDdcDisplayPort;
+    transfer.delayMs = (uint32_t)((delayNs + 999999) / 1000000);
+    transfer.sendLength = (uint8_t)request->sendBytes;
+    nvu_copy(transfer.send, (const void *)request->sendBuffer, transfer.sendLength);
+    const IOReturn result = getProvider()->callPlatformFunction(fDdcFunction, false, &transfer, nullptr, nullptr, nullptr);
+    setProperty("NVRMDDCStage", (uint32_t)transfer.stage, 32);
+    setProperty("NVRMDDCRMStatus", transfer.rmStatus, 32);
+    if (transfer.port) setProperty("NVRMDDCPortID", transfer.port, 32);
+    if (result != kIOReturnSuccess) return result;
+
+    if (get) nvu_copy((void *)request->replyBuffer, transfer.reply, sizeof transfer.reply);
+    request->result = kIOReturnSuccess;
+    return kIOReturnSuccess;
 }
 
 IOReturn NVRMNVDAFramebuffer::enableController()

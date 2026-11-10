@@ -9,6 +9,7 @@
 #include "nvrm_utilization.h"
 #include "nvrm_bar_limits.h"
 #include "nvrm_telemetry.h"
+#include "../NVRMFB/nvrm_ddcci.h"
 
 extern "C" void nv_xnu_power_refresh(void);   // nv_xnu_power.cpp
 #include <IOKit/IOService.h>
@@ -31,6 +32,10 @@ extern "C" {
 #include <sys/kauth.h>
 #include <sys/sysctl.h>
 #include <libkern/version.h>
+#include "nv-kernel-rmapi-ops.h"
+#include "ctrl/ctrl0073/ctrl0073dp.h"
+#include "ctrl/ctrl0073/ctrl0073specific.h"
+#include "ctrl/ctrl402c.h"
 
 // The 2.x driver is built for macOS 15 (Darwin 24) and macOS 26 (Darwin 25) only; on any other kernel NVRM
 // claims nothing, so NVRMFB and NVRMAGDC, which attach to it, never start either.
@@ -1910,8 +1915,102 @@ public:
 };
 OSDefineMetaClassAndStructors(IOAccelNVRMBridge, NVRMUserClient)
 
+static NvU32 nvrmDdcControl(NvU32 client, NvU32 object, NvU32 command, void *params, NvU32 size)
+{
+    // The caller already holds PM admission. The NVKMS RM wrapper would enter it again.
+    nvidia_kernel_rmapi_ops_t op = {};
+    op.op = NV04_CONTROL;
+    op.params.control.hClient = client;
+    op.params.control.hObject = object;
+    op.params.control.cmd = command;
+    op.params.control.params = NV_PTR_TO_NvP64(params);
+    op.params.control.paramsSize = size;
+    rm_kernel_rmapi_op(nullptr, &op);
+    return op.params.control.status;
+}
+
+static NvU32 nvrmDdcTransfer(const nv_state_t &nv, NVRMDdcRequest &request, bool write)
+{
+    const NvU32 size = write ? request.sendLength : sizeof request.reply;
+    if (request.displayPort) {
+        NV0073_CTRL_DP_AUXCH_I2C_TRANSFER_CTRL_PARAMS aux = {};
+        aux.displayId = request.displayId;
+        aux.addr = 0x37; // DP AUX uses the seven-bit address.
+        aux.bWrite = write;
+        aux.size = size;
+        if (write) memcpy(aux.data, request.send, size);
+        const NvU32 status = nvrmDdcControl(nv.rmapi.hClient, nv.rmapi.hDisp,
+                                          NV0073_CTRL_CMD_DP_AUXCH_I2C_TRANSFER_CTRL, &aux, sizeof aux);
+        if (status != NV_OK) return status;
+        if (aux.size != size) return NV_ERR_INVALID_DATA;
+        if (!write) memcpy(request.reply, aux.data, size);
+        return NV_OK;
+    }
+
+    NV402C_CTRL_I2C_TRANSACTION_PARAMS gpio = {};
+    gpio.portId = (NvU8)(request.port - 1); // RM's display query is one-based, the transaction is zero-based.
+    gpio.deviceAddress = 0x6e;
+    gpio.transType = NV402C_CTRL_I2C_TRANSACTION_TYPE_I2C_BLOCK_RW;
+    gpio.transData.i2cBlockData.bWrite = write;
+    gpio.transData.i2cBlockData.messageLength = size;
+    gpio.transData.i2cBlockData.pMessage = NV_PTR_TO_NvP64(write ? request.send : request.reply);
+    const NvU32 status = nvrmDdcControl(nv.rmapi.hClient, nv.rmapi.hI2C,
+                                      NV402C_CTRL_CMD_I2C_TRANSACTION, &gpio, sizeof gpio);
+    if (status == NV_OK && gpio.transData.i2cBlockData.messageLength != size) return NV_ERR_INVALID_DATA;
+    return status;
+}
+
+static IOReturn nvrmDdcBrightness(const nv_state_t &nv, NVRMDdcRequest &request)
+{
+    request.rmStatus = NV_ERR_NOT_READY;
+    if (!nv.rmapi.hClient || !nv.rmapi.hDisp) return kIOReturnNotReady;
+    if (!request.displayPort) {
+        request.stage = kNVRMDdcPortLookup;
+        NV0073_CTRL_SPECIFIC_GET_I2C_PORTID_PARAMS port = {};
+        port.displayId = request.displayId;
+        request.rmStatus = nvrmDdcControl(nv.rmapi.hClient, nv.rmapi.hDisp,
+                                         NV0073_CTRL_CMD_SPECIFIC_GET_I2C_PORTID, &port, sizeof port);
+        if (request.rmStatus != NV_OK) return kIOReturnIOError;
+        request.port = port.ddcPortId;
+        if (!request.port || request.port > NV402C_CTRL_NUM_I2C_PORTS || !nv.rmapi.hI2C) {
+            request.rmStatus = NV_ERR_NOT_SUPPORTED;
+            return kIOReturnUnsupported;
+        }
+    }
+    request.stage = kNVRMDdcWrite;
+    request.rmStatus = nvrmDdcTransfer(nv, request, true);
+    if (request.rmStatus != NV_OK) return kIOReturnIOError;
+    if (request.sendLength == 5) {
+        IOSleep(request.delayMs < 40 ? 40 : request.delayMs);
+        request.stage = kNVRMDdcRead;
+        request.rmStatus = nvrmDdcTransfer(nv, request, false);
+        if (request.rmStatus != NV_OK) return kIOReturnIOError;
+    }
+    request.stage = kNVRMDdcComplete;
+    return kIOReturnSuccess;
+}
+
 IOReturn NVRM::callPlatformFunction(const OSSymbol *fn, bool wait, void *p1, void *p2, void *p3, void *p4)
 {
+    if (fn && fn->isEqualTo(NVRM_DDCCI_FN)) {
+        auto *request = static_cast<NVRMDdcRequest *>(p1);
+        if (!request || !request->displayId || (request->displayId & (request->displayId - 1)) ||
+            request->delayMs > 200 || !nvrmDdcBrightnessCommand(request->send, request->sendLength))
+            return kIOReturnBadArgument;
+        int enabled = 0;
+        if (!PE_parse_boot_argn("nvddcci", &enabled, sizeof enabled) || enabled != 1)
+            return kIOReturnUnsupported;
+        if (!fUtilizationLock || isInactive()) return kIOReturnNotReady;
+        int counted = 0;
+        if (!nv_xnu_pm_try_enter(&counted)) return kIOReturnNotReady;
+        IOLockLock(fUtilizationLock);
+        const bool ready = !fUtilizationStopping && !isInactive() && fAdapter && fPassDone >= 2 &&
+                           request->gpuId == fNv.gpu_id && OSAddAtomic(0, &fGpuPm) == kGpuPmRunning;
+        const IOReturn result = ready ? nvrmDdcBrightness(fNv, *request) : kIOReturnNotReady;
+        IOLockUnlock(fUtilizationLock);
+        nv_xnu_pm_exit(counted);
+        return result;
+    }
     if (fn && fn->isEqualTo(NVRM_TELEMETRY_FN)) {
         NVRMTelemetry *sample = (NVRMTelemetry *)p1;
         if (!sample || sample->version != NVRM_TELEMETRY_ABI_VERSION) return kIOReturnBadArgument;

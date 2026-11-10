@@ -235,6 +235,31 @@ static const SInt32 kAppleBacklightDefaultMax = 255;
 static const UInt32 kNVRMBacklightSaveDelaySeconds = 2;
 #define BLLOG(fmt, ...) do { IOLog("NVRM-fb: " fmt "\n", ##__VA_ARGS__); kprintf("NVRM-fb: " fmt "\n", ##__VA_ARGS__); } while (0)
 
+// External displays can have no native parameter dictionary when the framebuffer reports zero parameters.
+// Seed the dictionary before IODisplay's first update so a DDC provider can publish a verified brightness range.
+class NVRMDdcParameterHandler : public IODisplayParameterHandler {
+    OSDeclareDefaultStructors(NVRMDdcParameterHandler)
+public:
+    bool setDisplay(IODisplay *display) override
+    {
+        if (!display || strcmp(display->getMetaClass()->getClassName(), "AppleDisplay") != 0) return false;
+        OSObject *existing = display->copyProperty(gIODisplayParametersKey);
+        if (existing) {
+            existing->release();
+            return true;
+        }
+        OSDictionary *params = OSDictionary::withCapacity(1);
+        if (!params) return false;
+        const bool ok = display->setProperty(gIODisplayParametersKey, params);
+        params->release();
+        return ok;
+    }
+    bool doIntegerSet(OSDictionary *, const OSSymbol *, UInt32) override { return false; }
+    bool doDataSet(const OSSymbol *, OSData *) override { return false; }
+    bool doUpdate() override { return true; }
+};
+OSDefineMetaClassAndStructors(NVRMDdcParameterHandler, IODisplayParameterHandler)
+
 class NVRMBacklightHandler : public IODisplayParameterHandler {
     OSDeclareDefaultStructors(NVRMBacklightHandler)
     IOService *fRM = nullptr;
@@ -420,6 +445,7 @@ class NVRMNVDAFramebuffer : public IOFramebuffer {
     NVRMBacklightHandler *fBacklight = nullptr;   // the panel's brightness control, see NVRMBacklightHandler
     void publishBacklight();
     const OSSymbol *fDdcFunction = nullptr;
+    NVRMDdcParameterHandler *fDdcParameters = nullptr;
     bool fDdcDisplayPort = false;
     void publishDdcInterface();
     void syncDdcPowerState(bool powered);
@@ -2873,7 +2899,15 @@ bool NVRMNVDAFramebuffer::start(IOService *provider)
     setName("NVRMFramebuffer");
     if (fInternal) publishBacklight();   // before super::start(): IOFramebuffer::open looks for "backlight"
     else publishDdcInterface();
+    if (fDdcFunction) {
+        fDdcParameters = OSTypeAlloc(NVRMDdcParameterHandler);
+        if (fDdcParameters && fDdcParameters->init() && fDdcParameters->attach(this))
+            fDdcParameters->registerService(kIOServiceSynchronous);
+        else
+            OSSafeReleaseNULL(fDdcParameters);
+    }
     if (!super::start(provider)) {
+        if (fDdcParameters) { fDdcParameters->detach(this); OSSafeReleaseNULL(fDdcParameters); }
         NVRMDisplayGate gate; if (gate.valid() && fOwnsHead) { gHeadsTaken &= ~(1u << fHead); fOwnsHead = false; }
         FBLOG("super::start failed after kapiInit succeeded"); return false;
     }
@@ -2963,6 +2997,7 @@ void NVRMNVDAFramebuffer::stop(IOService *provider)
         fKms->unregisterVblankIntrCallback(fDev, fHead, fHwVblCb); fHwVblCb = nullptr;
     }
     if (fBacklight) { fBacklight->detach(this); OSSafeReleaseNULL(fBacklight); }
+    if (fDdcParameters) { fDdcParameters->detach(this); OSSafeReleaseNULL(fDdcParameters); }
     if (fGamma) { IOFree(fGamma, sizeof *fGamma); fGamma = nullptr; fGammaOn = false; }
     if (fWakeGate) { if (IOWorkLoop *wl = getWorkLoop()) wl->removeEventSource(fWakeGate); OSSafeReleaseNULL(fWakeGate); }
     if (fSleepTap) { fSleepTap->remove(); fSleepTap = nullptr; }

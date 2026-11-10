@@ -30,7 +30,7 @@ struct InstallPlan: Codable, Sendable {
         baseline.tag.wholeMatch(of: /v[0-9]+\.[0-9]+(?:\.[0-9]+)?/) != nil &&
         baseline.name == "nullmoth-nvidia-\(baseline.tag.dropFirst()).tar.gz" && baseline.isValid &&
         DriverVersion(baseline.tag)?.base == DriverVersion(tag)?.base &&
-        overlay.tag == tag && overlay.name.hasPrefix("geekaudio-nullmoth-") && overlay.name.hasSuffix("-overlay.tar.gz") && overlay.isValid
+        overlay.tag == tag && DriverRelease.isOverlayAsset(overlay.name) && overlay.isValid
     }
 
     static func verify(_ bytes: Data, signature: Data, tag: String, publicKey: Data) throws -> Self {

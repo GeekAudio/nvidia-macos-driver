@@ -8,7 +8,7 @@ struct DriverVersion: Comparable, Sendable {
     var isPreview: Bool { candidate != nil }
 
     init?(_ text: String) {
-        guard let match = text.wholeMatch(of: /v?([0-9]+)\.([0-9]+)(?:\.([0-9]+))?(?:-geekaudio\.([0-9]+)(?:-rc([0-9]+)|-ddcci)?)?/),
+        guard let match = text.wholeMatch(of: /v?([0-9]+)\.([0-9]+)(?:\.([0-9]+))?(?:-geekaudio\.([0-9]+)(?:-rc([0-9]+)|-ddcci|-stable)?)?/),
               let major = Int(match.1), let minor = Int(match.2),
               let patch = Int(match.3 ?? "0"), let revision = Int(match.4 ?? "0") else { return nil }
         base = [major, minor, patch]
@@ -77,6 +77,11 @@ struct DriverRelease: Sendable {
     let offersInstaller: Bool
 
     var page: URL { ReleaseFeed.repository.appendingPathComponent("releases/tag/\(tag)") }
+
+    static func isOverlayAsset(_ name: String) -> Bool {
+        (name.hasPrefix("geekaudio-nullmoth-") || name.hasPrefix("01-geekaudio-nullmoth-")) &&
+        name.hasSuffix("-overlay.tar.gz")
+    }
 }
 
 enum CheckRoute: String, CaseIterable, Identifiable, Sendable {
@@ -91,7 +96,7 @@ struct ReleaseFeed: Sendable {
     static let repository = URL(string: "https://github.com/GeekAudio/nvidia-macos-driver")!
     private static let api = "https://api.github.com/repos/GeekAudio/nvidia-macos-driver/releases?per_page=100"
     private static let proxy = "https://gh-proxy.com/"
-    private static let withdrawn = "v2.9-geekaudio.1-rc1"
+    private static let withdrawn: Set<String> = ["v2.9-geekaudio.1-rc1", "v2.9.0-geekaudio.1-rc1"]
 
     private struct Entry: Decodable {
         struct Asset: Decodable { let name: String; let state: String }
@@ -158,10 +163,10 @@ struct ReleaseFeed: Sendable {
             throw FeedError.unexpectedResponse
         }
         return entries.compactMap { entry -> DriverRelease? in
-            guard !entry.draft, entry.tag_name != withdrawn, entry.tag_name.contains("-geekaudio."),
+            guard !entry.draft, !withdrawn.contains(entry.tag_name), entry.tag_name.contains("-geekaudio."),
                   let version = DriverVersion(entry.tag_name),
                   entry.assets.contains(where: {
-                      $0.state == "uploaded" && $0.name.hasPrefix("geekaudio-nullmoth-") && $0.name.hasSuffix("-overlay.tar.gz")
+                      $0.state == "uploaded" && DriverRelease.isOverlayAsset($0.name)
                   }) else { return nil }
             let preview = entry.prerelease || version.isPreview
             guard !preview || includePreviews else { return nil }

@@ -158,6 +158,7 @@ private:
     bool         fPrivateState = false;
     bool         fAdapter = false;
     IOLock      *fUtilizationLock = nullptr;
+    uint64_t     fDpDdcReadCompleted[32] = {}; // indexed by the one-bit display ID, under fUtilizationLock
     void        *fUtilizationState = nullptr;
     void        *fTelemetryState = nullptr;
     bool         fUtilizationStopping = false;
@@ -2020,6 +2021,18 @@ static IOReturn nvrmDdcBrightness(const nv_state_t &nv, NVRMDdcRequest &request)
     return kIOReturnSuccess;
 }
 
+static void nvrmDdcWaitAfterDpRead(uint64_t completed)
+{
+    if (!completed) return;
+    // A SetVCP sent directly after an ACKed DP GetVCP can fail at RM with NV_ERR_GENERIC.
+    // Leave the sink the interval verified on the affected DisplayPort path.
+    constexpr uint64_t quietNs = 140000000;
+    uint64_t elapsedNs = 0;
+    absolutetime_to_nanoseconds(mach_absolute_time() - completed, &elapsedNs);
+    if (elapsedNs < quietNs)
+        IOSleep((quietNs - elapsedNs + 999999) / 1000000);
+}
+
 IOReturn NVRM::callPlatformFunction(const OSSymbol *fn, bool wait, void *p1, void *p2, void *p3, void *p4)
 {
     if (fn && fn->isEqualTo(NVRM_DDCCI_FN)) {
@@ -2036,7 +2049,12 @@ IOReturn NVRM::callPlatformFunction(const OSSymbol *fn, bool wait, void *p1, voi
         IOLockLock(fUtilizationLock);
         const bool ready = !fUtilizationStopping && !isInactive() && fAdapter && fPassDone >= 2 &&
                            request->gpuId == fNv.gpu_id && OSAddAtomic(0, &fGpuPm) == kGpuPmRunning;
+        uint64_t *dpReadCompleted = ready && request->displayPort
+            ? &fDpDdcReadCompleted[__builtin_ctz(request->displayId)] : nullptr;
+        if (dpReadCompleted && request->sendLength == 7) nvrmDdcWaitAfterDpRead(*dpReadCompleted);
         const IOReturn result = ready ? nvrmDdcBrightness(fNv, *request) : kIOReturnNotReady;
+        if (dpReadCompleted && request->sendLength == 5 && result == kIOReturnSuccess)
+            *dpReadCompleted = mach_absolute_time();
         IOLockUnlock(fUtilizationLock);
         nv_xnu_pm_exit(counted);
         return result;

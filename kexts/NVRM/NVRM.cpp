@@ -2026,7 +2026,7 @@ static void nvrmDdcWaitAfterDpRead(uint64_t completed)
     if (!completed) return;
     // A SetVCP sent directly after an ACKed DP GetVCP can fail at RM with NV_ERR_GENERIC.
     // Leave the sink the interval verified on the affected DisplayPort path.
-    constexpr uint64_t quietNs = 140000000;
+    constexpr uint64_t quietNs = kNVRMDdcDpReadToWriteMs * 1000000ull;
     uint64_t elapsedNs = 0;
     absolutetime_to_nanoseconds(mach_absolute_time() - completed, &elapsedNs);
     if (elapsedNs < quietNs)

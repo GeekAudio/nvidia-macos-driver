@@ -447,8 +447,13 @@ class NVRMNVDAFramebuffer : public IOFramebuffer {
     const OSSymbol *fDdcFunction = nullptr;
     NVRMDdcParameterHandler *fDdcParameters = nullptr;
     bool fDdcDisplayPort = false;
+    uint64_t fDdcWriteAfter = 0; // under NVRMDisplayGate
+    volatile SInt32 fDdcSinkGeneration = 0;
+    IOCommandGate *fDdcWaitGate = nullptr; // active write wait, under the IOGraphics gate
     void publishDdcInterface();
     void syncDdcPowerState(bool powered);
+    IOReturn waitForDdcWrite(uint64_t deadline);
+    void drainDdcWrite();
     struct NvKmsKapiDisplayMode fMode = {};
     // the mode NVKMS validated for this display, kept when the boot pair takes the firmware's timing instead (applyMode)
     struct NvKmsKapiDisplayMode fKmsMode = {};
@@ -1718,6 +1723,7 @@ void NVRMNVDAFramebuffer::hotplugFire(thread_call_param_t, thread_call_param_t)
                     if (!fb->fDpyLost) {
                         FBLOG("hot-plug: display 0x%x went away (fb %u)", handles[i], fb->fIndex);
                         fb->fDpyLost = true;
+                        OSIncrementAtomic(&fb->fDdcSinkGeneration);
                         fb->fEdidSize = 0;
                         fb->clearDisplayAudioProperties();
                         if (nnotify < sizeof notify / sizeof notify[0]) { fb->retain(); notify[nnotify++] = fb; }
@@ -1731,7 +1737,10 @@ void NVRMNVDAFramebuffer::hotplugFire(thread_call_param_t, thread_call_param_t)
                         fb->fBlackLutDeadline = 0;
                         clock_interval_to_deadline(15000, kMillisecondScale, &fb->fBlackLutDeadline);
                     }
-                    if (swapped) fb->fEdidSwapped = true;
+                    if (swapped) {
+                        fb->fEdidSwapped = true;
+                        OSIncrementAtomic(&fb->fDdcSinkGeneration);
+                    }
                     if (nrelight < sizeof relight / sizeof relight[0]) {
                         fb->retain(); relight[nrelight++] = fb;
                     }
@@ -1766,6 +1775,7 @@ void NVRMNVDAFramebuffer::hotplugFire(thread_call_param_t, thread_call_param_t)
             FBLOG("hot-plug: known display 0x%x omitted from NVKMS list and confirmed disconnected (fb %u)",
                   gDpy[k].handle, fb->fIndex);
             fb->fDpyLost = true;
+            OSIncrementAtomic(&fb->fDdcSinkGeneration);
             fb->fEdidSize = 0;
             fb->clearDisplayAudioProperties();
             if (nnotify < sizeof notify / sizeof notify[0]) { fb->retain(); notify[nnotify++] = fb; }
@@ -2969,6 +2979,7 @@ void NVRMNVDAFramebuffer::stop(IOService *provider)
         fStopping = 1;
         IOSimpleLockUnlockEnableInterrupt(fFlipCacheLock, state);
     }
+    if (fDdcDisplayPort) drainDdcWrite();
     if (fHwVblCb && fKms && fDev) {
         fKms->unregisterVblankIntrCallback(fDev, fHead, fHwVblCb); fHwVblCb = nullptr;
     }
@@ -3091,13 +3102,53 @@ void NVRMNVDAFramebuffer::syncDdcPowerState(bool powered)
     // Mirror our power transition there without scheduling the family's own power work.
     IOWorkLoop *loop = getWorkLoop();
     if (!loop) {
+        if (!powered && pendingPowerState) OSIncrementAtomic(&fDdcSinkGeneration);
         pendingPowerState = powered ? 1 : 0;
         return;
     }
     loop->runAction([](OSObject *target, void *on, void *, void *, void *) -> IOReturn {
-        static_cast<NVRMNVDAFramebuffer *>(target)->pendingPowerState = on ? 1 : 0;
+        auto *fb = static_cast<NVRMNVDAFramebuffer *>(target);
+        if (!on && fb->pendingPowerState) OSIncrementAtomic(&fb->fDdcSinkGeneration);
+        fb->pendingPowerState = on ? 1 : 0;
         return kIOReturnSuccess;
     }, this, powered ? this : nullptr);
+}
+
+IOReturn NVRMNVDAFramebuffer::waitForDdcWrite(uint64_t deadline)
+{
+    IOWorkLoop *loop = getWorkLoop();
+    if (!loop || !loop->inGate() || loop->onThread()) return kIOReturnBusy;
+    if (OSAddAtomic(0, &fStopping)) return kIOReturnOffline;
+    IOCommandGate *waitGate = IOCommandGate::commandGate(this);
+    if (!waitGate) return kIOReturnNoMemory;
+    NVRMCallReference gateRef(waitGate);
+    const IOReturn added = loop->addEventSource(waitGate);
+    if (added != kIOReturnSuccess) return added;
+    // startIO owns the controller gate, sometimes recursively. commandSleep drops the entire gate
+    // and restores it before returning. Neither the NVIDIA display lock nor RM's PM gate is held.
+    fDdcWaitGate = waitGate;
+    const IOReturn slept = waitGate->commandSleep(waitGate, deadline, THREAD_UNINT);
+    fDdcWaitGate = nullptr;
+    waitGate->commandWakeup(&fDdcWaitGate, false);
+    loop->removeEventSource(waitGate);
+    return slept == THREAD_TIMED_OUT ? kIOReturnSuccess : kIOReturnAborted;
+}
+
+void NVRMNVDAFramebuffer::drainDdcWrite()
+{
+    IOWorkLoop *loop = getWorkLoop();
+    if (!loop) return;
+    loop->runAction([](OSObject *target, void *, void *, void *, void *) -> IOReturn {
+        auto *fb = static_cast<NVRMNVDAFramebuffer *>(target);
+        IOCommandGate *waitGate = fb->fDdcWaitGate;
+        if (!waitGate) return kIOReturnSuccess;
+        waitGate->retain();
+        NVRMCallReference gateRef(waitGate);
+        waitGate->commandWakeup(waitGate, false);
+        // Reacquiring the controller gate also waits for startIO to finish unlocking the framebuffer.
+        while (fb->fDdcWaitGate) waitGate->commandSleep(&fb->fDdcWaitGate, THREAD_UNINT);
+        return kIOReturnSuccess;
+    }, this);
 }
 
 IOReturn NVRMNVDAFramebuffer::doI2CRequest(UInt32 bus, IOI2CBusTiming *timing, IOI2CRequest *request)
@@ -3112,31 +3163,56 @@ IOReturn NVRMNVDAFramebuffer::doI2CRequest(UInt32 bus, IOI2CBusTiming *timing, I
                      request->replyBytes == 11 && request->replyBuffer;
     const bool set = request->sendBytes == 7 && request->replyTransactionType == kIOI2CNoTransactionType;
     if (!get && !set) return kIOReturnUnsupportedMode;
+    if (fDdcDisplayPort) {
+        IOWorkLoop *loop = getWorkLoop();
+        if (!loop || !loop->inGate() || fDdcWaitGate) return kIOReturnBusy;
+    }
 
     uint64_t delayNs = 0;
     absolutetime_to_nanoseconds(request->minReplyDelay, &delayNs);
     if (delayNs > 200000000) return kIOReturnBadArgument;
 
-    NVRMDisplayGate gate;
-    if (!gate.valid() || OSAddAtomic(0, &fStopping) || fDpyLost || fHeadSlept || !fModeSet || fEdidSize < 128 ||
-        !getProvider()) return kIOReturnOffline;
-
     NVRMDdcRequest transfer = {};
-    transfer.gpuId = fGpuId;
-    transfer.displayId = fDisplay;
-    transfer.displayPort = fDdcDisplayPort;
     transfer.delayMs = (uint32_t)((delayNs + 999999) / 1000000);
     transfer.sendLength = (uint8_t)request->sendBytes;
     nvu_copy(transfer.send, (const void *)request->sendBuffer, transfer.sendLength);
-    const IOReturn result = getProvider()->callPlatformFunction(fDdcFunction, false, &transfer, nullptr, nullptr, nullptr);
-    setProperty("NVRMDDCStage", (uint32_t)transfer.stage, 32);
-    setProperty("NVRMDDCRMStatus", transfer.rmStatus, 32);
-    if (transfer.port) setProperty("NVRMDDCPortID", transfer.port, 32);
-    if (result != kIOReturnSuccess) return result;
+    if (!nvrmDdcBrightnessCommand(transfer.send, transfer.sendLength)) return kIOReturnBadArgument;
 
-    if (get) nvu_copy((void *)request->replyBuffer, transfer.reply, sizeof transfer.reply);
-    request->result = kIOReturnSuccess;
-    return kIOReturnSuccess;
+    uint64_t deadline = 0;
+    SInt32 generation = 0;
+    for (;;) {
+        {
+            NVRMDisplayGate gate;
+            IOService *provider = getProvider();
+            if (!gate.valid() || OSAddAtomic(0, &fStopping) || isInactive() || !pendingPowerState ||
+                fDpyLost || fEdidSwapped || fHeadSlept || !fModeSet || fEdidSize < 128 || !provider)
+                return kIOReturnOffline;
+            if (deadline && generation != OSAddAtomic(0, &fDdcSinkGeneration)) return kIOReturnOffline;
+            if (!set || !fDdcDisplayPort || mach_absolute_time() >= fDdcWriteAfter) {
+                transfer.gpuId = fGpuId;
+                transfer.displayId = fDisplay;
+                transfer.displayPort = fDdcDisplayPort;
+                const IOReturn result = provider->callPlatformFunction(fDdcFunction, false, &transfer,
+                                                                       nullptr, nullptr, nullptr);
+                if (get && fDdcDisplayPort && result == kIOReturnSuccess)
+                    clock_interval_to_deadline(kNVRMDdcDpReadToWriteMs, kMillisecondScale, &fDdcWriteAfter);
+                setProperty("NVRMDDCStage", (uint32_t)transfer.stage, 32);
+                setProperty("NVRMDDCRMStatus", transfer.rmStatus, 32);
+                if (transfer.port) setProperty("NVRMDDCPortID", transfer.port, 32);
+                if (result != kIOReturnSuccess) return result;
+
+                if (get) nvu_copy((void *)request->replyBuffer, transfer.reply, sizeof transfer.reply);
+                request->result = kIOReturnSuccess;
+                return kIOReturnSuccess;
+            }
+            // Never write early or extend this request beyond a single wait.
+            if (deadline) return kIOReturnBusy;
+            deadline = fDdcWriteAfter;
+            generation = OSAddAtomic(0, &fDdcSinkGeneration);
+        }
+        const IOReturn waited = waitForDdcWrite(deadline);
+        if (waited != kIOReturnSuccess) return waited;
+    }
 }
 
 IOReturn NVRMNVDAFramebuffer::enableController()

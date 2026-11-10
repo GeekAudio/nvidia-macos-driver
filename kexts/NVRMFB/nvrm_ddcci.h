@@ -7,6 +7,8 @@
 
 #define NVRM_DDCCI_FN "nvDisplayDDCCI-v1"
 
+constexpr uint32_t kNVRMDdcDpReadToWriteMs = 140;
+
 enum NVRMDdcStage {
     kNVRMDdcUnavailable,
     kNVRMDdcPortLookup,

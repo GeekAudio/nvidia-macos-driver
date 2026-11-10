@@ -422,6 +422,7 @@ class NVRMNVDAFramebuffer : public IOFramebuffer {
     const OSSymbol *fDdcFunction = nullptr;
     bool fDdcDisplayPort = false;
     void publishDdcInterface();
+    void syncDdcPowerState(bool powered);
     struct NvKmsKapiDisplayMode fMode = {};
     // the mode NVKMS validated for this display, kept when the boot pair takes the firmware's timing instead (applyMode)
     struct NvKmsKapiDisplayMode fKmsMode = {};
@@ -3038,12 +3039,30 @@ void NVRMNVDAFramebuffer::publishDdcInterface()
         buses->setObject(info) && setProperty(kIOFBI2CInterfaceInfoKey, buses)) {
         fDdcFunction = function;
         function = nullptr;
+        // This is before the framebuffer starts, so the controller cannot read the state yet.
+        pendingPowerState = fPowerOn ? 1 : 0;
         setProperty("NVRMDDCTransport", fDdcDisplayPort ? "dp-aux" : "hdmi-ddc");
         setProperty("NVRMDDCDisplayID", fDisplay, 32);
     }
     OSSafeReleaseNULL(function);
     OSSafeReleaseNULL(info);
     OSSafeReleaseNULL(buses);
+}
+
+void NVRMNVDAFramebuffer::syncDdcPowerState(bool powered)
+{
+    if (!fDdcFunction) return;
+    // IOGraphics tests pendingPowerState under its framebuffer gate before calling doI2CRequest.
+    // Mirror our power transition there without scheduling the family's own power work.
+    IOWorkLoop *loop = getWorkLoop();
+    if (!loop) {
+        pendingPowerState = powered ? 1 : 0;
+        return;
+    }
+    loop->runAction([](OSObject *target, void *on, void *, void *, void *) -> IOReturn {
+        static_cast<NVRMNVDAFramebuffer *>(target)->pendingPowerState = on ? 1 : 0;
+        return kIOReturnSuccess;
+    }, this, powered ? this : nullptr);
 }
 
 IOReturn NVRMNVDAFramebuffer::doI2CRequest(UInt32 bus, IOI2CBusTiming *timing, IOI2CRequest *request)
@@ -3064,7 +3083,7 @@ IOReturn NVRMNVDAFramebuffer::doI2CRequest(UInt32 bus, IOI2CBusTiming *timing, I
     if (delayNs > 200000000) return kIOReturnBadArgument;
 
     NVRMDisplayGate gate;
-    if (!gate.valid() || OSAddAtomic(0, &fStopping) || fDpyLost || fEdidSize < 128 ||
+    if (!gate.valid() || OSAddAtomic(0, &fStopping) || fDpyLost || fHeadSlept || !fModeSet || fEdidSize < 128 ||
         !getProvider()) return kIOReturnOffline;
 
     NVRMDdcRequest transfer = {};
@@ -4424,6 +4443,7 @@ IOReturn NVRMNVDAFramebuffer::setPowerState(unsigned long ordinal, IOService *de
         // a failed wake stays retryable (fHeadSlept kept) but WindowServer is still told the display is on, as 1.14.7 did:
         // without the notification it never redraws, and the head can sit black with nothing left to retry it (review)
         (void)setHeadPower(true);
+        syncDdcPowerState(true);
         // A system sleep cleared pagingState (IOGraphics' system work, with kIOFBNotifyWillSleep to every client).
         // This override replaces IOFramebuffer::setPowerState, so the family's wake work never runs, and
         // handleEvent() does nothing off the controller's power thread - so no client ever saw kIOFBNotifyDidWake,
@@ -4434,6 +4454,7 @@ IOReturn NVRMNVDAFramebuffer::setPowerState(unsigned long ordinal, IOService *de
         if (!pagingState && fSysSlept) { fSysSlept = false; familyDidWake(); }
         else handleEvent(kIOFBNotifyDidPowerOn);
     } else {
+        syncDdcPowerState(false);
         handleEvent(kIOFBNotifyWillPowerOff);
         fPowerOn = false;
         (void)setHeadPower(false);

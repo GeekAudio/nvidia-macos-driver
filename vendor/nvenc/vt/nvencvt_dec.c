@@ -141,6 +141,9 @@ static uint64_t session_device_id(const Rm *rm)
     return ctlGPU == devGPU ? ctlGPU : 0;
 }
 
+// Firefox hands VP9/AV1 IOSurfaces to its compositor in another process.
+enum { MAX_HELD_PICTURES = 16 };
+
 typedef struct {
     pthread_mutex_t lock;
     VTVideoDecoderSession session;
@@ -163,6 +166,9 @@ typedef struct {
     // asynchronous output (T8.09): pictures waiting for the output thread (copy, emit, release), in decode order
     struct OutJob { VTVideoDecoderFrame frame; OSStatus res; VTDecodeInfoFlags fl; CVPixelBufferRef pb; int surf, rel; unsigned w, h, cx, cy, usCopy, usEmit; } q[4];
     unsigned qh, qt; bool async, thrOn, stop; pthread_t thr; pthread_cond_t cv;
+    pthread_mutex_t heldLock;
+    CVPixelBufferRef held[MAX_HELD_PICTURES];
+    unsigned hold, heldNext;
 } DState;
 typedef struct OutJob OutJob;
 
@@ -247,6 +253,19 @@ static int open_vp9(DState *s, unsigned w, unsigned h, int depth)
 
 // ---- base object ----
 static void out_drain(DState *s);
+
+static void clear_held_pictures(DState *s)
+{
+    CVPixelBufferRef pictures[MAX_HELD_PICTURES];
+    pthread_mutex_lock(&s->heldLock);
+    memcpy(pictures, s->held, sizeof pictures);
+    memset(s->held, 0, sizeof s->held);
+    s->heldNext = 0;
+    pthread_mutex_unlock(&s->heldLock);
+    for (unsigned i = 0; i < MAX_HELD_PICTURES; i++)
+        if (pictures[i]) CVPixelBufferRelease(pictures[i]);
+}
+
 static OSStatus b_invalidate(CMBaseObjectRef o)
 {
     DState *s = dstate(o); if (!s) return noErr;
@@ -268,6 +287,7 @@ static OSStatus b_invalidate(CMBaseObjectRef o)
         atomic_store(&s->pciID, 0);
     }
     if (s->fmt) { CFRelease(s->fmt); s->fmt = NULL; }
+    if (s->hold) clear_held_pictures(s);
     if (s->ownPool) { CVPixelBufferPoolRelease(s->ownPool); s->ownPool = NULL; }
     if (s->colour) { CFRelease(s->colour); s->colour = NULL; }
     if (s->frames) DLOG("per frame: decodeFrame %.2f ms (engine %.2f, pool %.2f, copy %.2f, emit %.2f), outside %.2f ms",
@@ -279,7 +299,7 @@ static OSStatus b_invalidate(CMBaseObjectRef o)
 static void b_finalize(CMBaseObjectRef o)
 {
     DState *s = dstate(o); if (!s) return;
-    b_invalidate(o); pthread_cond_destroy(&s->cv); pthread_mutex_destroy(&s->lock); free(s->tmp); free(s);
+    b_invalidate(o); pthread_cond_destroy(&s->cv); pthread_mutex_destroy(&s->heldLock); pthread_mutex_destroy(&s->lock); free(s->tmp); free(s);
     *(DState **)CMBaseObjectGetDerivedStorage(o) = NULL;
 }
 static CFStringRef b_desc(CMBaseObjectRef o)
@@ -681,6 +701,14 @@ static void out_release(DState *s, const OutJob *j)   // lock held
 static void out_emit(DState *s, OutJob *j)
 {
     const double te = nowms();
+    if (s->hold && j->pb && !j->res) {
+        pthread_mutex_lock(&s->heldLock);
+        CVPixelBufferRef previous = s->held[s->heldNext];
+        s->held[s->heldNext] = CVPixelBufferRetain(j->pb);
+        s->heldNext = (s->heldNext + 1) % s->hold;
+        pthread_mutex_unlock(&s->heldLock);
+        if (previous) CVPixelBufferRelease(previous);
+    }
     VTDecoderSessionEmitDecodedFrame(s->session, j->frame, j->res, j->fl, j->pb);
     if (j->pb) CVPixelBufferRelease(j->pb);
     j->pb = NULL; j->usEmit = (unsigned)((nowms() - te) * 1000);
@@ -1021,8 +1049,17 @@ __attribute__((visibility("default"))) OSStatus NVDecVT_CreateInstance(FourCharC
     if (st) return st;
     DState *s = calloc(1, sizeof *s);
     atomic_init(&s->pciID, 0);
-    pthread_mutex_init(&s->lock, NULL); pthread_cond_init(&s->cv, NULL);
+    pthread_mutex_init(&s->lock, NULL);
+    pthread_mutex_init(&s->heldLock, NULL);
+    pthread_cond_init(&s->cv, NULL);
     s->codec = codec;
+    if (codec == CODEC_VP9 || codec == CODEC_AV1) {
+        const char *configured = getenv("NVDEC_HOLD");
+        const char *process = getprogname();
+        const long count = configured ? strtol(configured, NULL, 10) :
+            (process && !strcmp(process, "plugin-container") ? 8 : 0);
+        s->hold = count <= 0 ? 0 : count > MAX_HELD_PICTURES ? MAX_HELD_PICTURES : (unsigned)count;
+    }
     *(DState **)CMBaseObjectGetDerivedStorage(obj) = s;
     *out = obj;
     DLOG("instance %p (%s)", obj, entry == CODEC_HEV1 ? "hev1" : entry == CODEC_AVC3 ? "avc3" : codec == CODEC_VP9 ? "vp09" : codec == CODEC_AV1 ? "av01" : codec == kCMVideoCodecType_HEVC ? "hvc1" :

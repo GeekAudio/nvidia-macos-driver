@@ -15,11 +15,11 @@
 | IOSurface 和录屏 | 继续交付 GeekAudio 的 NV12 copy-out、reader-skip、多平面共享和延迟上传，实验路径按开关启用。官方基线提供家族显存导入缓存与受保护的解锁等待。 |
 | 外接屏亮度与 GPU 监控 | 原生亮度使用官方 DDC/CI 通道 `nvrmfbddc=1`，DP 与 HDMI 已验证写入和回读。GPU 监控切换至官方 2.9 实现，旧 GeekAudio SMC 桥已按项目决定移除。 |
 | 更新与安装 | 更新 App 校验签名清单、包大小和 SHA-256 后使用同页完整包。整包也支持手动安装。 |
-| 历史功能待补齐 | 2.8.1 RC4 的 Firefox 专用启动器、注入库和解码帧保留适配未完整移植到 2.9。这一项仍需适配并在目标 Ada 硬件上验证。 |
+| Firefox 可选注入 | 恢复 2.8.1 RC4 的启动器和轻量注入库。启动脚本将解码注册限定在 `plugin-container`，VP9／AV1 会话保留近期画面供合成器取用。RTX 4060 的 Firefox 实机结果仍待验证。 |
 
 ## 每次发布前
 
 1. 对照上一版的完整功能清单和新官方基线。逐项记录继续随包、已由官方接手、按决定移除或仍待补齐。未获批准的功能缺口先解决，再发布新的驱动构建。
 2. 在同一个完整安装包中核对官方基线、所有应保留的 GeekAudio 功能、双系统所需驱动、安装和回滚脚本以及许可证。重解压后检查文件清单、SHA-256、关键签名和目标机的 AuxKC／启动，记录每项实测的系统、显卡与应用。
-3. 发布 `01-geekaudio-nullmoth-<版本>-full.tar.gz` 和同页的 `02-GeekAudio-ReleaseChecker-macOS.zip`，同时提供校验值、构建信息和签名安装清单。完整包是唯一驱动下载，手动安装与 App 使用同一份归档。[清单签名流程](../tools/ReleaseChecker/README.md)
+3. 发布 `01-geekaudio-nullmoth-<版本>-full.tar.gz` 和同页的 `02-GeekAudio-ReleaseChecker-macOS.zip`，同时提供校验值、构建信息和签名安装清单。整包须包含 Firefox 注入库、启动脚本和 mickys/nvenc 的许可证。完整包是唯一驱动下载，手动安装与 App 使用同一份归档。[清单签名流程](../tools/ReleaseChecker/README.md)
 4. 发布后从公开地址重新下载整包与校验清单，并用更新 App 的校验流程核对同一个归档。RC 标题统一使用 `GeekAudio NullMoth <版本> RC<编号>`，正式版使用 `GeekAudio NullMoth <版本>`。

@@ -24,6 +24,9 @@ PAYLOAD = {
     FRAMEBUFFER / 'Contents/_CodeSignature/CodeResources',
     PLUGIN / 'Contents/MacOS/NVMTLDriver',
     PLUGIN / 'Contents/MacOS/libnvencvt.dylib',
+    PLUGIN / 'Contents/MacOS/libnvencvt-loader.dylib',
+    Path('extras/firefox-nvdec.sh'),
+    Path('licenses/mickys-nvenc-LICENSE.txt'),
 }
 
 
@@ -80,7 +83,8 @@ def assemble(archive, output):
         nvrm_info['GeekAudioReleaseTag'] = identity['release']
         nvrm_plist.write_bytes(plistlib.dumps(nvrm_info, sort_keys=False))
         run('/usr/bin/xattr', '-cr', str(root))
-        run('/usr/bin/codesign', '--force', '--sign', '-', str(root / PLUGIN / 'Contents/MacOS/libnvencvt.dylib'))
+        for name in ('libnvencvt.dylib', 'libnvencvt-loader.dylib'):
+            run('/usr/bin/codesign', '--force', '--sign', '-', str(root / PLUGIN / 'Contents/MacOS' / name))
         for path in (NVRM, PLUGIN):
             run('/usr/bin/codesign', '--force', '--sign', '-', str(root / path))
         for path in (NVRM, FRAMEBUFFER, PLUGIN):

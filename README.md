@@ -12,6 +12,7 @@
 
 - RTX 30（GA10x C7B0）在适用进程默认注册 NVDEC H.264 与 HEVC（`hvc1`）快速硬解，并由解码会话报告实际 PCI 设备。在 RTX 3080、macOS 26.7.3 上，1080p H.264 和 HEVC 各完成 4,500 帧，零错误。
 - 沿用官方对 RTX 40（Ada）的 NVEncVT 注册策略。4060 的硬解实机问题仍待复测。
+- 整包包含可选的 Firefox VP9／AV1 注入启动脚本。安装驱动并完全退出 Firefox 后，从解压目录运行 `bash pkgroot/extras/firefox-nvdec.sh`。
 - 保留 Photo Booth 预览方向与 Core Image 写入修复，以及可选的 IOSurface 与 NV12 录屏适配。实验路径按发行说明的开关启用。
 - 外接屏通过官方 DDC/CI 通道 `nvrmfbddc=1` 接入 macOS 原生亮度滑块，已在一台 DP 和一台 HDMI 显示器上验证亮度写入及回读。
 

@@ -62,7 +62,7 @@ public:
 class NVRMDisplayGate {
     IORecursiveLock *lock;
 public:
-    NVRMDisplayGate() : lock(startLock()) { if (lock) IORecursiveLockLock(lock); }
+    explicit NVRMDisplayGate(IORecursiveLock *gate = startLock()) : lock(gate) { if (lock) IORecursiveLockLock(lock); }
     ~NVRMDisplayGate() { if (lock) IORecursiveLockUnlock(lock); }
     bool valid() const { return lock != nullptr; }
 };
@@ -848,11 +848,15 @@ public:
     IOCommandGate *fDdcBrightnessGate = nullptr;
     thread_call_t fDdcBrightnessCall = nullptr;
     thread_call_t fDdcProbeCall = nullptr;
+    IORecursiveLock *fDdcSinkLock = nullptr; // native DDC writes and changes to the sink; never taken by flips
     bool fDdcInFlight = false;
     bool fDdcPowered = false;
     UInt32 fDdcSinkGeneration = 1;
+    UInt32 fDdcFastReadGeneration = 0;
     UInt64 fDdcPending = 0; // generation in high word, requested VCP value + 1 in low word
+    UInt64 fDdcPendingAt = 0; // paired with fDdcPending under fFlipCacheLock
     UInt64 fDdcWriteAfter = 0; // accessed while holding fDdcInFlight
+    UInt32 fDdcBusyRetries = 0; // accessed only by the serial brightness callback
     void publishDdcBus();
     void publishDdcBrightness();
     static void ddcBrightnessFire(thread_call_param_t, thread_call_param_t);
@@ -1803,6 +1807,10 @@ void NVRMNVDAFramebuffer::takeEdid(const NvU8 *src, NvU32 size)
 {
     fEdidSize = (NvU16)(size > sizeof fEdid ? sizeof fEdid : size);
     nvu_copy(fEdid, src, fEdidSize);
+    const bool fastBrightness = fIndex < (unsigned)gNDpy &&
+        nvrmDdcFastBrightnessRead(fEdid, fEdidSize, gDpy[fIndex].hdaConnectorType);
+    const UInt32 generation = fastBrightness ? __atomic_load_n(&fDdcSinkGeneration, __ATOMIC_RELAXED) : 0;
+    __atomic_store_n(&fDdcFastReadGeneration, generation, __ATOMIC_RELEASE);
     nvrmEdidPanelSizeMm(fEdid, fEdidSize, &fEdidMmW, &fEdidMmH);
     if (!nvrmEdidVerticalRange(fEdid, fEdidSize, &fVrrMinHz, &fVrrMaxHz)) fVrrMinHz = fVrrMaxHz = 0;
     fHdrCapable = nvrmEdidHdrPq(fEdid, fEdidSize, &fHdrMaxLumCode);
@@ -1884,13 +1892,19 @@ void NVRMNVDAFramebuffer::surroundCheck()
         FBLOG("surround: %u of %u members connected -- the displays become separate again", up, total);
         gSurroundMask = 0;
         master->fSurActive = false; master->fSurN = 0;
-        for (unsigned k = 1; k < total; k++) if (gFBs[idx[k]]) { gFBs[idx[k]]->fHidden = false; gFBs[idx[k]]->notifyConnectionChanged(500); }
+        for (unsigned k = 1; k < total; k++) if (NVRMNVDAFramebuffer *fb = gFBs[idx[k]]) {
+            { NVRMDisplayGate sink(fb->fDdcSinkLock); fb->fHidden = false; }
+            fb->notifyConnectionChanged(500);
+        }
         master->notifyConnectionChanged(500);
     } else {
         FBLOG("surround: all %u members are back -- the group re-forms", total);
         gSurroundMask = gSurroundMaskOrig;
         master->fSurActive = false; master->fSurN = 0;   // re-planned when WindowServer reads the mode list again
-        for (unsigned k = 1; k < total; k++) if (gFBs[idx[k]]) { gFBs[idx[k]]->fHidden = true; gFBs[idx[k]]->notifyConnectionChanged(500); }
+        for (unsigned k = 1; k < total; k++) if (NVRMNVDAFramebuffer *fb = gFBs[idx[k]]) {
+            { NVRMDisplayGate sink(fb->fDdcSinkLock); fb->fHidden = true; }
+            fb->notifyConnectionChanged(500);
+        }
         master->notifyConnectionChanged(500);
     }
 }
@@ -1947,8 +1961,11 @@ void NVRMNVDAFramebuffer::hotplugFire(thread_call_param_t, thread_call_param_t)
                 if (!dd->connected) {
                     if (!fb->fDpyLost) {
                         FBLOG("hot-plug: display 0x%x went away (fb %u)", handles[i], fb->fIndex);
-                        fb->fDpyLost = true;
-                        __atomic_add_fetch(&fb->fDdcSinkGeneration, 1u, __ATOMIC_RELAXED);
+                        {
+                            NVRMDisplayGate sink(fb->fDdcSinkLock);
+                            fb->fDpyLost = true;
+                            __atomic_add_fetch(&fb->fDdcSinkGeneration, 1u, __ATOMIC_RELAXED);
+                        }
                         fb->fEdidSize = 0;
                         fb->clearDisplayAudioProperties();
                         if (nnotify < sizeof notify / sizeof notify[0]) { fb->retain(); notify[nnotify++] = fb; }
@@ -1957,12 +1974,13 @@ void NVRMNVDAFramebuffer::hotplugFire(thread_call_param_t, thread_call_param_t)
                     if (fb->fDpyLost && kdpy >= 0) {
                         const struct nvrm_dpy_rec *r = &gDpy[kdpy];
                         fb->takeEdid(r->edid, r->edidSize);
-                        fb->fDpyLost = false;
+                        { NVRMDisplayGate sink(fb->fDdcSinkLock); fb->fDpyLost = false; }
                         fb->fRelightAudioValid = dd->edid.bufferSize >= 128;
                         fb->fBlackLutDeadline = 0;
                         clock_interval_to_deadline(15000, kMillisecondScale, &fb->fBlackLutDeadline);
                     }
                     if (swapped) {
+                        NVRMDisplayGate sink(fb->fDdcSinkLock);
                         fb->fEdidSwapped = true;
                         __atomic_add_fetch(&fb->fDdcSinkGeneration, 1u, __ATOMIC_RELAXED);
                     }
@@ -1999,8 +2017,11 @@ void NVRMNVDAFramebuffer::hotplugFire(thread_call_param_t, thread_call_param_t)
             if (!fb || fb->fDisplay != gDpy[k].handle || fb->fDpyLost) continue;
             FBLOG("hot-plug: known display 0x%x omitted from NVKMS list and confirmed disconnected (fb %u)",
                   gDpy[k].handle, fb->fIndex);
-            fb->fDpyLost = true;
-            __atomic_add_fetch(&fb->fDdcSinkGeneration, 1u, __ATOMIC_RELAXED);
+            {
+                NVRMDisplayGate sink(fb->fDdcSinkLock);
+                fb->fDpyLost = true;
+                __atomic_add_fetch(&fb->fDdcSinkGeneration, 1u, __ATOMIC_RELAXED);
+            }
             fb->fEdidSize = 0;
             fb->clearDisplayAudioProperties();
             if (nnotify < sizeof notify / sizeof notify[0]) { fb->retain(); notify[nnotify++] = fb; }
@@ -2021,8 +2042,11 @@ void NVRMNVDAFramebuffer::hotplugFire(thread_call_param_t, thread_call_param_t)
               fb->fDisplay, fb->fIndex, fb->fHead, (unsigned)ok, fb->fReflipRc);
         if (!OSAddAtomic(0, &fb->fStopping) && !fb->fDpyLost) {
             const bool swapped = fb->fEdidSwapped;
-            fb->fEdidSwapped = false;
-            if (swapped) fb->adoptSwappedDisplay();
+            if (swapped) {
+                fb->adoptSwappedDisplay();
+                NVRMDisplayGate sink(fb->fDdcSinkLock);
+                fb->fEdidSwapped = false;
+            }
             else if (fb->fRelightAudioValid) fb->publishDisplayAudioProperties();
             else {
                 fb->clearDisplayAudioProperties();
@@ -3108,6 +3132,7 @@ bool NVRMNVDAFramebuffer::start(IOService *provider)
     }
     fFlipCacheLock = IOSimpleLockAlloc();
     if (!fFlipCacheLock) return false;
+    fDdcSinkLock = IORecursiveLockAlloc();
     struct NVRMDisplayPointers displayPtrs = {};
     displayPtrs.version = NVRM_DISPLAY_PTRS_ABI_VERSION;
     {
@@ -3387,6 +3412,7 @@ void NVRMNVDAFramebuffer::free()
 {
     if (fFlipCacheLock) { IOSimpleLockFree(fFlipCacheLock); fFlipCacheLock = nullptr; }
     if (fCurStateLock) { IOSimpleLockFree(fCurStateLock); fCurStateLock = nullptr; }
+    if (fDdcSinkLock) { IORecursiveLockFree(fDdcSinkLock); fDdcSinkLock = nullptr; }
     fConsKva = nullptr; OSSafeReleaseNULL(fConsMap); OSSafeReleaseNULL(fConsMem);
     OSSafeReleaseNULL(fPxMap);
     super::free();
@@ -5627,6 +5653,7 @@ bool NVRMExternalBrightness::doIntegerSet(OSDictionary *params, const OSSymbol *
 
 void NVRMNVDAFramebuffer::publishDdcBrightness()
 {
+    if (!fDdcSinkLock) return;
     fDdcBrightness = OSTypeAlloc(NVRMExternalBrightness);
     if (!fDdcBrightness) return;
     if (!fDdcBrightness->init() || !fDdcBrightness->attach(this)) {
@@ -5702,10 +5729,14 @@ bool NVRMNVDAFramebuffer::readDdcBrightness(UInt32 &value, UInt32 &maximum, UInt
 
 bool NVRMNVDAFramebuffer::queueDdcBrightness(UInt32 value, UInt32 generation)
 {
-    if (OSAddAtomic(0, &fStopping) || generation != __atomic_load_n(&fDdcSinkGeneration, __ATOMIC_RELAXED))
+    if (!fFlipCacheLock || OSAddAtomic(0, &fStopping) ||
+        generation != __atomic_load_n(&fDdcSinkGeneration, __ATOMIC_RELAXED))
         return false;
     const UInt64 request = (UInt64(generation) << 32) | (UInt64(value) + 1);
+    IOInterruptState state = IOSimpleLockLockDisableInterrupt(fFlipCacheLock);
+    fDdcPendingAt = mach_absolute_time();
     __atomic_store_n(&fDdcPending, request, __ATOMIC_RELEASE);
+    IOSimpleLockUnlockEnableInterrupt(fFlipCacheLock, state);
     setProperty("NVRMExternalBrightnessRequested", value, 32);
     scheduleCall(fDdcBrightnessCall, 0);
     return true;
@@ -5728,24 +5759,44 @@ void NVRMNVDAFramebuffer::ddcBrightnessFire(thread_call_param_t p0, thread_call_
 IOReturn NVRMNVDAFramebuffer::writeDdcBrightness()
 {
     NVRMDdcTransaction transaction(&fDdcInFlight);
-    if (!transaction.held()) return kIOReturnCannotLock;
+    if (!transaction.held()) {
+        ++fDdcBusyRetries;
+        return kIOReturnCannotLock;
+    }
     if (OSAddAtomic(0, &fStopping)) return kIOReturnOffline;
     if (mach_absolute_time() < fDdcWriteAfter) {
         scheduleCall(fDdcBrightnessCall, fDdcWriteAfter);
         return kIOReturnSuccess;
     }
 
-    NVRMBoundedGate gate(0);
-    if (!gate.held()) return kIOReturnCannotLock;
+    // RM serializes AUX/I2C itself. Only exclude changes to this sink, so a continuous
+    // stream of flips on either head cannot starve a pending brightness write.
+    NVRMDisplayGate sink(fDdcSinkLock);
+    IOInterruptState state = IOSimpleLockLockDisableInterrupt(fFlipCacheLock);
     const UInt64 request = __atomic_exchange_n(&fDdcPending, 0, __ATOMIC_ACQ_REL);
-    if (!request || (request >> 32) != __atomic_load_n(&fDdcSinkGeneration, __ATOMIC_RELAXED) ||
-        fDpyLost || fEdidSwapped || fHidden || fHeadSlept || !fModeSet || !__atomic_load_n(&fDdcPowered, __ATOMIC_ACQUIRE))
+    const UInt64 queuedAt = fDdcPendingAt;
+    IOSimpleLockUnlockEnableInterrupt(fFlipCacheLock, state);
+    const UInt32 busyRetries = fDdcBusyRetries;
+    fDdcBusyRetries = 0;
+    if (!sink.valid() || !request || OSAddAtomic(0, &fStopping) ||
+        (request >> 32) != __atomic_load_n(&fDdcSinkGeneration, __ATOMIC_RELAXED) ||
+        fDpyLost || fEdidSwapped || fHidden || !__atomic_load_n(&fDdcPowered, __ATOMIC_ACQUIRE) || !rmGpuReady())
         return kIOReturnOffline;
 
     const UInt32 value = static_cast<UInt32>(request) - 1;
     unsigned char msg[] = {0x51, 0x84, 0x03, 0x10, (unsigned char)(value >> 8), (unsigned char)value, 0x6e};
     for (unsigned i = 0; i + 1 < sizeof msg; ++i) msg[6] ^= msg[i];
+    const UInt64 started = mach_absolute_time();
     const IOReturn r = ddcTransfer(kNvrmDdcWrite, 0x37, msg, sizeof msg);
+    const UInt64 finished = mach_absolute_time();
+    UInt64 queueNs, transferNs, settleNs;
+    absolutetime_to_nanoseconds(started - queuedAt, &queueNs);
+    absolutetime_to_nanoseconds(finished - started, &transferNs);
+    absolutetime_to_nanoseconds(fDdcWriteAfter > queuedAt ? fDdcWriteAfter - queuedAt : 0, &settleNs);
+    // Queue, transfer and settle time in microseconds, I2C retries, and the retired display-lock retry slot.
+    UInt32 timing[] = { (UInt32)(queueNs / 1000), (UInt32)(transferNs / 1000),
+                       (UInt32)(settleNs / 1000), busyRetries, 0 };
+    setProperty("NVRMExternalBrightnessWriteTiming", timing, sizeof timing);
     setProperty("NVRMExternalBrightnessWriteStatus", (UInt32)r, 32);
     if (r == kIOReturnSuccess) setProperty("NVRMExternalBrightnessWritten", value, 32);
     clock_interval_to_deadline(40, kMillisecondScale, &fDdcWriteAfter);
@@ -5758,6 +5809,7 @@ IOReturn NVRMNVDAFramebuffer::writeDdcBrightness()
 // and pendingPowerChange is left alone so no power work starts.
 IOReturn NVRMNVDAFramebuffer::ddcPowerGated(void *on, void *, void *, void *)
 {
+    NVRMDisplayGate sink(fDdcSinkLock);
     pendingPowerState = on ? 1 : 0;
     __atomic_store_n(&fDdcPowered, on != nullptr, __ATOMIC_RELEASE);
     return kIOReturnSuccess;
@@ -5804,6 +5856,7 @@ IOReturn NVRMNVDAFramebuffer::doI2CRequest(UInt32 bus, struct IOI2CBusTiming *, 
             if (rq->completion) (*rq->completion)(rq);
             return kIOReturnBusy;
         }
+        const UInt32 generation = __atomic_load_n(&fDdcSinkGeneration, __ATOMIC_RELAXED);
         const bool send = rq->sendTransactionType != kIOI2CNoTransactionType && rq->sendBytes;
         const bool reply = rq->replyTransactionType != kIOI2CNoTransactionType && rq->replyBytes;
         const bool simpleSend = rq->sendTransactionType == kIOI2CSimpleTransactionType;
@@ -5825,8 +5878,16 @@ IOReturn NVRMNVDAFramebuffer::doI2CRequest(UInt32 bus, struct IOI2CBusTiming *, 
                 if (res == kIOReturnSuccess) {
                     rq->replyBytes = rq->replyTransactionType == kIOI2CDDCciReplyTransactionType
                         ? nvrmDdcReplyLength((const unsigned char *)(uintptr_t)rq->replyBuffer, want) : want;
-                    if (a == 0x37)
-                        clock_interval_to_deadline(140, kMillisecondScale, &fDdcWriteAfter);
+                    if (a == 0x37) {
+                        static const unsigned char getBrightness[] = {0x51, 0x82, 0x01, 0x10, 0xac};
+                        const bool fast = generation == __atomic_load_n(&fDdcFastReadGeneration, __ATOMIC_ACQUIRE) &&
+                            generation == __atomic_load_n(&fDdcSinkGeneration, __ATOMIC_RELAXED) &&
+                            send && rq->sendAddress == 0x6e && rq->sendBytes == sizeof getBrightness &&
+                            memcmp((const void *)(uintptr_t)rq->sendBuffer, getBrightness, sizeof getBrightness) == 0;
+                        UInt64 deadline;
+                        clock_interval_to_deadline(fast ? 40 : 140, kMillisecondScale, &deadline);
+                        if (deadline > fDdcWriteAfter) fDdcWriteAfter = deadline;
+                    }
                 } else if (res != kIOReturnBadArgument) res = kIOReturnNoDevice;
             }
         }

@@ -38,3 +38,14 @@ inline bool nvrmDdcBrightnessCommand(const uint8_t *bytes, unsigned length)
     for (unsigned i = 0; i < length; ++i) checksum ^= bytes[i];
     return checksum == 0;
 }
+
+inline bool nvrmDdcBrightnessReply(const uint8_t (&reply)[11])
+{
+    if (reply[0] != 0x6e || reply[1] != 0x88 || reply[2] != 0x02 ||
+        reply[3] != 0 || reply[4] != 0x10 || reply[5] != 0) return false;
+    uint8_t checksum = 0x50;
+    for (uint8_t byte : reply) checksum ^= byte;
+    const unsigned maximum = (reply[6] << 8) | reply[7];
+    const unsigned current = (reply[8] << 8) | reply[9];
+    return checksum == 0 && maximum && current <= maximum;
+}

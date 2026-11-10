@@ -1929,24 +1929,32 @@ static NvU32 nvrmDdcControl(NvU32 client, NvU32 object, NvU32 command, void *par
     return op.params.control.status;
 }
 
+static NvU32 nvrmDdcAux(const nv_state_t &nv, NVRMDdcRequest &request, bool write, bool addressOnly = false)
+{
+    const NvU32 size = addressOnly ? 0 : (write ? request.sendLength : sizeof request.reply);
+    NV0073_CTRL_DP_AUXCH_CTRL_PARAMS aux = {};
+    aux.displayId = request.displayId;
+    aux.addr = 0x37; // DP AUX uses the seven-bit address.
+    aux.bAddrOnly = addressOnly;
+    // A DDC/CI packet fits in one AUX message. I2C with MOT clear ends it with STOP.
+    aux.cmd = write ? NV0073_CTRL_DP_AUXCH_CMD_REQ_TYPE_WRITE : NV0073_CTRL_DP_AUXCH_CMD_REQ_TYPE_READ;
+    aux.size = addressOnly ? 0 : size - 1;
+    if (write && size) memcpy(aux.data, request.send, size);
+    const NvU32 status = nvrmDdcControl(nv.rmapi.hClient, nv.rmapi.hDisp,
+                                      NV0073_CTRL_CMD_DP_AUXCH_CTRL, &aux, sizeof aux);
+    if (status != NV_OK) return status;
+    if (aux.replyType == NV0073_CTRL_DP_AUXCH_REPLYTYPE_DEFER ||
+        aux.replyType == NV0073_CTRL_DP_AUXCH_REPLYTYPE_I2CDEFER) return NV_ERR_BUSY_RETRY;
+    if (aux.replyType != NV0073_CTRL_DP_AUXCH_REPLYTYPE_ACK) return NV_ERR_I2C_ERROR;
+    if (aux.size != size) return NV_ERR_INVALID_DATA;
+    if (!write && size) memcpy(request.reply, aux.data, size);
+    return NV_OK;
+}
+
 static NvU32 nvrmDdcTransfer(const nv_state_t &nv, NVRMDdcRequest &request, bool write)
 {
+    if (request.displayPort) return nvrmDdcAux(nv, request, write);
     const NvU32 size = write ? request.sendLength : sizeof request.reply;
-    if (request.displayPort) {
-        NV0073_CTRL_DP_AUXCH_I2C_TRANSFER_CTRL_PARAMS aux = {};
-        aux.displayId = request.displayId;
-        aux.addr = 0x37; // DP AUX uses the seven-bit address.
-        aux.bWrite = write;
-        aux.size = size;
-        if (write) memcpy(aux.data, request.send, size);
-        const NvU32 status = nvrmDdcControl(nv.rmapi.hClient, nv.rmapi.hDisp,
-                                          NV0073_CTRL_CMD_DP_AUXCH_I2C_TRANSFER_CTRL, &aux, sizeof aux);
-        if (status != NV_OK) return status;
-        if (aux.size != size) return NV_ERR_INVALID_DATA;
-        if (!write) memcpy(request.reply, aux.data, size);
-        return NV_OK;
-    }
-
     NV402C_CTRL_I2C_TRANSACTION_PARAMS gpio = {};
     gpio.portId = (NvU8)(request.port - 1); // RM's display query is one-based, the transaction is zero-based.
     gpio.deviceAddress = 0x6e;
@@ -1957,6 +1965,24 @@ static NvU32 nvrmDdcTransfer(const nv_state_t &nv, NVRMDdcRequest &request, bool
     const NvU32 status = nvrmDdcControl(nv.rmapi.hClient, nv.rmapi.hI2C,
                                       NV402C_CTRL_CMD_I2C_TRANSACTION, &gpio, sizeof gpio);
     if (status == NV_OK && gpio.transData.i2cBlockData.messageLength != size) return NV_ERR_INVALID_DATA;
+    return status;
+}
+
+static NvU32 nvrmDdcGetBrightness(const nv_state_t &nv, NVRMDdcRequest &request)
+{
+    request.stage = kNVRMDdcWrite;
+    NvU32 status = nvrmDdcTransfer(nv, request, true);
+    if (status != NV_OK) return status;
+    IOSleep(request.delayMs < 40 ? 40 : request.delayMs);
+    request.stage = kNVRMDdcRead;
+    status = nvrmDdcTransfer(nv, request, false);
+    if (request.displayPort && status == NV_ERR_BUSY_RETRY) {
+        // A deferred read still belongs to the same GetVCP command.
+        IOSleep(10);
+        status = nvrmDdcTransfer(nv, request, false);
+    }
+    if (status == NV_OK && request.displayPort && !nvrmDdcBrightnessReply(request.reply))
+        return NV_ERR_INVALID_DATA;
     return status;
 }
 
@@ -1977,15 +2003,19 @@ static IOReturn nvrmDdcBrightness(const nv_state_t &nv, NVRMDdcRequest &request)
             return kIOReturnUnsupported;
         }
     }
-    request.stage = kNVRMDdcWrite;
-    request.rmStatus = nvrmDdcTransfer(nv, request, true);
-    if (request.rmStatus != NV_OK) return kIOReturnIOError;
     if (request.sendLength == 5) {
-        IOSleep(request.delayMs < 40 ? 40 : request.delayMs);
-        request.stage = kNVRMDdcRead;
-        request.rmStatus = nvrmDdcTransfer(nv, request, false);
-        if (request.rmStatus != NV_OK) return kIOReturnIOError;
+        request.rmStatus = nvrmDdcGetBrightness(nv, request);
+        if (request.displayPort && request.stage == kNVRMDdcRead && request.rmStatus == NV_ERR_INVALID_DATA) {
+            // Clear any incomplete I2C-over-AUX transaction and retry only the read command.
+            (void)nvrmDdcAux(nv, request, true, true);
+            IOSleep(10);
+            request.rmStatus = nvrmDdcGetBrightness(nv, request);
+        }
+    } else {
+        request.stage = kNVRMDdcWrite;
+        request.rmStatus = nvrmDdcTransfer(nv, request, true);
     }
+    if (request.rmStatus != NV_OK) return kIOReturnIOError;
     request.stage = kNVRMDdcComplete;
     return kIOReturnSuccess;
 }

@@ -53,7 +53,7 @@ static inline void *nvmtl_buf_cpu(NVMTLBuffer *b) { nvmtl_buf_settle(b); if (b->
   NVMTLTexture *_viewParent;
   uint32_t _viewType, _viewSlices, _relativeLevel, _relativeSlice;
   uint32_t _baseSlice, _baseLevel;
-  uint32_t _surfSeed, _surfGen; BOOL _surfSynced, _surfOwned;
+  uint32_t _surfSeed, _surfGen, _readerStreak; BOOL _surfSynced, _surfOwned;
   nvk_buffer _vramBuf; BOOL _vramOn;
   nvk_buffer _hostPages;   // this surface's pages imported for the host copies (nvmtl_host_pages), kept while they hold
   id _capturePages;       // each recorded copy also retains its import until that submission finishes
@@ -66,6 +66,7 @@ static inline void *nvmtl_buf_cpu(NVMTLBuffer *b) { nvmtl_buf_settle(b); if (b->
 - (void *)nvview;
 - (void *)nvsampleview;
 - (void)nvmtlSurfaceIn;
+- (void)nvmtlSurfaceInForRenderTargetLoad:(BOOL)readerSkipCandidate;
 - (BOOL)nvmtlSurfaceOut;
 - (BOOL)nvmtlSurfaceOutDirtied:(BOOL)dirtied;
 - (BOOL)nvmtlSurfaceOutDirtied:(BOOL)dirtied copied:(BOOL)copied;

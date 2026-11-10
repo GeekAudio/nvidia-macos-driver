@@ -1189,9 +1189,9 @@ public:
         OSDictionary *d = cur ? OSDynamicCast(OSDictionary, cur->copyCollection()) : nullptr;
         if (property) property->release();
         if (!d) { d = OSDictionary::withCapacity(8); if (!d) return; }
-        setSensorStatistic(d, "Temperature(C)", fTempC != 0, fTempC);
+        setSensorStatistic(d, "Temperature(C)", fTempC > 0, static_cast<unsigned>(fTempC));
 #ifndef NMX_ACCEL
-        setSensorStatistic(d, "GPU Temperature(C)", fTempC != 0, fTempC);
+        setSensorStatistic(d, "GPU Temperature(C)", fTempC > 0, static_cast<unsigned>(fTempC));
         NVRMUtilization sample = {};
         bool valid = false;
         if (fUtilLock) {

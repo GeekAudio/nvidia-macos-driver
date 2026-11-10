@@ -74,7 +74,7 @@ private struct ReleaseCheckerView: View {
                 Spacer()
                 Button("检查更新") { attempt += 1 }
                     .disabled(isChecking || phase != nil)
-                Button("下载并安装") { beginInstall() }
+                Button(isReinstall ? "重新安装" : "下载并安装") { beginInstall() }
                     .buttonStyle(.borderedProminent)
                     .disabled(!canInstall)
             }
@@ -158,6 +158,11 @@ private struct ReleaseCheckerView: View {
     private var isChecking: Bool {
         if case .checking = result { return true }
         return false
+    }
+
+    private var isReinstall: Bool {
+        guard let release, let tag = installed?.releaseTag else { return false }
+        return DriverVersion(tag) == release.version
     }
 
     private var canInstall: Bool {

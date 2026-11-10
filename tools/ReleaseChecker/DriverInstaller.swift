@@ -5,8 +5,7 @@ import Foundation
 struct DriverInstaller: Sendable {
     enum Phase: String, Sendable {
         case manifest = "正在核对发布签名"
-        case baseline = "正在下载和校验官方驱动"
-        case overlay = "正在下载和校验 GeekAudio 覆盖包"
+        case package = "正在下载和校验完整安装包"
         case installing = "等待管理员授权或正在安装"
     }
 
@@ -17,7 +16,6 @@ struct DriverInstaller: Sendable {
         return arm64 == 0 && [15, 26].contains(ProcessInfo.processInfo.operatingSystemVersion.majorVersion)
     }
 
-    private static let upstream = URL(string: "https://github.com/nullmoth/nvidia-macos-driver")!
     private static let finalHosts: Set<String> = [
         "github.com", "gh-proxy.com", "release-assets.githubusercontent.com", "objects.githubusercontent.com"
     ]
@@ -44,14 +42,12 @@ struct DriverInstaller: Sendable {
         let work = files.temporaryDirectory.appendingPathComponent("GeekAudioUpdate-\(UUID().uuidString)")
         try files.createDirectory(at: work, withIntermediateDirectories: false, attributes: [.posixPermissions: 0o700])
         defer { try? files.removeItem(at: work) }
-        await phase(.baseline)
-        let base = try await archive(plan.baseline, repo: Self.upstream, route: route, directory: work)
-        await phase(.overlay)
-        let overlay = try await archive(plan.overlay, repo: ReleaseFeed.repository, route: route, directory: work)
+        await phase(.package)
+        let archive = try await downloadPackage(plan, route: route, directory: work)
         guard InstalledDriver.permitsInstallation(release) else { throw InstallError.versionChanged }
         await phase(.installing)
         return try await Task.detached(priority: .userInitiated) {
-            try Self.authorizedInstall(plan, base: base, overlay: overlay)
+            try Self.authorizedInstall(plan, archive: archive)
         }.value
     }
 
@@ -67,8 +63,9 @@ struct DriverInstaller: Sendable {
         }
     }
 
-    private func archive(_ asset: InstallPlan.Archive, repo: URL, route: CheckRoute, directory: URL) async throws -> URL {
-        try await attempt(asset.url(in: repo), route: route) { file, _ in
+    private func downloadPackage(_ plan: InstallPlan, route: CheckRoute, directory: URL) async throws -> URL {
+        let asset = plan.package
+        return try await attempt(asset.url(in: ReleaseFeed.repository, tag: plan.tag), route: route) { file, _ in
             guard try Self.size(of: file) == asset.size, try Self.sha256(file) == asset.sha256 else {
                 throw InstallError.invalidArchive
             }
@@ -121,13 +118,12 @@ struct DriverInstaller: Sendable {
         return digest.finalize().map { String(format: "%02x", $0) }.joined()
     }
 
-    private static func authorizedInstall(_ plan: InstallPlan, base: URL, overlay: URL) throws -> String {
+    private static func authorizedInstall(_ plan: InstallPlan, archive: URL) throws -> String {
         guard let helper = Bundle.main.url(forResource: "Installer", withExtension: "sh"),
               let bytes = try? Data(contentsOf: helper),
               SHA256.hash(data: bytes).map({ String(format: "%02x", $0) }).joined() == InstallerPins.helperSHA256,
               let script = String(data: bytes, encoding: .utf8) else { throw InstallError.invalidHelper }
-        let arguments = [script, "geekaudio-install", "install", base.path, plan.baseline.sha256,
-                         overlay.path, plan.overlay.sha256, plan.overlayDirectory, plan.tag]
+        let arguments = [script, "geekaudio-install", "install", archive.path, plan.package.sha256, plan.tag]
         let quoted = arguments.map { "'" + $0.replacingOccurrences(of: "'", with: "'\\''") + "'" }.joined(separator: " ")
         let shell = "set -o pipefail; /usr/bin/env -i /bin/bash --noprofile --norc -c \(quoted) 2>&1 | /usr/bin/tail -c 12000"
         let escaped = shell.replacingOccurrences(of: "\\", with: "\\\\")

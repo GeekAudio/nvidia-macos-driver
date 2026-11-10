@@ -61,7 +61,7 @@ struct InstalledDriver: Sendable {
             return DriverVersion(baseline).map { $0 < release.version } ?? false
         }
         guard let releaseTag else { return true }
-        return DriverVersion(releaseTag).map { $0.base == current.base && $0 < release.version } ?? false
+        return DriverVersion(releaseTag).map { $0.base == current.base && $0 <= release.version } ?? false
     }
 
     static func permitsInstallation(_ release: DriverRelease) -> Bool {
@@ -78,9 +78,8 @@ struct DriverRelease: Sendable {
 
     var page: URL { ReleaseFeed.repository.appendingPathComponent("releases/tag/\(tag)") }
 
-    static func isOverlayAsset(_ name: String) -> Bool {
-        (name.hasPrefix("geekaudio-nullmoth-") || name.hasPrefix("01-geekaudio-nullmoth-")) &&
-        name.hasSuffix("-overlay.tar.gz")
+    static func isFullAsset(_ name: String) -> Bool {
+        name.wholeMatch(of: /(?:01-)?geekaudio-nullmoth-[a-z0-9][a-z0-9.-]*-full\.tar\.gz/) != nil
     }
 }
 
@@ -166,7 +165,7 @@ struct ReleaseFeed: Sendable {
             guard !entry.draft, !withdrawn.contains(entry.tag_name), entry.tag_name.contains("-geekaudio."),
                   let version = DriverVersion(entry.tag_name),
                   entry.assets.contains(where: {
-                      $0.state == "uploaded" && DriverRelease.isOverlayAsset($0.name)
+                      $0.state == "uploaded" && DriverRelease.isFullAsset($0.name)
                   }) else { return nil }
             let preview = entry.prerelease || version.isPreview
             guard !preview || includePreviews else { return nil }

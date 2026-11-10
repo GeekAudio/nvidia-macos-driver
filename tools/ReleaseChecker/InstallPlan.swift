@@ -3,34 +3,26 @@ import Foundation
 
 struct InstallPlan: Codable, Sendable {
     struct Archive: Codable, Sendable {
-        let tag: String
         let name: String
         let sha256: String
         let size: Int64
 
         var isValid: Bool {
-            name.wholeMatch(of: /[a-z0-9][a-z0-9.-]*\.tar\.gz/) != nil &&
+            DriverRelease.isFullAsset(name) &&
             sha256.wholeMatch(of: /[0-9a-f]{64}/) != nil && (1...1_500_000_000).contains(size)
         }
 
-        func url(in repo: URL) -> URL { repo.appendingPathComponent("releases/download/\(tag)/\(name)") }
+        func url(in repo: URL, tag: String) -> URL { repo.appendingPathComponent("releases/download/\(tag)/\(name)") }
     }
 
     let schema: String
     let tag: String
     let macOS: [Int]
-    let overlayDirectory: String
-    let baseline: Archive
-    let overlay: Archive
+    let package: Archive
 
     var isValid: Bool {
-        schema == "GeekAudio/NullMoth/install/v1" && DriverVersion(tag) != nil && tag.contains("-geekaudio.") &&
-        !macOS.isEmpty && macOS.allSatisfy { $0 == 15 || $0 == 26 } &&
-        overlayDirectory.wholeMatch(of: /geekaudio-[a-z0-9][a-z0-9.-]*/) != nil &&
-        baseline.tag.wholeMatch(of: /v[0-9]+\.[0-9]+(?:\.[0-9]+)?/) != nil &&
-        baseline.name == "nullmoth-nvidia-\(baseline.tag.dropFirst()).tar.gz" && baseline.isValid &&
-        DriverVersion(baseline.tag)?.base == DriverVersion(tag)?.base &&
-        overlay.tag == tag && DriverRelease.isOverlayAsset(overlay.name) && overlay.isValid
+        schema == "GeekAudio/NullMoth/install/v2" && DriverVersion(tag) != nil && tag.contains("-geekaudio.") &&
+        !macOS.isEmpty && macOS.allSatisfy { $0 == 15 || $0 == 26 } && package.isValid
     }
 
     static func verify(_ bytes: Data, signature: Data, tag: String, publicKey: Data) throws -> Self {

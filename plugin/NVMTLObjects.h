@@ -57,6 +57,7 @@ static inline void *nvmtl_buf_cpu(NVMTLBuffer *b) { nvmtl_buf_settle(b); if (b->
   nvk_buffer _vramBuf; BOOL _vramOn; uint64_t _vramBorn;   // _vramBorn: when _vramBuf was imported (nvmtl_vram_keep_put)
   nvk_image _surfaceLinear;   // Managed IOSurface: shared publication image; _i is its coherent tiled GPU backing
   nvk_buffer _hostPages;   // this surface's pages imported for the host copies (nvmtl_host_pages), kept while they hold
+  id _capturePages;       // each recorded copy also retains its import until that submission finishes
   BOOL _stex;
   uint64_t _resid;
   NSUInteger _usage;
@@ -68,6 +69,10 @@ static inline void *nvmtl_buf_cpu(NVMTLBuffer *b) { nvmtl_buf_settle(b); if (b->
 - (void)nvmtlSurfaceIn;
 - (BOOL)nvmtlSurfaceOut;
 - (BOOL)nvmtlSurfaceOutDirtied:(BOOL)dirtied;
+- (BOOL)nvmtlSurfaceOutDirtied:(BOOL)dirtied copied:(BOOL)copied;
+@end
+@interface NVMTLTexture (CaptureCopyout)
+- (id)nvmtlRecordCaptureCopy:(nvk_cmdbuf *)commands;
 @end
 @interface NVMTLFunction : NSObject <MTLFunction> { @public NSData *_spirv; NSString *_fname; NSString *_stage; NSString *_air; NSDictionary *_fc; NSArray *_embedded; unsigned char _bcHash[32]; BOOL _bcHashed;
   NSDictionary *_refl; NSDictionary *_airNames; NSArray *_arguments;

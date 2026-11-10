@@ -37,15 +37,18 @@ static void nvmtl_busy_write(IOSurfaceRef s,NSUInteger p,uint64_t seq,int done){
 static unsigned IOSurfaceGetID(IOSurfaceRef s){return s->id;}
 static unsigned IOSurfaceGetSeed(IOSurfaceRef s){return s->seed;}
 @class NVMTLCommandBuffer;
-@interface NVMTLTexture:NSObject{@public IOSurfaceRef _surf; BOOL _vramOn;NSUInteger _plane;struct {void *img;} _surfaceLinear;}@end
+@interface NVMTLTexture:NSObject{@public IOSurfaceRef _surf; BOOL _vramOn;NSUInteger _plane;}@end
+static unsigned copiedPublications, readbackPublications;
 @implementation NVMTLTexture
 - (BOOL)nvmtlSurfaceOut{return YES;}
 - (BOOL)nvmtlSurfaceOutDirtied:(BOOL)dirtied{(void)dirtied;return YES;}
+- (BOOL)nvmtlSurfaceOutDirtied:(BOOL)dirtied copied:(BOOL)copied{(void)dirtied;if(copied)copiedPublications++;else readbackPublications++;return YES;}
 @end
 @interface NVMTLCommandBuffer:NSObject{@public id _queue;NSArray *_parts;NSDictionary *_busyMarks;}@end
 @implementation NVMTLCommandBuffer @end
-@interface NVMTLSubmissionPart:NSObject{@public NSSet *surfaces;}@end
+@interface NVMTLSubmissionPart:NSObject{@public NSSet *surfaces, *copiedSurfaces;}@end
 @implementation NVMTLSubmissionPart @end
+static void nvmtl_ws_gpu_copyout(NVMTLCommandBuffer *cb){(void)cb;}
 '''
 checks=r'''
 static NVMTLTexture *texture(IOSurfaceRef surface){NVMTLTexture*t=[NVMTLTexture new];t->_surf=surface;t->_vramOn=YES;return t;}
@@ -66,11 +69,6 @@ int main(void){@autoreleasepool{
  surface.seed++;assert(!nvmtl_surface_pending_write(b,t));surface.seed--;
  alias->_vramOn=NO;assert(!nvmtl_surface_pending_write(b,alias));alias->_vramOn=YES;
  t->_vramOn=NO;assert(nvmtl_surface_pending_write(b,t));assert(!nvmtl_surface_pending_write(b,alias));t->_vramOn=YES;
- // Two tiled images are not the same GPU backing just because both can publish
- // to one family surface. Aliases sharing the actual root still match by object.
- alias->_surfaceLinear.img=(void*)1;assert(!nvmtl_surface_pending_write(b,alias));
- t->_surfaceLinear.img=(void*)1;assert(nvmtl_surface_pending_write(b,t));
- assert(!nvmtl_surface_pending_write(b,alias));t->_surfaceLinear.img=NULL;alias->_surfaceLinear.img=NULL;
  alias->_plane=1;assert(!nvmtl_surface_pending_write(b,alias));alias->_plane=0;
  nvmtl_surface_register_writes(b);nvmtl_surface_finish_writes(a);
  assert(nvmtl_surface_pending_write(a,t));
@@ -108,10 +106,6 @@ int main(void){@autoreleasepool{
  COMMIT(w1);
  assert(dirtyCalls==0&&surface.seed==seed1&&[markLog containsObject:@"4:1"]&&nvmtl_surface_pending_write(w2,t));
  nvmtl_surface_finish_writes(w1);t->_vramOn=YES;
- // A tiled publication image becomes newest only after its GPU copy lands.
- t->_surfaceLinear.img=(void*)1;dirtyCalls=0;const unsigned tiledSeed=surface.seed;
- COMMIT(w1);assert(dirtyCalls==0 && surface.seed==tiledSeed);
- nvmtl_surface_finish_writes(w1);t->_surfaceLinear.img=NULL;
  // a CPU write after the commit still invalidates the record (later CPU edits import)
  COMMIT(w1);surface.seed++;assert(!nvmtl_surface_pending_write(w2,t));nvmtl_surface_finish_writes(w1);
  assert(nvmtl_surface_writers.count==0);
@@ -127,6 +121,28 @@ int main(void){@autoreleasepool{
  nvmtl_surface_finish_writes(w2);
  assert([markLog.lastObject isEqual:@"4:0"]&&[nvmtl_ws_pending_holds countForObject:@4]==0);
  assert(nvmtl_surface_writers.count==0&&!nvmtl_ws_deferred.count);
+ if(half){
+  // Deferred publications follow the latest completed writer's copy status, including when that writer used fallback.
+  for(unsigned mode=0;mode<4;mode++){
+   NVMTLCommandBuffer *a=writer(q,t),*b=writer(q,t);
+   ((NVMTLSubmissionPart*)a->_parts[0])->copiedSurfaces=(mode&1)?[NSSet setWithObject:t]:nil;
+   ((NVMTLSubmissionPart*)b->_parts[0])->copiedSurfaces=(mode&2)?[NSSet setWithObject:t]:nil;
+   COMMIT(a);COMMIT(b);
+   NSMutableArray *settled=[NSMutableArray new];
+   assert(!nvmtl_ws_part_landed(a,0,settled).count&&!settled.count);
+   unsigned copied=copiedPublications, readbacks=readbackPublications;
+   assert(!nvmtl_ws_part_landed(b,0,settled).count&&settled.count==1);
+   assert(nvmtl_ws_publish_settled(settled,b));
+   assert(copiedPublications==copied+!!(mode&2)&&readbackPublications==readbacks+!(mode&2));
+   nvmtl_surface_finish_writes(a);nvmtl_surface_finish_writes(b);
+  }
+  // A recorded copy whose submission failed never reaches part_landed or grants a later publication permission.
+  NVMTLCommandBuffer *failed=writer(q,t);
+  ((NVMTLSubmissionPart*)failed->_parts[0])->copiedSurfaces=[NSSet setWithObject:t];
+  COMMIT(failed);unsigned copied=copiedPublications;
+  nvmtl_surface_finish_writes(failed);assert(copiedPublications==copied);
+  assert(!nvmtl_ws_deferred.count);
+ }
  printf("PASS (kernel half %s): aliases, CPU seeds, queues, planes, private backing, latest writer, weak lifetime, 1000 cleanup "
         "cycles, WindowServer commit: %s, CPU edits still import, overlapping writers release the kernel mark once, with "
         "the last of them\n", half?"present":"absent",

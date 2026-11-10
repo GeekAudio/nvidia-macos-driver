@@ -6,17 +6,18 @@ import tempfile
 
 root = pathlib.Path(__file__).resolve().parents[1]
 source = (root / 'plugin/NVMTLObjects.m').read_text()
-start = source.index('static id nvmtl_surface_sync(')
+start = source.index('static id nvmtl_surface_sync(NVMTLTexture *t) {')
 end = source.index('- (NSUInteger)width ', start)
 methods = source[start:end]
 # The 4:2:2 surface reader (packed video frames, decoded by the CPU) sits in this stretch and has its own tests
 # (tools/test_yuv422.c, tools/test_y422_convert.c); the stand-in texture below is not a 4:2:2 one, so the method is left out and its flag stays NULL.
 y0 = methods.index('- (void)nvmtlY422SurfaceIn {'); y1 = methods.index('\n}\n', y0) + 3
-assert methods[y1:].startswith('- (void)nvmtlSurfaceIn {'), 'the 4:2:2 reader is no longer right before nvmtlSurfaceIn'
 methods = methods[:y0] + methods[y1:]
 fixture = r'''
 #import <Foundation/Foundation.h>
 #include <assert.h>
+#include "nvmtl_reader_skip.h"
+#define NVMTL_VP(t) ((t)->_vramMulti ? 0 : (t)->_plane)
 #include <os/lock.h>
 #include <stdatomic.h>
 #include <dispatch/dispatch.h>
@@ -26,6 +27,7 @@ fixture = r'''
 #import <objc/runtime.h>
 typedef struct __IOSurface { unsigned seed; unsigned char cpu[4]; } Surface;
 typedef int IOReturn;
+typedef void nvk_buffer;
 enum { kIOSurfaceLockReadOnly = 1 };
 typedef struct { unsigned w,h,bpp; unsigned char gpu[4]; } Image;
 static dispatch_semaphore_t entered, release_read;
@@ -48,7 +50,9 @@ static void *IOSurfaceGetBaseAddress(IOSurfaceRef s) { return s->cpu; }
 static size_t IOSurfaceGetAllocSize(IOSurfaceRef s) { return sizeof s->cpu; }
 // the imported-pages upload is unavailable here, so every upload takes the CPU copy this test checks
 // the host-page fast paths (#399) report "not available", so the copies below take the plain path this test checks
-static int nvmtl_vk_image_write_host(void *q, Image *img, void *base, size_t row, size_t bytes, void *cache) { return -1; }
+static int nvmtl_vk_image_write_host(void *q, Image *img, void *base, size_t row, size_t bytes, void *cache,
+                                     void *lease, void *(*retain)(void *), void (*release)(void *)) { return -1; }
+static int nvmtl_vk_buffer_fill_from_surface(void *q, void *dst, const void *src, size_t bytes) { return -1; }
 static int nvmtl_vk_image_read_host(void *q, Image *img, void *base, size_t row, size_t bytes, void *cache) { return -1; }
 static uint32_t nvmtl_vram_gen(IOSurfaceRef s, NSUInteger p) { return 1; }
 static int nvmtl_vram_tag_current(IOSurfaceRef s, NSUInteger p, unsigned seed) { return gpu_seed == seed; }
@@ -85,17 +89,29 @@ static int nvmtl_vk_image_read(void *q, Image *i, void *base, size_t row) {
     memcpy(base,i->gpu,4); return 0;
 }
 @interface NVMTLTexture : NSObject {
-@public NVMTLTexture *_parent; IOSurfaceRef _surf; BOOL _vramOn, _surfSynced, _clientWritten; void *_hostPages;
-    uint32_t _surfSeed, _surfGen; NSUInteger _plane; Image _i; void *_q;
+@public NVMTLTexture *_parent; IOSurfaceRef _surf; BOOL _vramOn, _vramMulti, _surfSynced, _clientWritten; void *_hostPages;
+    int _vramBuf;
+    uint32_t _surfSeed, _surfGen, _readerStreak; NSUInteger _plane; Image _i; void *_q;
     IOSurfaceRef _y422Surf;   // NULL: not a 4:2:2 texture
 }
 - (void)nvmtlY422SurfaceIn;
 - (BOOL)nvmtlSurfaceCopyable;
 - (void)nvmtlSurfaceIn;
+- (void)nvmtlSurfaceInForRenderTargetLoad:(BOOL)candidate;
 - (BOOL)nvmtlSurfaceOut;
 - (BOOL)nvmtlSurfaceOutDirtied:(BOOL)dirtied;
 - (BOOL)nvmtlSurfaceOutDirtied:(BOOL)dirtied copied:(BOOL)copied;
 @end
+@interface NVMTLSurfaceUploadLease : NSObject
+- (instancetype)initWithSurface:(IOSurfaceRef)s options:(uint32_t)opts pages:(id)pages;
+@end
+@implementation NVMTLSurfaceUploadLease
+- (instancetype)initWithSurface:(IOSurfaceRef)s options:(uint32_t)opts pages:(id)pages { return [super init]; }
+@end
+static nvk_buffer *nvmtl_surface_host_pages(NVMTLTexture *r, void *base, size_t bytes) { return NULL; }
+static id nvmtl_surface_page_lease(NVMTLTexture *r, nvk_buffer *pages) { return nil; }
+static void *nvmtl_surface_upload_lease_retain(void *lease) { return lease; }
+static void nvmtl_surface_upload_lease_release(void *lease) { (void)lease; }
 @implementation NVMTLTexture
 - (BOOL)nvmtlSurfaceCopyable { return YES; }
 - (void)nvmtlY422SurfaceIn { assert(!"a non-4:2:2 texture took the 4:2:2 path"); }

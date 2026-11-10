@@ -17,7 +17,7 @@ enum NVRMDdcStage {
     kNVRMDdcComplete,
 };
 
-struct NVRMDdcRequest {
+struct NVRMDdcBrightnessRequest {
     uint32_t gpuId;
     uint32_t displayId;
     uint32_t delayMs;
@@ -47,7 +47,7 @@ inline bool nvrmDdcBrightnessReply(const uint8_t (&reply)[11])
         reply[3] != 0 || reply[4] != 0x10 || reply[5] != 0) return false;
     uint8_t checksum = 0x50;
     for (uint8_t byte : reply) checksum ^= byte;
-    const unsigned maximum = (reply[6] << 8) | reply[7];
-    const unsigned current = (reply[8] << 8) | reply[9];
+    const unsigned maximum = (static_cast<unsigned>(reply[6]) << 8) | reply[7];
+    const unsigned current = (static_cast<unsigned>(reply[8]) << 8) | reply[9];
     return checksum == 0 && maximum && current <= maximum;
 }

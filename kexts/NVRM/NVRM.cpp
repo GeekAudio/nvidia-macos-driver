@@ -2403,7 +2403,7 @@ static NvU32 nvrmDdcControl(NvU32 client, NvU32 object, NvU32 command, void *par
     return op.params.control.status;
 }
 
-static NvU32 nvrmDdcAux(const nv_state_t &nv, NVRMDdcRequest &request, bool write, bool addressOnly = false)
+static NvU32 nvrmDdcAux(const nv_state_t &nv, NVRMDdcBrightnessRequest &request, bool write, bool addressOnly = false)
 {
     const NvU32 size = addressOnly ? 0 : (write ? request.sendLength : sizeof request.reply);
     NV0073_CTRL_DP_AUXCH_CTRL_PARAMS aux = {};
@@ -2425,7 +2425,7 @@ static NvU32 nvrmDdcAux(const nv_state_t &nv, NVRMDdcRequest &request, bool writ
     return NV_OK;
 }
 
-static NvU32 nvrmDdcTransfer(const nv_state_t &nv, NVRMDdcRequest &request, bool write)
+static NvU32 nvrmDdcTransfer(const nv_state_t &nv, NVRMDdcBrightnessRequest &request, bool write)
 {
     if (request.displayPort) return nvrmDdcAux(nv, request, write);
     const NvU32 size = write ? request.sendLength : sizeof request.reply;
@@ -2442,7 +2442,7 @@ static NvU32 nvrmDdcTransfer(const nv_state_t &nv, NVRMDdcRequest &request, bool
     return status;
 }
 
-static NvU32 nvrmDdcGetBrightness(const nv_state_t &nv, NVRMDdcRequest &request)
+static NvU32 nvrmDdcGetBrightness(const nv_state_t &nv, NVRMDdcBrightnessRequest &request)
 {
     request.stage = kNVRMDdcWrite;
     NvU32 status = nvrmDdcTransfer(nv, request, true);
@@ -2460,7 +2460,7 @@ static NvU32 nvrmDdcGetBrightness(const nv_state_t &nv, NVRMDdcRequest &request)
     return status;
 }
 
-static IOReturn nvrmDdcBrightness(const nv_state_t &nv, NVRMDdcRequest &request)
+static IOReturn nvrmDdcBrightness(const nv_state_t &nv, NVRMDdcBrightnessRequest &request)
 {
     request.rmStatus = NV_ERR_NOT_READY;
     if (!nv.rmapi.hClient || !nv.rmapi.hDisp) return kIOReturnNotReady;
@@ -2503,13 +2503,13 @@ static void nvrmDdcWaitAfterDpRead(uint64_t completed)
     uint64_t elapsedNs = 0;
     absolutetime_to_nanoseconds(mach_absolute_time() - completed, &elapsedNs);
     if (elapsedNs < quietNs)
-        IOSleep((quietNs - elapsedNs + 999999) / 1000000);
+        IOSleep(static_cast<unsigned>((quietNs - elapsedNs + 999999) / 1000000));
 }
 
 IOReturn NVRM::callPlatformFunction(const OSSymbol *fn, bool wait, void *p1, void *p2, void *p3, void *p4)
 {
     if (fn && fn->isEqualTo(NVRM_DDCCI_FN)) {
-        auto *request = static_cast<NVRMDdcRequest *>(p1);
+        auto *request = static_cast<NVRMDdcBrightnessRequest *>(p1);
         if (!request || !request->displayId || (request->displayId & (request->displayId - 1)) ||
             request->delayMs > 200 || !nvrmDdcBrightnessCommand(request->send, request->sendLength))
             return kIOReturnBadArgument;

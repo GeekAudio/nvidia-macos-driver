@@ -3551,7 +3551,7 @@ IOReturn NVRMNVDAFramebuffer::doDdcBrightnessRequest(UInt32 bus, IOI2CBusTiming 
     absolutetime_to_nanoseconds(request->minReplyDelay, &delayNs);
     if (delayNs > 200000000) return kIOReturnBadArgument;
 
-    NVRMDdcRequest transfer = {};
+    NVRMDdcBrightnessRequest transfer = {};
     transfer.delayMs = (uint32_t)((delayNs + 999999) / 1000000);
     transfer.sendLength = (uint8_t)request->sendBytes;
     nvu_copy(transfer.send, (const void *)request->sendBuffer, transfer.sendLength);

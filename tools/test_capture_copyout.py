@@ -14,9 +14,8 @@ budget = vk[start:vk.index("\nstatic nvk_buffer *nvmtl_host_pages(", start)]
 event = (root / "plugin/NVMTLEventSync.m").read_text()
 start = event.index("static void nvmtl_ws_gpu_copyout(")
 copyout = event[start:event.index("\n@interface NVMTLPendingSurfaceWrite", start)]
-objects = (root / "plugin/NVMTLObjects.m").read_text()
-start = objects.index("#if NVMTL_RELEASE", objects.index("static void nvmtl_conf_knobs(")) + len("#if NVMTL_RELEASE")
-prune = "static void prune_release_environment(void) {\n" + objects[start:objects.index("#endif", start)] + "\n}\n"
+capture = (root / "plugin/NVMTLCapture.m").read_text()
+capture = capture[:capture.index("// The upload holds")] + capture[capture.index("@implementation NVMTLTexture (CaptureCopyout)"):]
 
 c_fixture = r'''
 #include <assert.h>
@@ -41,7 +40,8 @@ int nvmtl_vk_buffer_import_host(void *base,size_t bytes,nvk_buffer *b) {
 void nvmtl_vk_buffer_destroy(nvk_buffer *b) { memset(b,0,sizeof *b); }
 static uint32_t aspect = VK_IMAGE_ASPECT_COLOR_BIT;
 static uint32_t nvmtl_copy_aspect(nvk_image *i) { (void)i; return aspect; }
-void nvmtl_vk_image_upload_barrier(nvk_image *i) { (void)i; uploads++; }
+int nvmtl_vk_image_upload_barrier(nvk_image *i) { (void)i; uploads++; return 0; }
+#define nvlog(...) ((void)0)
 static void pvkCmdPipelineBarrier(VkCommandBuffer c, VkPipelineStageFlags src, VkPipelineStageFlags dst,
     VkDependencyFlags flags, uint32_t nm, const VkMemoryBarrier *mb, uint32_t nb,
     const VkBufferMemoryBarrier *bb, uint32_t ni, const VkImageMemoryBarrier *ib) {
@@ -145,6 +145,7 @@ objc_fixture = r'''
 #include <stdio.h>
 #include <string.h>
 #include "nvmtl_vk.h"
+#include "nvmtl_env_knobs.h"
 struct __IOSurface { uintptr_t base; size_t alloc, off, row; unsigned refs, planes; };
 typedef struct __IOSurface *IOSurfaceRef;
 static unsigned imports, destroys, recordings;
@@ -201,9 +202,10 @@ static NVMTLCommandBuffer *buffer(NSArray *parts) {
     NVMTLCommandBuffer *b=[NVMTLCommandBuffer new]; b->_parts=parts; b->_scheduleAfterPublish=YES; return b;
 }
 int main(void) { @autoreleasepool {
+    extern char **environ;
     setenv("NVMTL_GPU_COPYOUT_EXTRA","1",1);
-    prune_release_environment();
-    assert(getenv("NVMTL_GPU_COPYOUT") && !getenv("NVMTL_GPU_COPYOUT_EXTRA"));
+    nvmtl_release_forget_env(environ);
+    assert(!!getenv("NVMTL_GPU_COPYOUT_EXTRA") == !!getenv("NVMTL_PROCESS_ENV"));
     static struct __IOSurface s={.base=0x100000,.alloc=16384,.row=128,.planes=2}; kept=&s;
     NVMTLTexture *t=[NVMTLTexture new]; t->_surf=&s;
     NVMTLTexture *alias=[NVMTLTexture new]; alias->_parent=t;
@@ -211,7 +213,7 @@ int main(void) { @autoreleasepool {
     @autoreleasepool {
         p=part([NSSet setWithObjects:t,alias,nil]); cb=buffer(@[p]); nvmtl_ws_gpu_copyout(cb);
     }
-    if(getenv("NVMTL_GPU_COPYOUT") && !strcmp(getenv("NVMTL_GPU_COPYOUT"),"0")) {
+    if(!getenv("NVMTL_GPU_COPYOUT") || strcmp(getenv("NVMTL_GPU_COPYOUT"),"1")) {
         assert(!imports && !recordings && !p->copiedSurfaces.count);
         puts("PASS: release copy-out rollback switch"); return 0;
     }
@@ -262,8 +264,8 @@ with tempfile.TemporaryDirectory() as directory:
                     str(c), "-o", str(path / "copy")], check=True)
     subprocess.run([str(path / "copy")], check=True)
     m = path / "ownership.m"
-    m.write_text(objc_fixture + prune + (root / "plugin/NVMTLCapture.m").read_text() + copyout + objc_checks)
+    m.write_text(objc_fixture + capture + copyout + objc_checks)
     subprocess.run(["xcrun", "clang", "-fobjc-arc", "-fsanitize=address,undefined", "-fno-omit-frame-pointer", *includes,
                     "-framework", "Foundation", str(m), "-o", str(path / "ownership")], check=True)
-    subprocess.run([str(path / "ownership")], check=True, env=dict(os.environ, NVMTL_GPU_COPYOUT="1"))
-    subprocess.run([str(path / "ownership")], check=True, env=dict(os.environ, NVMTL_GPU_COPYOUT="0"))
+    subprocess.run([str(path / "ownership")], check=True, env=dict(os.environ, NVMTL_GPU_COPYOUT="1", NVMTL_PROCESS_ENV="1"))
+    subprocess.run([str(path / "ownership")], check=True, env=dict(os.environ, NVMTL_GPU_COPYOUT="0", NVMTL_PROCESS_ENV="1"))

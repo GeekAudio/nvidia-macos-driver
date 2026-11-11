@@ -460,6 +460,15 @@ public:
     bool held() const { return acquired; }
 };
 
+// Some displays start answering DDC/CI after the framebuffer publishes the bus.
+// Allow about 26 seconds of scheduled waits before giving up on this display attachment.
+static constexpr unsigned kNVRMDdcProbeFirstDelayMs = 350;
+static constexpr unsigned kNVRMDdcProbeMaxDelayMs = 2000;
+static constexpr unsigned kNVRMDdcProbeMaxRetries = 12;
+static constexpr unsigned kNVRMDdcProbeFirstReplyMs = 40;
+static constexpr unsigned kNVRMDdcProbeReplyMs = 80;
+static constexpr unsigned kNVRMDdcProbeMaxReplyMs = 500;
+
 class NVRMExternalBrightness : public IODisplayParameterHandler {
     OSDeclareDefaultStructors(NVRMExternalBrightness)
     NVRMNVDAFramebuffer *fFramebuffer = nullptr;
@@ -469,6 +478,7 @@ class NVRMExternalBrightness : public IODisplayParameterHandler {
     IODisplay *fRetryDisplay = nullptr;
     UInt32 fRetryGeneration = 0;
     unsigned fRetriesLeft = 0;
+    unsigned fRetryDelayMs = 0;
     bool publishParameters(IODisplay *display, bool &retry);
 public:
     void retryProbe();
@@ -863,7 +873,7 @@ public:
     IOReturn writeDdcBrightness();
     static void ddcProbeFire(thread_call_param_t, thread_call_param_t);
     IOReturn ddcProbeGated(void *, void *, void *, void *);
-    void scheduleDdcProbe();
+    void scheduleDdcProbe(unsigned delayMs);
     bool readDdcBrightness(UInt32 &value, UInt32 &maximum, UInt32 &generation, unsigned delayMs);
     bool queueDdcBrightness(UInt32 value, UInt32 generation);
     IOReturn ddcTransfer(unsigned op, unsigned addr7, unsigned char *data, unsigned len);
@@ -5579,8 +5589,9 @@ bool NVRMExternalBrightness::setDisplay(IODisplay *display)
     fRetryDisplay = display;
     fRetryDisplay->retain();
     fRetryGeneration = __atomic_load_n(&fFramebuffer->fDdcSinkGeneration, __ATOMIC_RELAXED);
-    fRetriesLeft = 4;
-    fFramebuffer->scheduleDdcProbe();
+    fRetriesLeft = kNVRMDdcProbeMaxRetries;
+    fRetryDelayMs = kNVRMDdcProbeFirstDelayMs;
+    fFramebuffer->scheduleDdcProbe(fRetryDelayMs);
     return true;
 }
 
@@ -5600,8 +5611,13 @@ void NVRMExternalBrightness::retryProbe()
         display->release();
         return;
     }
-    if (retry && --fRetriesLeft) fFramebuffer->scheduleDdcProbe();
-    else OSSafeReleaseNULL(fRetryDisplay);
+    if (!retry || !--fRetriesLeft) { OSSafeReleaseNULL(fRetryDisplay); return; }
+    // Back off so a slow sink gets progressively more time without hammering the bus early on.
+    if (fRetryDelayMs < kNVRMDdcProbeMaxDelayMs) {
+        fRetryDelayMs *= 2;
+        if (fRetryDelayMs > kNVRMDdcProbeMaxDelayMs) fRetryDelayMs = kNVRMDdcProbeMaxDelayMs;
+    }
+    fFramebuffer->scheduleDdcProbe(fRetryDelayMs);
 }
 
 bool NVRMExternalBrightness::publishParameters(IODisplay *display, bool &retry)
@@ -5614,8 +5630,14 @@ bool NVRMExternalBrightness::publishParameters(IODisplay *display, bool &retry)
     if (!params) return false;
     UInt32 value = 0;
     const bool ownsBrightness = !params->getObject(gIODisplayBrightnessKey);
+    // A sink that is still coming up answers late, so the retry window grows with the retry delay.
+    unsigned replyMs = kNVRMDdcProbeFirstReplyMs;
+    if (fRetryDisplay) {
+        replyMs = fRetryDelayMs > kNVRMDdcProbeReplyMs ? fRetryDelayMs : kNVRMDdcProbeReplyMs;
+        if (replyMs > kNVRMDdcProbeMaxReplyMs) replyMs = kNVRMDdcProbeMaxReplyMs;
+    }
     bool ok = ownsBrightness &&
-        fFramebuffer->readDdcBrightness(value, fMaximum, fGeneration, fRetryDisplay ? 80 : 40);
+        fFramebuffer->readDdcBrightness(value, fMaximum, fGeneration, replyMs);
     retry = ownsBrightness && !ok;
     if (ok) {
         ok = IODisplay::addParameter(params, gIODisplayBrightnessKey, 0, static_cast<SInt32>(fMaximum)) &&
@@ -5673,10 +5695,10 @@ void NVRMNVDAFramebuffer::publishDdcBrightness()
     fDdcBrightness->registerService(kIOServiceSynchronous);
 }
 
-void NVRMNVDAFramebuffer::scheduleDdcProbe()
+void NVRMNVDAFramebuffer::scheduleDdcProbe(unsigned delayMs)
 {
     uint64_t deadline;
-    clock_interval_to_deadline(350, kMillisecondScale, &deadline);
+    clock_interval_to_deadline(delayMs, kMillisecondScale, &deadline);
     scheduleCall(fDdcProbeCall, deadline);
 }
 
@@ -5687,7 +5709,7 @@ void NVRMNVDAFramebuffer::ddcProbeFire(thread_call_param_t p0, thread_call_param
     if (OSAddAtomic(0, &fb->fStopping) || !fb->fDdcBrightnessGate) return;
     const IOReturn r = fb->fDdcBrightnessGate->attemptAction(
         OSMemberFunctionCast(IOCommandGate::Action, fb, &NVRMNVDAFramebuffer::ddcProbeGated));
-    if (r == kIOReturnCannotLock) fb->scheduleDdcProbe();
+    if (r == kIOReturnCannotLock) fb->scheduleDdcProbe(kNVRMDdcProbeFirstDelayMs);
 }
 
 IOReturn NVRMNVDAFramebuffer::ddcProbeGated(void *, void *, void *, void *)

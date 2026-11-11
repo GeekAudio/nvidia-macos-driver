@@ -11,6 +11,7 @@
 | RTX 30 H.264／HEVC 快速硬解和 PCI 设备上报 | GeekAudio 补丁 `30aa3db7`。GA10x 在 C7B0 上为适用进程注册 H.264 和 `hvc1`。RTX 3080 的 1080p H.264、HEVC 各解码 4,500 帧，零错误，两个会话均报告 RTX 3080。 |
 | RTX 40 的 NVEncVT | 沿用官方 2.9 的 Ada 自动选择和 GeekAudio 随包的 `libnvencvt.dylib`。正式版二进制通过 Ada 注册模拟。RTX 4060 的实际解码故障仍待同机复测。 |
 | Photo Booth 预览和 Core Image 写入 | GeekAudio 补丁 `bd74ead3` 保留 drawable 身份、方向与 Core Image 写入兼容。 |
+| 启动台「查找」图标 | 2.9 修订 3 修复「查找」随机叠上「地图」「播客」等图标的问题。RTX 3080 在 macOS 26.7.3 的硬件渲染下通过图标像素对照，并在启动台界面复核。 |
 | Chromium 共享画面发布、EDID 与 BAR 预检 | 由官方 2.9 基线提供，对应 Chromium 发布顺序 `f00791de`、EDID 覆盖及 BAR 预检 `3889d546` 等上游改动。Safari 播放绿屏另行跟踪。 |
 | IOSurface 和录屏 | 继续交付 GeekAudio 的 NV12 copy-out、reader-skip、多平面共享和延迟上传，实验路径按开关启用。官方基线提供家族显存导入缓存与受保护的解锁等待。 |
 | 外接屏亮度与 GPU 监控 | 原生亮度使用官方 DDC/CI 通道 `nvrmfbddc=1`。2.9 修订 2 修复 DP 滑块快速拖动后暂时失灵的问题。RTX 3080 重启后在窗口重绘负载下，HKC T2751U（DP）和 Redmi 215 NF（HDMI）各完成 6 轮亮度压力测试，末次写入均与硬件回读一致。GPU 监控使用官方 2.9 实现。 |

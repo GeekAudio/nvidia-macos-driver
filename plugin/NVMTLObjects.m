@@ -5180,7 +5180,19 @@ static NVMTLBuffer *nvmtl_icb_scratch(uint32_t slots) {
 - (void)useHeap:(id<MTLHeap>)h { nvmtl_use_heap(_cb, h); }
 - (void)useHeap:(id<MTLHeap>)h stages:(MTLRenderStages)st { (void)st; nvmtl_use_heap(_cb, h); }
 - (void)sampleCountersInBuffer:(id)sb atSampleIndex:(NSUInteger)i withBarrier:(BOOL)b { nvmtl_sample_counter(_cb, sb, i, self, b); }
-- (void)textureBarrier { if ([self nvmtlPublishRenderShadows]) return; nvmtl_vk_barrier_site(NVMTL_BARS_FENCE_API); nvmtl_vk_cmd_barrier(&_cb->_c); }
+- (void)nvmtlRenderMemoryBarrier {
+    // Metal allows this barrier between draws. A Vulkan subpass only permits barriers
+    // covered by its self-dependency, which does not cover arbitrary texture and buffer accesses.
+    // Store the attachments, issue the full barrier outside the pass and reload them.
+     if ([self nvmtlPublishRenderShadows]) return;
+     if (_begun) {
+        [self nvmtlHzRestart:YES];
+        return;
+    }
+    nvmtl_vk_barrier_site(NVMTL_BARS_FENCE_API);
+    nvmtl_vk_cmd_barrier(&_cb->_c);
+}
+ - (void)textureBarrier { [self nvmtlRenderMemoryBarrier]; }
 - (void)updateFence:(id<MTLFence>)f afterStages:(MTLRenderStages)st {}
 - (void)waitForFence:(id<MTLFence>)f beforeStages:(MTLRenderStages)st {
     // in a pass begun without a barrier the wait must order what came before the pass: restart it behind one
@@ -5189,12 +5201,10 @@ static NVMTLBuffer *nvmtl_icb_scratch(uint32_t slots) {
     nvmtl_vk_barrier_site(NVMTL_BARS_FENCE_API); nvmtl_vk_cmd_barrier(&_cb->_c);
 }
 - (void)memoryBarrierWithScope:(MTLBarrierScope)scope afterStages:(MTLRenderStages)a beforeStages:(MTLRenderStages)b {
-    if ((scope & MTLBarrierScopeRenderTargets) && [self nvmtlPublishRenderShadows]) return;
-    nvmtl_vk_barrier_site(NVMTL_BARS_FENCE_API); nvmtl_vk_cmd_barrier(&_cb->_c);
+    [self nvmtlRenderMemoryBarrier];
 }
-- (void)memoryBarrierWithResources:(const id<MTLResource> __unsafe_unretained [])r count:(NSUInteger)n afterStages:(MTLRenderStages)a beforeStages:(MTLRenderStages)b {
-    for (NSUInteger i = 0; i < n; i++) if ([self nvmtlPassAttachment:r[i]]) { if ([self nvmtlPublishRenderShadows]) return; break; }
-    nvmtl_vk_barrier_site(NVMTL_BARS_FENCE_API); nvmtl_vk_cmd_barrier(&_cb->_c);
+ - (void)memoryBarrierWithResources:(const id<MTLResource> __unsafe_unretained [])r count:(NSUInteger)n afterStages:(MTLRenderStages)a beforeStages:(MTLRenderStages)b {
+    [self nvmtlRenderMemoryBarrier];
 }
 - (void)drawPrimitives:(MTLPrimitiveType)type indirectBuffer:(id<MTLBuffer>)buf indirectBufferOffset:(NSUInteger)off {
     NVMTLBuffer *nb = (NVMTLBuffer *)buf;

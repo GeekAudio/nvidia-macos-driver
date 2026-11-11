@@ -37,6 +37,7 @@
 #include "nvmtl_icb_record.h"
 #include "nvmtl_copy_compat.h"
 #include "nvmtl_sampler_state.h"
+#include "nvmtl_spirv_stencil.h"
 static int g_sampler_anisotropy, g_sampler_mirror_clamp;
 static int g_scalar_layout;
 static uint32_t g_cbuf_limit, g_cbuf_dynamic_limit, g_cbuf_stage_limit;

@@ -13,6 +13,7 @@
 | Photo Booth 预览和 Core Image 写入 | GeekAudio 补丁 `bd74ead3` 保留 drawable 身份、方向与 Core Image 写入兼容。 |
 | 启动台「查找」图标 | 2.9 修订 3 修复「查找」随机叠上「地图」「播客」等图标的问题。RTX 3080 在 macOS 26.7.3 的硬件渲染下通过图标像素对照，并在启动台界面复核。 |
 | Dock「日历」图标 | 2.9 修订 5 让 Dock 的日期图标辅助进程使用同步 GPU 提交，避免首次上传纹理时 GPU 通道失效而留下空白。 |
+| Dock 的 App Store 图标 | 2.9 修订 6 修复半透明笔画上的蓝线。驱动将 Metal 绘制间的内存屏障放到 Vulkan 渲染通道之间，保留前一段的绘制结果供后续采样。 |
 | Chromium 共享画面发布、EDID 与 BAR 预检 | 由官方 2.9 基线提供，对应 Chromium 发布顺序 `f00791de`、EDID 覆盖及 BAR 预检 `3889d546` 等上游改动。Safari 播放绿屏另行跟踪。 |
 | IOSurface 和录屏 | 继续交付 GeekAudio 的 NV12 copy-out、reader-skip、多平面共享和延迟上传，实验路径按开关启用。官方基线提供家族显存导入缓存与受保护的解锁等待。 |
 | 外接屏亮度与 GPU 监控 | 原生亮度使用官方 DDC/CI 通道 `nvrmfbddc=1`。2.9 修订 2 修复 DP 滑块快速拖动后暂时失灵的问题。RTX 3080 重启后在窗口重绘负载下，HKC T2751U（DP）和 Redmi 215 NF（HDMI）各完成 6 轮亮度压力测试，末次写入均与硬件回读一致。GPU 监控使用官方 2.9 实现。 |

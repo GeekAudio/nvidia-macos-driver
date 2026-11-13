@@ -4,6 +4,8 @@
 
 在同一驱动 Release 提供完整安装包、App ZIP、`driver-update.json` 和 64 字节的 `driver-update.json.sig`。App 下载并校验手动安装使用的同一份整包。旧版 App 请从正式版页面下载更新。
 
+App 界面跟随 macOS 的首选语言，支持简体中文和英文。也可以在「系统设置 → 通用 → 语言与地区 → 应用程序」为它指定语言，重新打开后生效。
+
 签名清单使用 `GeekAudio/NullMoth/install/v2`。顶层 `tag` 是 GitHub 发行标签，`macOS` 为支持的系统主版本列表，`package` 包含整包的 `name`、`sha256` 和字节数 `size`。归档包含 `pkgroot`，其中构建信息和驱动安装标记都要匹配发行标签。
 
 ```bash

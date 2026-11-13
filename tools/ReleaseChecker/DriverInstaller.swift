@@ -3,10 +3,16 @@ import Darwin
 import Foundation
 
 struct DriverInstaller: Sendable {
-    enum Phase: String, Sendable {
-        case manifest = "正在核对发布签名"
-        case package = "正在下载和校验完整安装包"
-        case installing = "等待管理员授权或正在安装"
+    enum Phase: Sendable {
+        case manifest, package, installing
+
+        var title: LocalizedStringResource {
+            switch self {
+            case .manifest: "Verifying the release signature…"
+            case .package: "Downloading and verifying the full installer…"
+            case .installing: "Waiting for authorization or installing…"
+            }
+        }
     }
 
     static var supportedSystem: Bool {
@@ -95,7 +101,8 @@ struct DriverInstaller: Sendable {
                 return try await consume(temporary, isProxy)
             } catch {
                 try Task.checkCancellation()
-                failures.append("\(isProxy ? "代理" : "直连") · \(error.localizedDescription)")
+                let source = isProxy ? String(localized: "Proxy") : String(localized: "Direct")
+                failures.append("\(source) · \(error.localizedDescription)")
             }
         }
         throw InstallError.failed(failures.joined(separator: "\n"))

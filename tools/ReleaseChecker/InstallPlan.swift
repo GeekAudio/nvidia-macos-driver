@@ -39,13 +39,13 @@ enum InstallError: LocalizedError {
 
     var errorDescription: String? {
         switch self {
-        case .invalidSignature: "发布签名验证失败。"
-        case .invalidPlan: "安装清单无效，或与选中的版本不匹配。"
-        case .unsupportedSystem: "该驱动包不支持本机的处理器或 macOS 版本。"
-        case .versionChanged: "本机版本已变化，请重新检查更新。"
-        case .invalidArchive: "下载的文件大小或 SHA-256 与发布清单不符。"
-        case .invalidHelper: "App 的安装组件校验失败，请重新下载 App。"
-        case .cancelled: "安装已取消。"
+        case .invalidSignature: String(localized: "The release signature could not be verified.")
+        case .invalidPlan: String(localized: "The install manifest is invalid or does not match the selected release.")
+        case .unsupportedSystem: String(localized: "This package does not support this Mac’s processor or macOS version.")
+        case .versionChanged: String(localized: "The installed version changed. Check for updates again.")
+        case .invalidArchive: String(localized: "The download size or SHA-256 does not match the release manifest.")
+        case .invalidHelper: String(localized: "The installer component failed verification. Download the app again.")
+        case .cancelled: String(localized: "Installation canceled.")
         case .failed(let message): message
         }
     }

@@ -3,7 +3,7 @@ import SwiftUI
 @main
 struct ReleaseCheckerApp: App {
     var body: some Scene {
-        Window("GeekAudio 驱动更新", id: "updates") {
+        Window("GeekAudio Driver Update", id: "updates") {
             ReleaseCheckerView()
         }
         .defaultSize(width: 580, height: 390)
@@ -30,7 +30,7 @@ private struct ReleaseCheckerView: View {
     @State private var result = Result.checking
     @State private var attempt = 0
     @State private var phase: DriverInstaller.Phase?
-    @State private var notice: String?
+    @State private var notice: LocalizedStringKey?
     @State private var details: String?
     @State private var showDetails = false
 
@@ -41,25 +41,29 @@ private struct ReleaseCheckerView: View {
         let check = Check(route: route, includePreviews: includePreviews, attempt: attempt)
         VStack(alignment: .leading, spacing: 18) {
             HStack {
-                Text("驱动更新").font(.title2.weight(.semibold))
+                Text("Driver Update").font(.title2.weight(.semibold))
                 Spacer()
                 Text("GeekAudio · NullMoth").font(.callout).foregroundStyle(.secondary)
             }
 
             HStack(alignment: .top, spacing: 12) {
-                versionCard("本机驱动", icon: "cpu", version: installed?.baseline ?? "—",
-                            detail: installed?.releaseTag ?? (installed == nil ? "磁盘上未读取到驱动版本" : "磁盘上的 NullMoth"))
-                versionCard("可用版本", icon: "arrow.down.circle", version: release.map { baselineLabel($0) } ?? "—",
-                            detail: release?.tag ?? (isChecking ? "正在检查…" : "当前频道暂无可用版本"))
+                versionCard("Installed Driver", icon: "cpu", version: installed?.baseline ?? "—",
+                            detail: installed?.releaseTag ?? (installed == nil
+                                ? String(localized: "No driver version found on disk")
+                                : String(localized: "NullMoth on disk")))
+                versionCard("Available Version", icon: "arrow.down.circle", version: release.map { baselineLabel($0) } ?? "—",
+                            detail: release?.tag ?? (isChecking
+                                ? String(localized: "Checking…")
+                                : String(localized: "No release in this channel")))
             }
 
             HStack(spacing: 20) {
-                Picker("检查线路", selection: $route) {
-                    ForEach(CheckRoute.allCases) { route in Text(route.rawValue).tag(route) }
+                Picker("Connection", selection: $route) {
+                    ForEach(CheckRoute.allCases) { route in Text(route.title).tag(route) }
                 }
                 .fixedSize()
                 Spacer(minLength: 8)
-                Toggle("包括预览版", isOn: $includePreviews)
+                Toggle("Include Previews", isOn: $includePreviews)
                     .fixedSize()
             }
             .disabled(phase != nil)
@@ -70,11 +74,13 @@ private struct ReleaseCheckerView: View {
                 .background(.quaternary.opacity(0.6), in: RoundedRectangle(cornerRadius: 9))
 
             HStack(spacing: 10) {
-                Link("发行说明", destination: release?.page ?? ReleaseFeed.repository.appendingPathComponent("releases"))
+                Link("Release Notes", destination: release?.page ?? ReleaseFeed.repository.appendingPathComponent("releases"))
                 Spacer()
-                Button("检查更新") { attempt += 1 }
+                Button("Check for Updates") { attempt += 1 }
                     .disabled(isChecking || phase != nil)
-                Button(isReinstall ? "重新安装" : "下载并安装") { beginInstall() }
+                Button(action: beginInstall) {
+                    Text(isReinstall ? LocalizedStringKey("Reinstall") : LocalizedStringKey("Download and Install"))
+                }
                     .buttonStyle(.borderedProminent)
                     .disabled(!canInstall)
             }
@@ -84,19 +90,19 @@ private struct ReleaseCheckerView: View {
         .task(id: check) { await refresh(check) }
         .sheet(isPresented: $showDetails) {
             VStack(alignment: .leading, spacing: 12) {
-                Text("运行详情").font(.headline)
+                Text("Details").font(.headline)
                 ScrollView {
                     Text(details ?? "").font(.system(.caption, design: .monospaced)).textSelection(.enabled)
                         .frame(maxWidth: .infinity, alignment: .leading)
                 }
-                Button("完成") { showDetails = false }.keyboardShortcut(.defaultAction)
+                Button("Done") { showDetails = false }.keyboardShortcut(.defaultAction)
             }
             .padding(20)
             .frame(width: 540, height: 320)
         }
     }
 
-    private func versionCard(_ title: String, icon: String, version: String, detail: String) -> some View {
+    private func versionCard(_ title: LocalizedStringKey, icon: String, version: String, detail: String) -> some View {
         VStack(alignment: .leading, spacing: 8) {
             Label(title, systemImage: icon).font(.subheadline.weight(.medium)).foregroundStyle(.secondary)
             Text(version).font(.system(.title, design: .monospaced).weight(.semibold))
@@ -115,32 +121,33 @@ private struct ReleaseCheckerView: View {
     @ViewBuilder
     private var statusRow: some View {
         if let phase {
-            ProgressView(phase.rawValue + "…").controlSize(.small)
+            ProgressView { Text(phase.title) }.controlSize(.small)
         } else if let notice {
             HStack {
                 Text(notice)
                 Spacer()
-                if details != nil { Button("查看详情") { showDetails = true } }
+                if details != nil { Button("View Details") { showDetails = true } }
             }
         } else {
             switch result {
             case .checking:
-                ProgressView("正在检查发行版…").controlSize(.small)
+                ProgressView("Checking for releases…").controlSize(.small)
             case .failure:
                 HStack {
-                    Label("检查失败，请重试。", systemImage: "exclamationmark.circle")
+                    Label("Couldn't check for updates. Try again.", systemImage: "exclamationmark.circle")
                     Spacer()
-                    Button("查看详情") { showDetails = true }
+                    Button("View Details") { showDetails = true }
                 }
             case .checked(let release, let source):
                 HStack(spacing: 8) {
                     VStack(alignment: .leading, spacing: 2) {
-                        Text(release.map { installed?.status(for: $0) ?? "找到了可用的驱动版本" } ?? "该频道暂无可用的驱动包")
+                        Text(release.map { installed?.status(for: $0) ?? String(localized: "A driver package is available") }
+                            ?? String(localized: "No driver package in this channel"))
                             .fontWeight(.medium)
                         if let release, !release.offersInstaller {
-                            Text("此版本提供手动安装").font(.caption).foregroundStyle(.secondary)
+                            Text("This version is available for manual installation").font(.caption).foregroundStyle(.secondary)
                         } else if !DriverInstaller.supportedSystem {
-                            Text("驱动安装适用于 Intel macOS 15 或 26").font(.caption).foregroundStyle(.secondary)
+                            Text("Driver installation requires Intel macOS 15 or 26").font(.caption).foregroundStyle(.secondary)
                         }
                     }
                     Spacer()
@@ -197,12 +204,12 @@ private struct ReleaseCheckerView: View {
             do {
                 details = try await installer.install(release, route: selectedRoute) { phase = $0 }
                 installed = InstalledDriver.read()
-                notice = "安装完成，请保存工作后重启。"
+                notice = "Installation complete. Save your work and restart."
             } catch InstallError.cancelled {
-                notice = "安装已取消。"
+                notice = "Installation canceled."
                 details = nil
             } catch {
-                notice = "安装未完成。"
+                notice = "Installation failed."
                 details = error.localizedDescription
             }
         }

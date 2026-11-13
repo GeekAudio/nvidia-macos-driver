@@ -6,12 +6,16 @@ output=${1:?Usage: bash tools/ReleaseChecker/build.sh NEW_OUTPUT_DIRECTORY}
 mkdir "$output"
 output=$(cd "$output" && pwd)
 
-app="$output/GeekAudio 驱动更新.app"
+app="$output/GeekAudio Driver Update.app"
 binary="$app/Contents/MacOS/GeekAudioReleaseChecker"
 mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
 cp "$source_dir/Info.plist" "$app/Contents/Info.plist"
 plutil -lint "$app/Contents/Info.plist"
 cp "$source_dir/Installer.sh" "$app/Contents/Resources/Installer.sh"
+for localization in "$source_dir"/Resources/*.lproj; do
+    plutil -lint "$localization"/*.strings
+    cp -R "$localization" "$app/Contents/Resources/"
+done
 
 icon_work=$(mktemp -d "${TMPDIR:-/tmp}/geekaudio-icon.XXXXXX")
 trap 'rm -r "$icon_work"' EXIT

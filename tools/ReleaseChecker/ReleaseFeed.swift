@@ -44,16 +44,16 @@ struct InstalledDriver: Sendable {
     }
 
     func status(for release: DriverRelease) -> String {
-        guard let current = DriverVersion(baseline) else { return "已找到驱动，但无法识别版本" }
+        guard let current = DriverVersion(baseline) else { return String(localized: "Driver found, but its version is unknown") }
         let available = release.version
         if current.base != available.base {
-            return current < available ? "有新版本" : "本机基础版本更新"
+            return current < available ? String(localized: "Update available") : String(localized: "Installed base version is newer")
         }
         guard let releaseTag, let installed = DriverVersion(releaseTag), installed.base == current.base else {
-            return "基础版本相同，当前 GeekAudio 构建无法确认"
+            return String(localized: "Base versions match. The installed GeekAudio build is unknown.")
         }
-        if installed == available { return "当前已安装此版本" }
-        return installed < available ? "有新版本" : "本机构建更新"
+        if installed == available { return String(localized: "This version is already installed") }
+        return installed < available ? String(localized: "Update available") : String(localized: "Installed build is newer")
     }
 
     func permits(_ release: DriverRelease) -> Bool {
@@ -84,11 +84,20 @@ struct DriverRelease: Sendable {
 }
 
 enum CheckRoute: String, CaseIterable, Identifiable, Sendable {
+    // Preserve the values stored by earlier versions in AppStorage.
     case automatic = "自动回退"
     case direct = "仅 GitHub 直连"
     case proxy = "仅 GitHub 代理"
 
     var id: Self { self }
+
+    var title: LocalizedStringResource {
+        switch self {
+        case .automatic: "Automatic fallback"
+        case .direct: "GitHub direct only"
+        case .proxy: "GitHub proxy only"
+        }
+    }
 }
 
 struct ReleaseFeed: Sendable {
@@ -113,7 +122,7 @@ struct ReleaseFeed: Sendable {
         var errorDescription: String? {
             switch self {
             case .http(let status): "HTTP \(status)"
-            case .unexpectedResponse: "服务器未返回有效的 Release 数据"
+            case .unexpectedResponse: String(localized: "The server did not return valid release data")
             case .failed(let reason): reason
             }
         }
@@ -129,8 +138,8 @@ struct ReleaseFeed: Sendable {
     }
 
     func check(route: CheckRoute, includePreviews: Bool) async throws -> (release: DriverRelease?, source: String) {
-        let direct = (URL(string: Self.api)!, "GitHub 直连")
-        let proxy = (URL(string: Self.proxy + Self.api)!, "代理 gh-proxy.com")
+        let direct = (URL(string: Self.api)!, String(localized: "GitHub direct"))
+        let proxy = (URL(string: Self.proxy + Self.api)!, String(localized: "Proxy via gh-proxy.com"))
         let routes = switch route {
         case .automatic: [direct, proxy]
         case .direct: [direct]

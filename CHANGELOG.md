@@ -1,5 +1,22 @@
 # Changelog
 
+## 3.0
+
+### Fixes
+- Processes that lost the GPU right after login on 2.9 (transparent Dock, icons that went missing, a lock screen that crashed in a loop, apps that crashed at launch): the GPU could read a small command before the driver's write of it was visible to it and stopped the process's channel. The memory those commands are written to is no longer cached by the GPU.
+- System Settings > Displays hanging for seconds when it opens (#567): a search of the shader text ran on every call; its answer is kept.
+- Apps built with an old SDK that crashed at launch on the NVIDIA device (Canon CaptureOnTouch #571, OpenCore Configurator #545): the system version they are told ("10.16") is read correctly, and a refused device no longer crashes the app.
+- Camera previews that stayed black (Photo Booth #568): 4:2:2 video textures are on by default, as on Apple's drivers (`NVMTL_YUV422=0` turns them off), and a per-frame shader scan is kept instead of repeated.
+- WindowServer spending time in the kernel while a video plays (#566): a surface is marked once per commit instead of once per texture per pass.
+- A shutdown or restart that hung: a GPU usage reading that does not come back stops the once-a-second sampler.
+- A buffer is never copied into a multisample image; the request is refused and named in the log.
+- A monitor that came up as a 1920x1080 television after some restarts, with its own resolutions missing until a cold start: the memory a display scans out of no longer depends on the first identification the monitor sends.
+- The uninstaller also removes the hybrid laptop panel drivers.
+
+### Experimental: older macOS releases
+- Driver kits for macOS 14 Sonoma down to Mac OS X 10.7 Lion, one per release, each compiled for that release and linked with that release's own kernel linker. None has been run on a card.
+- `install-legacy.sh` in each kit checks the kit, test-links it against the running system and prepares the GPU firmware before it changes anything. The display driver starts on `nvfb=1`; the accelerator stays off until `nvaccel=1` is added.
+
 ## 2.9
 
 2.9 is the last 2.x release for macOS 15 Sequoia and macOS 26 Tahoe. It carries every fix we had for both systems, on GTX 16 and RTX 20, 30, 40, and 50 cards, plus a large set of new features. New features that have not been proven on enough hardware are **off by default** and listed under "Experimental" below: you switch them on one at a time from the 1401 Mac app.

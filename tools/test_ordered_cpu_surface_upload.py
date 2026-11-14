@@ -8,8 +8,11 @@ import tempfile
 root = Path(__file__).resolve().parents[1]
 source = (root / "plugin/nvmtl_vk.c").read_text()
 ordered_start = source.index("// NVMTL_SURFIN_ORDERED")
-ordered_end = source.index("\n// Deferred surface-in uploads retain", ordered_start)
+ordered_end = source.index("\n// A buffer-to-image copy into a multisample image", ordered_start)
 ordered = source[ordered_start:ordered_end]
+transfer_start = source.index("static void nvmtl_surfin_to_transfer(")
+transfer_end = source.index("\n}\n", transfer_start) + 3
+ordered += source[transfer_start:transfer_end]
 helper_start = source.index("static void nvmtl_upload_region_to_transfer(")
 helper_end = source.index("\nstatic void nvmtl_private_depth_layout", helper_start)
 helper = source[helper_start:helper_end]

@@ -30,6 +30,16 @@
 #include "IOAccelLegacyDisplayMachine.h"
 #include "IOAccelTask.h"
 #include "IOAccelMemoryMap.h"
+// Where Apple's video-memory object keeps its physical address (the field its own withPhysicalAddress and
+// getPhysicalSegment use): +0xc8 from 10.15 on, +0xb8 on 10.12 to 10.14, whose memory base class is 16 bytes smaller,
+// +0x78 on 10.11 (all three of the family's own methods that touch it agree on each release).
+#if defined(NM_ERA) && NM_ERA < 1012
+enum { kNvVidMemPhysOff = 0x78 };
+#elif defined(NM_ERA) && NM_ERA < 1015
+enum { kNvVidMemPhysOff = 0xb8 };
+#else
+enum { kNvVidMemPhysOff = 0xc8 };
+#endif
 #include "../nvrm_gpuva_abi.h"
 #include "nvaccel_lock_owner.h"
 #include "../nvrm_devtab.h"
@@ -579,9 +589,24 @@ public:
         reportPipeGates("after deliverModeChange");
     }
     void reportPipeGates(const char *when) {
-        uint8_t accelFlags = *(const volatile uint8_t *)((const uint8_t *)this + 0xc78);
-        ALOG("  GATES %s: accel+0xc78 = 0x%02x (enabled bit 0x2 %s)",
-             when, accelFlags, (accelFlags & 0x2) ? "SET" : "CLEAR <- kIOReturnNotReady");
+        // Log-only read of the family's accelerator flags byte. Its offset moves per release: read in the family's
+        // unlock_busy on 10.11 to 10.14; not located on 10.15, where the line is skipped instead of guessed.
+#if defined(NM_ERA) && NM_ERA == 1015
+        const unsigned kGateOff = 0;
+#elif defined(NM_ERA) && NM_ERA < 1012
+        const unsigned kGateOff = 0xbd0;
+#elif defined(NM_ERA) && NM_ERA < 1013
+        const unsigned kGateOff = 0xc48;
+#elif defined(NM_ERA) && NM_ERA < 1015
+        const unsigned kGateOff = 0xc58;
+#else
+        const unsigned kGateOff = 0xc78;
+#endif
+        if (kGateOff) {
+            uint8_t accelFlags = *(const volatile uint8_t *)((const uint8_t *)this + kGateOff);
+            ALOG("  GATES %s: accel+0x%x = 0x%02x (enabled bit 0x2 %s)",
+                 when, kGateOff, accelFlags, (accelFlags & 0x2) ? "SET" : "CLEAR <- kIOReturnNotReady");
+        }
         if (!fDM) return;
         uint8_t *dm = (uint8_t *)fDM;
         uint32_t n = *(const volatile uint32_t *)(dm + 0x108);
@@ -980,8 +1005,13 @@ public:
         if (!fPCI || fUtilLoop) return;
         fUtilLock = IOLockAlloc();
         fUtilLoop = IOWorkLoop::workLoop();
+#if defined(NM_ERA) && NM_ERA < 1013
+        // The options form arrived in 10.13; the plain timer runs on the same private work loop.
+        fUtilTimer = IOTimerEventSource::timerEventSource(this, &NVAccel::utilTimerFired);
+#else
         fUtilTimer = IOTimerEventSource::timerEventSource(kIOTimerEventSourceOptionsPriorityWorkLoop,
                                                         this, &NVAccel::utilTimerFired);
+#endif
         if (!fUtilLock || !fUtilLoop || !fUtilTimer ||
             fUtilLoop->addEventSource(fUtilTimer) != kIOReturnSuccess) {
             ALOG("utilization: cannot create sampling work loop");
@@ -1165,7 +1195,7 @@ IOAccelMemory *NVDisplayPipe::initFramebufferResource(unsigned int index, IOAcce
     m->fScanout = true;
     m->fPhys    = r.phys;
     m->fBytes   = r.actualSize;
-    *(volatile unsigned long long *)((unsigned char *)m + 0xc8) = r.phys;
+    *(volatile unsigned long long *)((unsigned char *)m + kNvVidMemPhysOff) = r.phys;
     ALOG("NVDisplayPipe::initFramebufferResource(head %u, index %u, res %p) -> vidmem %p over the LIVE SCANOUT "
          "phys 0x%llx %u x %u pitch %u (%llu bytes)",
          head, index, res, m, (unsigned long long)r.phys, r.width, r.height, r.pitch,
@@ -1176,7 +1206,7 @@ IOAccelMemory *NVDisplayPipe::initFramebufferResource(unsigned int index, IOAcce
 static NVVidMemory *nvres_vidmem(IOAccelResource2 *r)
 {
     if (!r) return nullptr;
-    OSObject *o = *(OSObject **)((unsigned char *)r + 0x88);
+    OSObject *o = *(OSObject **)((unsigned char *)r + kNvResVidMem);
     return OSDynamicCast(NVVidMemory, o);
 }
 
@@ -1235,7 +1265,7 @@ bool NVVidMemory::allocPhysical()
 {
     if (fScanout) {
         if (!fPhys || !fBytes) { ALOG("NVVidMemory::allocPhysical(%p): scanout with no address", this); return false; }
-        *(volatile unsigned long long *)((unsigned char *)this + 0xc8) = fPhys;
+        *(volatile unsigned long long *)((unsigned char *)this + kNvVidMemPhysOff) = fPhys;
         ALOG("NVVidMemory::allocPhysical(%p): SCANOUT phys 0x%llx (%llu bytes) -- already backed, nothing allocated",
              this, fPhys, fBytes);
         return true;
@@ -1253,7 +1283,7 @@ bool NVVidMemory::allocPhysical()
         if (fParkBytes >= want) {
             fRmHandle = fParkHandle; fKva = fParkKva; fPhys = fParkPhys; fBytes = fParkBytes; fAllocationCookie = fParkCookie;
             fParkHandle = nullptr; fParkKva = nullptr; fParkPhys = fParkBytes = fParkCookie = 0;
-            *(volatile unsigned long long *)((unsigned char *)this + 0xc8) = fPhys;
+            *(volatile unsigned long long *)((unsigned char *)this + kNvVidMemPhysOff) = fPhys;
             OSAddAtomic64(1, &gCntVmUnparked);
             return true;
         }
@@ -1283,7 +1313,7 @@ bool NVVidMemory::allocPhysical()
     }
     fRmHandle = r.handle; fKva = r.kva; fPhys = r.phys; fBytes = r.actualSize; fAllocationCookie = r.allocationCookie;
     OSAddAtomic64(1, &gCntVmAlloc); OSAddAtomic64((SInt64)fBytes, &gCntVmAllocBytes);
-    *(volatile unsigned long long *)((unsigned char *)this + 0xc8) = fPhys;
+    *(volatile unsigned long long *)((unsigned char *)this + kNvVidMemPhysOff) = fPhys;
     ALOGV("NVVidMemory::allocPhysical(%p): %llu bytes of REAL VRAM -- phys 0x%llx kva %p [BAR1 %llu]",
          this, fBytes, fPhys, fKva, r.mappedTotal);
     return true;
@@ -1294,7 +1324,7 @@ void NVVidMemory::deallocPhysical()
     if (fScanout) {
         ALOG("NVVidMemory::deallocPhysical(%p): SCANOUT -- not ours to free, only forgetting it", this);
         fPhys = 0; fBytes = 0; fScanout = false;
-        *(volatile unsigned long long *)((unsigned char *)this + 0xc8) = 0;
+        *(volatile unsigned long long *)((unsigned char *)this + kNvVidMemPhysOff) = 0;
         return;
     }
     if (!fRmHandle) return;
@@ -1312,7 +1342,7 @@ void NVVidMemory::deallocPhysical()
         releaseVram(fRmHandle, fKva, fBytes, fAllocationCookie);
     }
     fRmHandle = nullptr; fKva = nullptr; fPhys = 0; fBytes = 0; fAllocationCookie = 0;
-    *(volatile unsigned long long *)((unsigned char *)this + 0xc8) = 0;
+    *(volatile unsigned long long *)((unsigned char *)this + kNvVidMemPhysOff) = 0;
 }
 
 void NVVidMemory::releaseVram(void *handle, void *kva, unsigned long long bytes, unsigned long long cookie)
@@ -1342,6 +1372,22 @@ void NVVidMemory::free()
     IOAccelVidMemory::free();
 }
 
+#if defined(NM_ERA) && NM_ERA < 1015
+// macOS 10.13 and 10.14: the IOSurface kext exports no id, size or format accessors (drivers read the object), and its
+// memory-descriptor accessor is not const. The fields are where 10.15's own accessors read them (id +0xc, width +0x90,
+// height +0x94, bytes per row +0x98, pixel format +0xa4); every 10.14 method that touches them on 10.15 still does.
+extern "C" void *_ZN9IOSurface19getMemoryDescriptorEv(void *surface);
+class IOSurface {
+    template <typename T> T nmField(unsigned off) const { return *(const volatile T *)((const unsigned char *)this + off); }
+public:
+    IOMemoryDescriptor *getMemoryDescriptor() const { return (IOMemoryDescriptor *)_ZN9IOSurface19getMemoryDescriptorEv((void *)this); }
+    unsigned long long  getWidth() const { return nmField<unsigned int>(0x90); }
+    unsigned long long  getHeight() const { return nmField<unsigned int>(0x94); }
+    unsigned long long  getBytesPerRow() const { return nmField<unsigned int>(0x98); }
+    unsigned int        getPixelFormat() const { return nmField<unsigned int>(0xa4); }
+    unsigned int        getSurfaceID() const { return nmField<unsigned int>(0xc); }
+};
+#else
 class IOSurface {
 public:
     IOMemoryDescriptor *getMemoryDescriptor() const;
@@ -1351,6 +1397,7 @@ public:
     unsigned int        getPixelFormat() const;
     unsigned int        getSurfaceID() const;
 };
+#endif
 class IOAccelDisplayPipeTransaction2 {
 public:
     IOSurface *getPlaneIOSurface(unsigned int, unsigned int) const;
@@ -1946,8 +1993,15 @@ void *_ZN13IOSurfaceRoot13lookupSurfaceEjP4task(void *root, unsigned int id, tas
 void *_ZN22IOGraphicsAccelerator223deviceCacheForIOSurfaceEP9IOSurfacej(void *accel, void *surface, unsigned int plane);
 void  _ZN16IOAccelVidMemory4wireEv(void *vidmem);
 void  _ZN20IOSurfaceDeviceCache10setCurrentEv(void *cache);
+#if defined(NM_ERA) && NM_ERA < 1015
+}
+static inline void *_ZNK9IOSurface19getMemoryDescriptorEv(void *surface) { return _ZN9IOSurface19getMemoryDescriptorEv(surface); }
+static inline unsigned int _ZNK9IOSurface12getSurfaceIDEv(void *surface) { return ((const IOSurface *)surface)->getSurfaceID(); }
+extern "C" {
+#else
 void *_ZNK9IOSurface19getMemoryDescriptorEv(void *surface);
 unsigned int _ZNK9IOSurface12getSurfaceIDEv(void *surface);
+#endif
 void  _ZN22IOGraphicsAccelerator29lock_busyEv(void *accel);
 void  _ZN22IOGraphicsAccelerator211unlock_busyEv(void *accel);
 }
@@ -1958,9 +2012,14 @@ static bool nvFamLock(NVAccel *a, bool tryOnly)
     if (!lk) return false;
     if (tryOnly) { if (!IOLockTryLock(lk)) return false; }
     else {
+#if defined(NM_ERA) && NM_ERA < 1100
+        // The waiter count beside the lock is not confirmed on these releases; the lock itself is (same place on all).
+        IOLockLock(lk);
+#else
         OSIncrementAtomic((volatile SInt32 *)(b + 0x90));
         IOLockLock(lk);
         OSDecrementAtomic((volatile SInt32 *)(b + 0x90));
+#endif
     }
     _ZN22IOGraphicsAccelerator29lock_busyEv(a);
     a->acceleratorDidLock("", 0);
@@ -2021,9 +2080,9 @@ static bool nvSVDiag() { return gSVDiag > 0 && OSDecrementAtomic(&gSVDiag) > 0; 
 static unsigned nvAccelSurfDirty(void *cache, NVResource *res, unsigned plane)
 {
     volatile unsigned char *r = (volatile unsigned char *)res;
-    unsigned char type = r[0x14];
-    unsigned int fl = *(volatile unsigned int *)(r + 0xc);
-    volatile unsigned short *valid = *(unsigned short *volatile *)(r + 0x30);
+    unsigned char type = r[kNvResType];
+    unsigned int fl = *(volatile unsigned int *)(r + kNvResFlags);
+    volatile unsigned short *valid = *(unsigned short *volatile *)(r + kNvResValid);
     if (type != 0xc0 || (fl & 0x8000) || !valid || plane > 15) return NVRM_SS_NO_CACHE;
     if (!gNVSVPendLock) gNVSVPendLock = IOSimpleLockAlloc();
     if (!nvSVPend(_ZNK9IOSurface12getSurfaceIDEv(*(void *volatile *)((unsigned char *)cache + 0x10)), 1, res)) return NVRM_SS_NO_CACHE;
@@ -2040,10 +2099,10 @@ static bool nvAccelRestoreParkedForDirty(NVResource *res, NVVidMemory *vm, unsig
 {
     if (!res || !vm || vm->fRmHandle || !vm->fParkHandle) return true;
     const volatile unsigned char *r = (const volatile unsigned char *)res;
-    const unsigned flags = *(const volatile unsigned *)(r + 0xc);
-    const volatile unsigned short *valid = *(unsigned short *volatile const *)(r + 0x30);
+    const unsigned flags = *(const volatile unsigned *)(r + kNvResFlags);
+    const volatile unsigned short *valid = *(unsigned short *volatile const *)(r + kNvResValid);
     const unsigned long long want = *(const volatile unsigned long long *)((const unsigned char *)vm + 0x40);
-    if (vm->fScanout || r[0x14] != 0xc0 || (flags & 0x8000) || !valid || plane > 15 ||
+    if (vm->fScanout || r[kNvResType] != 0xc0 || (flags & 0x8000) || !valid || plane > 15 ||
         !want || vm->fParkBytes < want || !vm->fParkPhys || !vm->fParkKva)
         return true;  // Preserve the original refusal and CPU-copy fallback.
     void *const handle = vm->fParkHandle;
@@ -2108,7 +2167,7 @@ static IOReturn nvAccelSurfVram(NVAccel *owner, struct NVRMSurfShareEsc *p, task
                              cache ? 1 : 0, res ? 1 : 0, (vm && vm->fRmHandle) ? 1 : 0);
         if (gNVSVDirty + gNVSVDirtyRefused <= 6 || ((gNVSVDirty + gNVSVDirtyRefused) & 4095) == 0)
             ALOG("surfvram dirty: surface %u plane %u type 0x%x -> %#x (dirty %u, refused %u)", p->surfaceID, p->plane,
-                 res ? (unsigned)((volatile unsigned char *)res)[0x14] : 0u, p->status, gNVSVDirty, gNVSVDirtyRefused);
+                 res ? (unsigned)((volatile unsigned char *)res)[kNvResType] : 0u, p->status, gNVSVDirty, gNVSVDirtyRefused);
         if (cache) ((OSObject *)cache)->release();
         nvFamUnlock(a);
         ((OSObject *)surf)->release();
@@ -2169,20 +2228,27 @@ static IOBufferMemoryDescriptor *nvSVStage(unsigned long long len)
     return b;
 }
 
+// The family's own page-off. From 10.12 on it forwards to the short form, whose base body is empty; before 10.12 the
+// family has no body at all, so there is nothing to call.
+#if defined(NM_ERA) && NM_ERA < 1012
+#define NV_FAM_PAGEOFF(ev, a1, out, a3) ((void)(ev), (void)(a1), (void)(out), (void)(a3))
+#else
+#define NV_FAM_PAGEOFF(ev, a1, out, a3) IOAccelResource2::pageoff(ev, a1, out, a3)
+#endif
 void NVResource::pageoff(IOAccelEvent *ev, bool a1, bool *out, unsigned long long a3)
 {
     volatile unsigned char *r = (volatile unsigned char *)this;
-    void *cache = *(void *volatile *)(r + 0xe0);
+    void *cache = *(void *volatile *)(r + kNvResCache);
     NVVidMemory *vm = nvres_vidmem(this);
     struct NVRMRmHandles h; nvSVZero(&h, sizeof h);
-    void *surf = (r[0x14] == 0xc0 && cache) ? *(void *volatile *)((unsigned char *)cache + 0x10) : nullptr;
+    void *surf = (r[kNvResType] == 0xc0 && cache) ? *(void *volatile *)((unsigned char *)cache + 0x10) : nullptr;
     if (nvSVDiag()) {
-        volatile unsigned short *vd = *(unsigned short *volatile *)(r + 0x30);
+        volatile unsigned short *vd = *(unsigned short *volatile *)(r + kNvResValid);
         ALOG("SVDIAG pageoff surface %u type 0x%x vm %d rm %d scanout %d valid0 %#x valid6 %#x", surf ? _ZNK9IOSurface12getSurfaceIDEv(surf) : 0u,
-             (unsigned)r[0x14], vm ? 1 : 0, (vm && vm->fRmHandle) ? 1 : 0, vm ? (int)vm->fScanout : -1, vd ? vd[0] : 0xffff, vd ? vd[6] : 0xffff);
+             (unsigned)r[kNvResType], vm ? 1 : 0, (vm && vm->fRmHandle) ? 1 : 0, vm ? (int)vm->fScanout : -1, vd ? vd[0] : 0xffff, vd ? vd[6] : 0xffff);
     }
     if (!surf || !vm || !vm->fRmHandle || vm->fScanout || !vm->fBytes || !nvAccelRmHandles(fAccel, &h)) {
-        IOAccelResource2::pageoff(ev, a1, out, a3);
+        NV_FAM_PAGEOFF(ev, a1, out, a3);
         return;
     }
     // a CPU lock that arrives while WindowServer's GPU is still writing this surface waits for that write first, as a
@@ -2204,10 +2270,10 @@ void NVResource::pageoff(IOAccelEvent *ev, bool a1, bool *out, unsigned long lon
             if ((int)(ns / 1000) > gPoUnlockedMaxUs) gPoUnlockedMaxUs = (int)(ns / 1000);
             OSAddAtomic64(1, &gCntPoUnlocked);
             // while the lock was free the family may have changed the resource: read everything again
-            cache = *(void *volatile *)(r + 0xe0);
+            cache = *(void *volatile *)(r + kNvResCache);
             vm = nvres_vidmem(this);
-            surf = (r[0x14] == 0xc0 && cache) ? *(void *volatile *)((unsigned char *)cache + 0x10) : nullptr;
-            if (!surf || !vm || !vm->fRmHandle || vm->fScanout || !vm->fBytes || !nvAccelRmHandles(fAccel, &h)) { IOAccelResource2::pageoff(ev, a1, out, a3); return; }
+            surf = (r[kNvResType] == 0xc0 && cache) ? *(void *volatile *)((unsigned char *)cache + 0x10) : nullptr;
+            if (!surf || !vm || !vm->fRmHandle || vm->fScanout || !vm->fBytes || !nvAccelRmHandles(fAccel, &h)) { NV_FAM_PAGEOFF(ev, a1, out, a3); return; }
         } else {
             if (gPoUnlocked && a && nvSurfIsPending(sid)) OSAddAtomic64(1, &gCntPoNotOwner);
             nvSurfWaitReady(sid);
@@ -2217,7 +2283,7 @@ void NVResource::pageoff(IOAccelEvent *ev, bool a1, bool *out, unsigned long lon
     if (!md || md->prepare(kIODirectionNone) != kIOReturnSuccess) {
         gNVSVPageoffFail++;
         ALOG("surfvram pageoff: res %p surface pages could not be wired (md %p) -- family pageoff instead", this, md);
-        IOAccelResource2::pageoff(ev, a1, out, a3);
+        NV_FAM_PAGEOFF(ev, a1, out, a3);
         return;
     }
     bool mayUnwire = true;
@@ -2284,7 +2350,7 @@ void NVResource::pageoff(IOAccelEvent *ev, bool a1, bool *out, unsigned long lon
     else ALOG("surfvram pageoff: res %p CE copy TIMED OUT -- surface pages stay wired (%llu B)", this, len);
     if (ok) {
         nvSVPend(_ZNK9IOSurface12getSurfaceIDEv(surf), 0);
-        volatile unsigned short *valid = *(unsigned short *volatile *)(r + 0x30);
+        volatile unsigned short *valid = *(unsigned short *volatile *)(r + kNvResValid);
         if (valid) valid[0] |= 1;
         gNVSVPageoff++;
     } else gNVSVPageoffFail++;
@@ -2338,7 +2404,13 @@ static void nvAccelIopCachePut(IOSurface *s, NVResource *res, NVVidMemory *vm, v
     if (drop) ((OSObject *)drop)->release();
 }
 extern "C" {
+#if defined(NM_ERA) && NM_ERA < 1015
+// one display-pipe class on these releases, so the same function carries that class's name
+void _ZN19IOAccelDisplayPipe226signalTransactionInterruptEPv(void *pipe, void *arg);
+#define _ZN18IOAccelDisplayPipe26signalTransactionInterruptEPv _ZN19IOAccelDisplayPipe226signalTransactionInterruptEPv
+#else
 void _ZN18IOAccelDisplayPipe26signalTransactionInterruptEPv(void *pipe, void *arg);
+#endif
 struct thread_call *thread_call_allocate(void (*func)(void *, void *), void *param0);
 int thread_call_enter(struct thread_call *call);
 }
@@ -2496,7 +2568,7 @@ static bool nvAccelIopFlip(IOService *fb, unsigned head, IOSurface *s, void *pip
         OSAddAtomic64(1, &gCntIopFlipMiss);
         if (kmem) nvAccelIopCachePut(s, res, vm, kmem, bytes);
     }
-    volatile unsigned short *valid = res ? *(unsigned short *volatile *)((volatile unsigned char *)res + 0x30) : nullptr;
+    volatile unsigned short *valid = res ? *(unsigned short *volatile *)((volatile unsigned char *)res + kNvResValid) : nullptr;
     const bool vramNewest = valid && (valid[6] & 1u);
     if (!kmem) return nvAccelIopFlipNo(4);
     if (!vramNewest) return nvAccelIopFlipNo(5);
@@ -2608,7 +2680,7 @@ static bool nvAccelSurfCopyReady(IOSurface *s, unsigned head)
             void *cache = _ZN22IOGraphicsAccelerator223deviceCacheForIOSurfaceEP9IOSurfacej((void *)a, (void *)s, 0);
             OSObject *ctx = cache ? *(OSObject *volatile *)((unsigned char *)cache + 0x20) : nullptr;
             NVResource *res = OSDynamicCast(NVResource, ctx);
-            volatile unsigned short *valid = res ? *(unsigned short *volatile *)((volatile unsigned char *)res + 0x30) : nullptr;
+            volatile unsigned short *valid = res ? *(unsigned short *volatile *)((volatile unsigned char *)res + kNvResValid) : nullptr;
             if (!res || !valid || (valid[0] & 1u)) ready = true;
             else if (!nvAccelIopCopyNeedsPageoff(false, nvAccelResPluginWrote(res))) { ready = true; OSAddAtomic64(1, &gCntIopCopyUnwritten); }
             else { bool out = false; res->pageoff(nullptr, true, &out, 0); ready = out || (valid[0] & 1u); }
@@ -3061,8 +3133,8 @@ static void nvAccelResStats(IOAccelResource2 *res, const char *tag)
     if (!res) { ALOG("  swap %s: (null)", tag); return; }
     NVVidMemory *vm = nvres_vidmem(res);
     const unsigned char *r = (const unsigned char *)res;
-    const unsigned w     = *(const volatile unsigned short *)(r + 0xb0);
-    const unsigned h     = *(const volatile unsigned short *)(r + 0xb2);
+    const unsigned w     = *(const volatile unsigned short *)(r + kNvResWidth);
+    const unsigned h     = *(const volatile unsigned short *)(r + kNvResHeight);
     const unsigned pitch = *(const volatile unsigned int   *)(r + 0xb8);
     if (!vm || !vm->fKva || !pitch || !w || !h) {
         ALOG("  swap %s: %ux%u pitch %u vm %p kva %p scanout %d -- NOT SAMPLEABLE",
@@ -3087,8 +3159,8 @@ bool nvAccelResHasContent(IOAccelResource2 *res)
     NVVidMemory *vm = nvres_vidmem(res);
     if (!vm || !vm->fKva) return false;
     const unsigned char *r = (const unsigned char *)res;
-    const unsigned w     = *(const volatile unsigned short *)(r + 0xb0);
-    const unsigned h     = *(const volatile unsigned short *)(r + 0xb2);
+    const unsigned w     = *(const volatile unsigned short *)(r + kNvResWidth);
+    const unsigned h     = *(const volatile unsigned short *)(r + kNvResHeight);
     const unsigned pitch = *(const volatile unsigned int   *)(r + 0xb8);
     if (!w || !h || pitch < 4) return false;
     const volatile unsigned int *px = (const volatile unsigned int *)vm->fKva;
@@ -3177,8 +3249,8 @@ static bool nvAccelFlipTo(IOAccelResource2 *res)
     if (vm->fScanout) { NVFLIPWHY("nvAccelFlipTo: already the scanout"); return false; }
 
     const unsigned char *r = (const unsigned char *)res;
-    const unsigned w     = *(const volatile unsigned short *)(r + 0xb0);
-    const unsigned h     = *(const volatile unsigned short *)(r + 0xb2);
+    const unsigned w     = *(const volatile unsigned short *)(r + kNvResWidth);
+    const unsigned h     = *(const volatile unsigned short *)(r + kNvResHeight);
     const unsigned pitch = *(const volatile unsigned int   *)(r + 0xb8);
     if (!w || !h || !pitch) { NVFLIPWHY("nvAccelFlipTo: geometry %ux%u pitch %u", w, h, pitch); return false; }
 

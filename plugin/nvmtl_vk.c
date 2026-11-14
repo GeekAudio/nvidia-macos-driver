@@ -5,6 +5,7 @@
  */
 
 #include "nvmtl_game_priority.h"
+#include "nvmtl_avail.h"
 #include <dlfcn.h>
 #include <notify.h>
 #include <dispatch/dispatch.h>
@@ -116,9 +117,9 @@ uint16_t nvmtl_vk_set_accelerator(mach_port_t accel)
 uint16_t nvmtl_vk_vendor(void)
 {
     if (g_vendor) return g_vendor;
-    io_service_t s = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("NVAccel"));
+    io_service_t s = IOServiceGetMatchingService(NVMTL_IO_MAIN_PORT, IOServiceMatching("NVAccel"));
     if (s) { IOObjectRelease(s); g_vendor = 0x10de; return g_vendor; }
-    s = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("NMXAccel"));
+    s = IOServiceGetMatchingService(NVMTL_IO_MAIN_PORT, IOServiceMatching("NMXAccel"));
     uint16_t v = s ? nvmtl_pci_vendor_of(s) : 0;
     if (s) IOObjectRelease(s);
     g_vendor = (v == 0x1002 || v == 0x8086) ? v : 0x10de;
@@ -2872,8 +2873,8 @@ uint32_t nvmtl_vk_surface_gpu_mark(uint32_t surfaceID, int pending)
 int nvmtl_vk_accel_surface_wait(void)
 {
     /* the card this process was bound to (nvmultigpu=1), else the first accelerator as always */
-    io_service_t s = nvmtl_card_registry_id ? IOServiceGetMatchingService(kIOMainPortDefault, IORegistryEntryIDMatching(nvmtl_card_registry_id))
-                                            : IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("NVAccel"));
+    io_service_t s = nvmtl_card_registry_id ? IOServiceGetMatchingService(NVMTL_IO_MAIN_PORT, IORegistryEntryIDMatching(nvmtl_card_registry_id))
+                                            : IOServiceGetMatchingService(NVMTL_IO_MAIN_PORT, IOServiceMatching("NVAccel"));
     if (!s) return 0;
     CFTypeRef v = IORegistryEntryCreateCFProperty(s, CFSTR("NVAccelSurfaceWait"), kCFAllocatorDefault, 0);
     int on = 0;
@@ -9303,6 +9304,15 @@ static int nvmtl_surfin_ordered_on(void)
     if (on < 0) { const char *e = getenv("NVMTL_SURFIN_ORDERED"); on = !(e && e[0] == '0'); nvlog("ordered surface-in %s (NVMTL_SURFIN_ORDERED=%s)", on ? "on" : "off", e ? e : "unset"); }
     return on;
 }
+// A buffer-to-image copy into a multisample image is not valid Vulkan, and the copy engine raises an error for it that
+// the GPU firmware may not recover from. Metal has no such upload either, so the request is refused and named.
+static int nvmtl_copy_into_multisample(const char *who, const nvk_image *img)
+{
+    if (!img || img->samples <= 1) return 0;
+    static _Atomic int said;
+    if (atomic_fetch_add(&said, 1) < 8) nvlog("%s: %ux%u image has %u samples - a buffer is not copied into a multisample image, refused", who, img->w, img->h, img->samples);
+    return 1;
+}
 static int nvmtl_surfin_async_on(void)
 {
     static int on = -1;
@@ -9540,6 +9550,7 @@ static void nvmtl_surfin_quarantine(nvmtl_asyncup *au)
 static int nvmtl_vk_image_write_host_body(nvk_queue *q, nvk_image *img, void *base, size_t row_bytes, size_t bytes, nvk_buffer *cache,
                                           void *lease, nvmtl_vk_lease_retain_fn retain_lease, nvmtl_vk_lease_release_fn release_lease)
 {
+    if (nvmtl_copy_into_multisample("image_write_host", img)) return -1;
     const size_t bpp = img->bpp ? img->bpp : 4;
     if (img->bw > 1 || img->bh > 1 || !row_bytes || row_bytes % bpp || row_bytes < (size_t)img->w * bpp) return -1;
     if (g_host_align) bytes = (bytes + g_host_align - 1) & ~(g_host_align - 1);
@@ -9652,6 +9663,7 @@ int nvmtl_vk_buffer_fill_from_surface(nvk_queue *q, nvk_buffer *dst, const void 
 static int nvmtl_vk_image_write_body(nvk_queue *q, nvk_image *img, const void *src, size_t row_bytes)
 {
     if (nvmtl_vk_image_upload_barrier(img)) return -1;
+    if (nvmtl_copy_into_multisample("image_write", img)) return -1;
     if (nvmtl_async_surface_upload() && img->bw <= 1 && img->bh <= 1 && (img->layers ? img->layers : 1) == 1) {
         g_up_force_async = 1;
         const int rc = nvmtl_vk_image_write_region_level_layer(q, img, src, row_bytes, 0, 0, img->w, img->h, 0, 0);
@@ -9913,6 +9925,7 @@ int nvmtl_vk_image_write_region_level(nvk_queue *q, nvk_image *img, const void *
 static int nvmtl_vk_image_write_region_level_layer_body(nvk_queue *q, nvk_image *img, const void *src, size_t row_bytes,
                                       uint32_t x, uint32_t y, uint32_t w, uint32_t h, uint32_t level, uint32_t layer)
 {
+    if (nvmtl_copy_into_multisample("image_write_region", img)) return -1;
     if (layer >= (img->layers ? img->layers : 1)) { nvlog("image_write_region: layer %u — this image has %u", layer, img->layers ? img->layers : 1); return -1; }
     { const uint32_t lw = img->w >> level ? img->w >> level : 1, lh = img->h >> level ? img->h >> level : 1;
       if (!w || !h || x > lw || w > lw - x || y > lh || h > lh - y) { nvlog("image_write_region: %ux%u at (%u,%u) is outside %ux%u (level %u)", w, h, x, y, lw, lh, level); return -1; } }
@@ -11245,6 +11258,7 @@ int nvmtl_vk_cmd_copy_buffer_to_image_level_layer(nvk_cmdbuf *c, nvk_buffer *b, 
     // barrier below handed NVK a null image and the app crashed in nvk_CmdPipelineBarrier2 (read at 0x520). Refuse the
     // copy and name the texture, so the path that left it without an image can be found from the log.
     if (!nvmtl_copy_has_image("copy_buffer_to_image", img)) return -1;
+    if (nvmtl_copy_into_multisample("copy_buffer_to_image", img)) return -1;
     if (level >= (img->mips ? img->mips : 1)) { nvlog("copy_buffer_to_image: level %u — this image has %u", level, img->mips ? img->mips : 1); return -1; }
     const uint32_t lw = nvmtl_lvl(img->w, level), lh = nvmtl_lvl(img->h, level);
     const uint32_t bpp = g_copy_bpp_override ? g_copy_bpp_override : (img->bpp ? img->bpp : 4);

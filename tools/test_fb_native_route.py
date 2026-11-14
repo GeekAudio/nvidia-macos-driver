@@ -72,6 +72,7 @@ struct NVRMExternalBrightness {
     IODisplay *fRetryDisplay = nullptr;
     OSDictionary *fParameters = nullptr;
     UInt32 fGeneration = 0, fMaximum = 0;
+    unsigned fRetriesLeft = 0, fRetryDelayMs = 0;
     bool publishParameters(IODisplay *, bool &);
     bool doIntegerSet(OSDictionary *, const OSSymbol *, UInt32);
 };
@@ -107,7 +108,8 @@ int main() {
 with tempfile.TemporaryDirectory() as name:
     cpp = Path(name) / 'route.cpp'
     exe = Path(name) / 'route'
-    cpp.write_text(fixture + function('bool NVRMExternalBrightness::publishParameters') +
+    constants = '\n'.join(line for line in source.splitlines() if line.startswith('static constexpr unsigned kNVRMDdcProbe') and 'ReplyMs' in line)
+    cpp.write_text(fixture + constants + function('bool NVRMExternalBrightness::publishParameters') +
         function('bool NVRMExternalBrightness::doIntegerSet') + checks)
     subprocess.run(['clang++', '-std=c++17', '-Wall', '-Werror', str(cpp), '-o', str(exe)], check=True)
     subprocess.run([str(exe)], check=True)

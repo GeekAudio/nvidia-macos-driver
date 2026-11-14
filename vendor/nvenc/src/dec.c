@@ -1,5 +1,6 @@
 // dec.c: see dec.h. Section numbers refer to ITU-T H.264.
 #include "dec.h"
+#include "nv_floor.h"
 #include "blocklinear.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -13,7 +14,7 @@
 _Static_assert(DEC_SURFACES == NVDEC_IFACE_H264_SURFACE_COUNT, "H.264 surface offsets do not cover DEC_SURFACES");
 
 static NvU32 hi(NvU64 a) { return (NvU32)(a >> 8); }
-static double now_ms(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec * 1e3 + t.tv_nsec / 1e6; }
+static double now_ms(void) { struct timespec t; NV_CLOCK_GETTIME(CLOCK_MONOTONIC, &t); return t.tv_sec * 1e3 + t.tv_nsec / 1e6; }
 
 int h264dec_open(H264Dec *d, Rm *rm, unsigned maxW, unsigned maxH)
 {

@@ -62,6 +62,10 @@ __private_extern__ int _kext_apple_cc = __APPLE_CC__;
 
 #define LOG(fmt, ...) do { kprintf("NVRM-xnu: " fmt "\n", ##__VA_ARGS__); IOLog("NVRM-xnu: " fmt "\n", ##__VA_ARGS__); } while (0)
 
+// Longest a utilization firmware read may take before it counts as hung (chosen by us: two orders above a control
+// round trip, an order below the firmware's own timeout); the read's real duration is logged when it trips.
+static const uint64_t kUtilHangNs = 500ull * 1000 * 1000;
+
 extern "C" { NvBool nvkms_xnu_load(void); }
 class NVRM;
 #include "nvrm_devtab.h"
@@ -308,7 +312,18 @@ class NVRMUserClient;
 static NVRMUserClient *gNvClients[NV_XNU_MAX_CLIENTS];
 static IOLock         *gNvClientsLock = NULL;
 #include <kern/clock.h>
+#if defined(NM_ERA) && NM_ERA < 1010
+// Before 10.10 the kernel does not export get_task_pmap to kexts, only get_task_map. The kernel's own
+// get_task_pmap is "load the map, load one field of it"; the field's offset is read from each release's kernel
+// (10.6: 0x38, 10.7 and 10.8: 0x48, 10.9: 0x50).
+extern "C" vm_map_t get_task_map(task_t);
+static inline struct pmap *get_task_pmap(task_t t)
+{
+    return *(struct pmap **)((unsigned char *)get_task_map(t) + (NM_ERA < 1007 ? 0x38 : NM_ERA < 1009 ? 0x48 : 0x50));
+}
+#else
 extern "C" struct pmap *get_task_pmap(task_t);
+#endif
 struct nv_pm_owner { uint64_t pm; int pid; int nopen; uint64_t closed_ms; char name[20]; };
 static nv_pm_owner gNvPmTab[256];
 static uint64_t nv_pm_now_ms(void) { uint64_t ns = 0; absolutetime_to_nanoseconds(mach_absolute_time(), &ns); return ns / 1000000ULL; }
@@ -2391,7 +2406,18 @@ IOReturn NVRM::callPlatformFunction(const OSSymbol *fn, bool wait, void *p1, voi
         IOLockLock(fUtilizationLock);
         const bool ready = !fUtilizationStopping && !isInactive() && fAdapter && fPassDone >= 2 &&
                            OSAddAtomic(0, &fGpuPm) == kGpuPmRunning;
+        // A hung firmware read must not be repeated: it holds the RM's exclusive lock for its whole duration, and
+        // re-issued every second it keeps other processes and the window server blocked, which stalls shutdown.
+        // Longer than kUtilHangNs is a firmware that stopped answering, not a slow GPU, so the sampler stops for the
+        // rest of this boot; a fast failure keeps retrying.
+        const uint64_t utilT0 = mach_absolute_time();
         const bool ok = ready && nvrm_query_utilization(fNv.gpu_id, &fUtilizationState, sample);
+        uint64_t utilNs = 0; absolutetime_to_nanoseconds(mach_absolute_time() - utilT0, &utilNs);
+        if (ready && utilNs > kUtilHangNs) {
+            fUtilizationStopping = true;
+            LOG("utilization: a firmware read took %llu ms (limit %llu) - sampling stopped for this boot so the RM lock is not held again",
+                (unsigned long long)(utilNs / 1000000ull), (unsigned long long)(kUtilHangNs / 1000000ull));
+        }
         IOLockUnlock(fUtilizationLock);
         nv_xnu_pm_exit(counted);
         return ok ? kIOReturnSuccess : (ready ? kIOReturnIOError : kIOReturnNotReady);

@@ -25,10 +25,5 @@ jobs:
           fetch-depth: 0
       - name: Show the tools in use
         run: python3 --version && clang --version
-      - name: Fetch the Vulkan headers the plugin tests compile against
-        # The plugin tests compile against $VULKAN_HEADERS, or ~/Vulkan-Headers/include when it is unset, as on a
-        # development machine. Without them a dozen tests stop at "vulkan/vulkan.h not found" instead of checking
-        # anything.
-        run: git clone --depth 1 https://github.com/KhronosGroup/Vulkan-Headers "$HOME/Vulkan-Headers"
       - name: Host tests
         run: python3 tools/run_all_tests.py -j 3

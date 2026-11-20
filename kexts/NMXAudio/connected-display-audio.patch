@@ -1,97 +1,18 @@
 diff --git a/realmac27/audio/NMXAudio/Info.plist b/realmac27/audio/NMXAudio/Info.plist
-index 99b6fa59326c0b429e5bab8110827f2d4433df62..02d512dd2b4b35c94e0d6e0001a62af2fd1fafc8 100644
+index 99b6fa59326c0b429e5bab8110827f2d4433df62..a9c211fd8b1d8f051f78035e54032136b80e5e8f 100644
 --- a/realmac27/audio/NMXAudio/Info.plist
 +++ b/realmac27/audio/NMXAudio/Info.plist
-@@ -2,36 +2,58 @@
- <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
- <plist version="1.0">
- <dict>
--  <key>CFBundleDevelopmentRegion</key><string>en</string>
--  <key>CFBundleExecutable</key><string>NMXAudio</string>
--  <key>CFBundleIdentifier</key><string>com.nullmoth.NMXAudio</string>
--  <key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
--  <key>CFBundleName</key><string>NMXAudio</string>
--  <key>CFBundlePackageType</key><string>KEXT</string>
+@@ -8,8 +8,8 @@
+   <key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
+   <key>CFBundleName</key><string>NMXAudio</string>
+   <key>CFBundlePackageType</key><string>KEXT</string>
 -  <key>CFBundleShortVersionString</key><string>1.0.0</string>
 -  <key>CFBundleVersion</key><string>1.0.0</string>
--  <key>IOKitPersonalities</key>
--  <dict>
--    <key>HDAudio</key>
--    <dict>
--      <key>CFBundleIdentifier</key><string>com.nullmoth.NMXAudio</string>
--      <key>IOClass</key><string>NMXAudio</string>
--      <key>IOProviderClass</key><string>IOPCIDevice</string>
--      <key>IOPCIClassMatch</key><string>0x04030000&amp;0xffff0000</string>
--      <key>IOProbeScore</key><integer>5000</integer>
--    </dict>
--  </dict>
--  <key>OSBundleLibraries</key>
--  <dict>
--    <key>com.apple.iokit.IOAudioFamily</key><string>1.1fc1</string>
--    <key>com.apple.iokit.IOPCIFamily</key><string>1.0.0</string>
--    <key>com.apple.iokit.IOACPIFamily</key><string>1.0.0</string>
--    <key>com.apple.kpi.bsd</key><string>8.0</string>
--    <key>com.apple.kpi.iokit</key><string>8.0</string>
--    <key>com.apple.kpi.libkern</key><string>8.0</string>
--    <key>com.apple.kpi.mach</key><string>8.0</string>
--    <key>com.apple.kpi.unsupported</key><string>8.0</string>
--  </dict>
--  <key>OSBundleRequired</key><string>Root</string>
-+	<key>CFBundleDevelopmentRegion</key>
-+	<string>en</string>
-+	<key>CFBundleExecutable</key>
-+	<string>NMXAudio</string>
-+	<key>CFBundleIdentifier</key>
-+	<string>com.nullmoth.NMXAudio</string>
-+	<key>CFBundleInfoDictionaryVersion</key>
-+	<string>6.0</string>
-+	<key>CFBundleName</key>
-+	<string>NMXAudio</string>
-+	<key>CFBundlePackageType</key>
-+	<string>KEXT</string>
-+	<key>CFBundleShortVersionString</key>
-+	<string>1.0.2</string>
-+	<key>CFBundleVersion</key>
-+	<string>1.0.2</string>
-+	<key>IOKitPersonalities</key>
-+	<dict>
-+		<key>HDAudio</key>
-+		<dict>
-+			<key>CFBundleIdentifier</key>
-+			<string>com.nullmoth.NMXAudio</string>
-+			<key>IOClass</key>
-+			<string>NMXAudio</string>
-+			<key>IOProviderClass</key>
-+			<string>IOPCIDevice</string>
-+			<key>IOPCIClassMatch</key>
-+			<string>0x04030000&amp;0xffff0000</string>
-+			<key>IOProbeScore</key>
-+			<integer>5000</integer>
-+		</dict>
-+	</dict>
-+	<key>OSBundleLibraries</key>
-+	<dict>
-+		<key>com.apple.iokit.IOAudioFamily</key>
-+		<string>1.1fc1</string>
-+		<key>com.apple.iokit.IOPCIFamily</key>
-+		<string>1.0.0</string>
-+		<key>com.apple.iokit.IOACPIFamily</key>
-+		<string>1.0.0</string>
-+		<key>com.apple.kpi.bsd</key>
-+		<string>8.0</string>
-+		<key>com.apple.kpi.iokit</key>
-+		<string>8.0</string>
-+		<key>com.apple.kpi.libkern</key>
-+		<string>8.0</string>
-+		<key>com.apple.kpi.mach</key>
-+		<string>8.0</string>
-+		<key>com.apple.kpi.unsupported</key>
-+		<string>8.0</string>
-+	</dict>
-+	<key>OSBundleRequired</key>
-+	<string>Root</string>
- </dict>
- </plist>
++  <key>CFBundleShortVersionString</key><string>1.0.2</string>
++  <key>CFBundleVersion</key><string>1.0.2</string>
+   <key>IOKitPersonalities</key>
+   <dict>
+     <key>HDAudio</key>
 diff --git a/realmac27/audio/NMXAudio/build.sh b/realmac27/audio/NMXAudio/build.sh
 index 30cb638529479697d6255af749884b8fd98b1e7a..3db4ff53c0b9240635c72233d0cf7f2c3ed4a48e 100755
 --- a/realmac27/audio/NMXAudio/build.sh
@@ -440,7 +361,7 @@ index b41e26c04d1d369f2fabaeb5280b2dc7032a4f43..8a95f4551be90ab32c4cc2c942667fe4
  	if (c == 1)
  		snprintf(buf, buflen, "mono");
 diff --git a/realmac27/audio/NMXAudio/nmx_audio_kext.cpp b/realmac27/audio/NMXAudio/nmx_audio_kext.cpp
-index 508fe00b93521e4754f54ea4b60f3fd27049f7eb..2f7fcb3b6b1b0939c1e537482db867333932c18e 100644
+index 508fe00b93521e4754f54ea4b60f3fd27049f7eb..a0d67e77e91bce3ffa09049d6e3fb9bfec812fcd 100644
 --- a/realmac27/audio/NMXAudio/nmx_audio_kext.cpp
 +++ b/realmac27/audio/NMXAudio/nmx_audio_kext.cpp
 @@ -16,6 +16,8 @@
@@ -903,7 +824,26 @@ index 508fe00b93521e4754f54ea4b60f3fd27049f7eb..2f7fcb3b6b1b0939c1e537482db86733
  
  static bool enabled()
  {
-@@ -384,20 +657,24 @@ bool NMXAudio::start(IOService *provider)
+@@ -362,8 +635,17 @@ static bool enabled()
+ 
+ IOService *NMXAudio::probe(IOService *provider, SInt32 *score)
+ {
+-    if (OSDynamicCast(IOPCIDevice, provider) == nullptr || !enabled())
++    auto *pci = OSDynamicCast(IOPCIDevice, provider);
++    if (pci == nullptr || !enabled())
+         return nullptr;
++
++    // Apple's HDA controller gets first refusal on onboard audio. Preserve
++    // the configured priority for NVIDIA display audio.
++    constexpr UInt16 nvidiaVendor = 0x10de;
++    constexpr SInt32 fallbackScore = -1000;
++    if (score != nullptr && pci->configRead16(kIOPCIConfigVendorID) != nvidiaVendor)
++        *score = fallbackScore;
++
+     return IOService::probe(provider, score);
+ }
+ 
+@@ -384,20 +666,24 @@ bool NMXAudio::start(IOService *provider)
      IOPCIDevice *pci = OSDynamicCast(IOPCIDevice, provider);
      if (pci == nullptr || g_lock == nullptr || !IOService::start(provider))
          return false;
@@ -932,7 +872,7 @@ index 508fe00b93521e4754f54ea4b60f3fd27049f7eb..2f7fcb3b6b1b0939c1e537482db86733
      pci->setMemoryEnable(true);
      pci->setBusMasterEnable(true);
      pci_ = pci;
-@@ -432,6 +709,31 @@ static IODTNVRAM *nmx_nvram()
+@@ -432,6 +718,31 @@ static IODTNVRAM *nmx_nvram()
      return n;
  }
  
@@ -964,7 +904,7 @@ index 508fe00b93521e4754f54ea4b60f3fd27049f7eb..2f7fcb3b6b1b0939c1e537482db86733
  static bool nmx_marker_set()
  {
      IODTNVRAM *n = nmx_nvram();
-@@ -474,7 +776,13 @@ static int g_guard;     /* 0 = not checked this boot, 1 = armed by this boot, -1
+@@ -474,7 +785,13 @@ static int g_guard;     /* 0 = not checked this boot, 1 = armed by this boot, -1
  void NMXAudio::attachThread(void *arg, wait_result_t)
  {
      NMXAudio *self = (NMXAudio *)arg;
@@ -979,7 +919,7 @@ index 508fe00b93521e4754f54ea4b60f3fd27049f7eb..2f7fcb3b6b1b0939c1e537482db86733
      if (g_guard == 0) {
          if (nmx_marker_set()) {
              g_guard = -1;
-@@ -485,17 +793,19 @@ void NMXAudio::attachThread(void *arg, wait_result_t)
+@@ -485,17 +802,19 @@ void NMXAudio::attachThread(void *arg, wait_result_t)
          }
      }
      if (g_guard < 0) {
@@ -1001,7 +941,7 @@ index 508fe00b93521e4754f54ea4b60f3fd27049f7eb..2f7fcb3b6b1b0939c1e537482db86733
      if (self->dev_ == nullptr) {
          IOLog("NMXAudio: no driver took %04x:%04x\n", self->pci_->configRead16(kIOPCIConfigVendorID),
                self->pci_->configRead16(kIOPCIConfigDeviceID));
-@@ -509,6 +819,7 @@ void NMXAudio::attachThread(void *arg, wait_result_t)
+@@ -509,6 +828,7 @@ void NMXAudio::attachThread(void *arg, wait_result_t)
          self->pci_->joinPMtree(self);
          self->registerPowerDriver(self, states, 2);
          self->registerService();
@@ -1009,7 +949,7 @@ index 508fe00b93521e4754f54ea4b60f3fd27049f7eb..2f7fcb3b6b1b0939c1e537482db86733
          self->attach_ = 1;
      }
      /* the guard comes off once audio has run for two minutes (the first controller's thread does it) */
-@@ -521,24 +832,125 @@ void NMXAudio::attachThread(void *arg, wait_result_t)
+@@ -521,24 +841,125 @@ void NMXAudio::attachThread(void *arg, wait_result_t)
      self->release();
  }
  
@@ -1146,7 +1086,7 @@ index 508fe00b93521e4754f54ea4b60f3fd27049f7eb..2f7fcb3b6b1b0939c1e537482db86733
  }
  
  extern "C" void nmx_audio_diag_publish(const char *text)
-@@ -547,20 +959,19 @@ extern "C" void nmx_audio_diag_publish(const char *text)
+@@ -547,20 +968,19 @@ extern "C" void nmx_audio_diag_publish(const char *text)
          g_attaching->setProperty("nmx-hda-diag", text);
  }
  
@@ -1177,7 +1117,7 @@ index 508fe00b93521e4754f54ea4b60f3fd27049f7eb..2f7fcb3b6b1b0939c1e537482db86733
  }
  
  extern "C" void nmx_audio_block_done(void *engine, struct pcm_channel *)
-@@ -570,25 +981,55 @@ extern "C" void nmx_audio_block_done(void *engine, struct pcm_channel *)
+@@ -570,25 +990,55 @@ extern "C" void nmx_audio_block_done(void *engine, struct pcm_channel *)
  
  void NMXAudio::stop(IOService *provider)
  {
@@ -1233,7 +1173,7 @@ index 508fe00b93521e4754f54ea4b60f3fd27049f7eb..2f7fcb3b6b1b0939c1e537482db86733
  extern "C" {
  kern_return_t nmx_audio_kmod_start(kmod_info_t *ki, void *data);
  kern_return_t nmx_audio_kmod_stop(kmod_info_t *ki, void *data);
-@@ -596,9 +1037,10 @@ kern_return_t nmx_audio_kmod_stop(kmod_info_t *ki, void *data);
+@@ -596,9 +1046,10 @@ kern_return_t nmx_audio_kmod_stop(kmod_info_t *ki, void *data);
  
  kern_return_t nmx_audio_kmod_start(kmod_info_t *, void *)
  {
@@ -1246,7 +1186,7 @@ index 508fe00b93521e4754f54ea4b60f3fd27049f7eb..2f7fcb3b6b1b0939c1e537482db86733
  }
  
  kern_return_t nmx_audio_kmod_stop(kmod_info_t *, void *)
-@@ -607,15 +1049,17 @@ kern_return_t nmx_audio_kmod_stop(kmod_info_t *, void *)
+@@ -607,15 +1058,17 @@ kern_return_t nmx_audio_kmod_stop(kmod_info_t *, void *)
          nmx_port_stop();
      if (g_devices)
          g_devices->release();

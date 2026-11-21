@@ -21,6 +21,11 @@ fixture = r'''
 
 using IOReturn = int;
 using NvU16 = unsigned short;
+using thread_call_param_t = void *;
+uint64_t ticks = 1;
+static constexpr unsigned kMicrosecondScale = 1;
+uint64_t mach_absolute_time() { return ticks; }
+void clock_interval_to_deadline(unsigned interval, unsigned, uint64_t *out) { *out = ticks + interval; }
 enum { kIOReturnSuccess, kIOReturnUnsupported, kIOReturnNotReady, kIOReturnBadArgument,
        kIOReturnBusy, kIOReturnNoMemory, kIOReturnIOError };
 enum { NV_FALSE, NV_TRUE, NV_KMS_FLIP_RESULT_IN_PROGRESS };
@@ -44,6 +49,7 @@ struct NvKmsKapiRequestedModeSetConfig {
 struct NvKmsKapiModeSetReplyConfig { int flipResult; };
 struct NVRMDisplayGate { bool valid() { return true; } };
 struct NVRMHeadGate { NVRMHeadGate(int, int, bool) {} bool valid() { return true; } };
+struct NVRMCallReference { explicit NVRMCallReference(void *) {} };
 int startLock() { return 0; }
 void nvrmfbInstallSysctl() {}
 void *IOMalloc(size_t size) { return std::malloc(size); }
@@ -54,13 +60,19 @@ void OSAddAtomic64(int value, long long *counter) { *counter += value; }
 bool OSCompareAndSwap(int, int, unsigned *) { return false; }
 #define FBLOG(...) ((void)0)
 long long gCopyPresentLatched, gCopyPresentBusy, gCopyPresentFailed;
+long long gCopyPresentQueued, gCopyPresentDeferred, gCopyPresentLatchedHead[8];
 COPY_METHOD
 
 struct NVRMNVDAFramebuffer {
-    struct CopyScanout { Surface *surface = nullptr; void *kva = nullptr; unsigned pitch = 16; };
-    Surface home, owned[2];
-    CopyScanout fCopyScanout[2];
+    struct CopyScanout { Surface *surface = nullptr; void *kva = nullptr; unsigned pitch = 16, width = 2, height = 2; };
+    Surface home, owned[3];
+    CopyScanout fCopyScanout[3];
     Surface *fSurf = &home, *fFrontSurf = fSurf;
+    Surface *fCopyRetiring = nullptr;
+    CopyScanout *fCopyQueued = nullptr;
+    uint64_t fCopyQueuedDeadline = 0;
+    void *fCopyPresentCall = nullptr;
+    unsigned scheduled = 0;
     void *fKms = this, *fDev = this;
     bool fCopyPresent = true, fCopyAwaitingLatch = false;
     bool fSubmissionSeen = false, fSubmissionFaulted = false;
@@ -76,10 +88,13 @@ struct NVRMNVDAFramebuffer {
     explicit NVRMNVDAFramebuffer(unsigned head) : fHead(head) {}
     bool rmGpuReady() { return true; }
     bool waitFlipDone(unsigned us) { assert(us == 0); return statusAvailable && !pending; }
+    uint64_t vblPeriodAbs() { return 16667; }
+    void scheduleCall(void *call, uint64_t) { assert(call == fCopyPresentCall && call); ++scheduled; }
     void notifyConnectionChanged(int) {}
     bool prepareCopyScanout(CopyScanout &slot) {
         ++preparations;
-        assert(!pending && statusAvailable && (!slot.surface || slot.surface != fFrontSurf));
+        assert((!slot.surface || (slot.surface != fFrontSurf && slot.surface != fCopyRetiring)) &&
+               (!pending || (statusAvailable && fCopyPresentCall && fCopyAwaitingLatch)));
         if (!canAllocate) return false;
         slot.surface = &owned[&slot - fCopyScanout];
         slot.kva = slot.surface->words;
@@ -94,13 +109,17 @@ struct NVRMNVDAFramebuffer {
         assert(head.modeSetConfig.bActive && head.modeSetConfig.displays[0] == fDisplay);
         assert(layer.flags.surfaceChanged && layer.config.srcWidth == fW && layer.config.dstWidth == fRasterW);
         assert(layer.config.minPresentInterval == 1 && !layer.config.tearing);
-        assert(layer.config.surface != fFrontSurf && layer.config.surface != &home);
+        assert(!pending && statusAvailable && layer.config.surface != fFrontSurf && layer.config.surface != &home);
         ++commits;
         firstPixelAtCommit = layer.config.surface->words[0];
         rep->flipResult = accept ? 0 : 3;
         if (accept) fSubmissionSeen = pending = true;
         return accept;
     }
+    bool copyPresentReady();
+    bool copyFlipPending();
+    IOReturn submitCopiedScanout(CopyScanout &);
+    static void copyPresentFire(thread_call_param_t, thread_call_param_t);
     IOReturn presentCopiedFrame(const NVRMCopyPresentRequest &request);
 };
 PRODUCTION_METHOD
@@ -146,9 +165,54 @@ int main() {
     assert(tight.presentCopiedFrame(frame) == kIOReturnSuccess);
     assert(!std::memcmp(tight.fFrontSurf->words, pixels, 4 * sizeof(unsigned)));
     assert(tight.fFrontSurf->words[4] == 0);
-    std::puts("PASS: buffered copy, independent heads, latch safety, refusal, pitch and l10r");
+
+    NVRMNVDAFramebuffer queued(0);
+    queued.fCopyPresentCall = &queued;
+    frame.pitch = 12;
+    pixels[0] = 41;
+    assert(queued.presentCopiedFrame(frame) == kIOReturnSuccess);
+    auto *first = queued.fFrontSurf;
+    queued.pending = false;
+    pixels[0] = 42;
+    assert(queued.presentCopiedFrame(frame) == kIOReturnSuccess);
+    auto *second = queued.fFrontSurf;
+    pixels[0] = 43;
+    assert(queued.presentCopiedFrame(frame) == kIOReturnBusy);
+    assert(queued.fCopyQueued && queued.commits == 2 && queued.scheduled == 1);
+    assert(first->words[0] == 41 && second->words[0] == 42);
+    assert(queued.fCopyQueued->surface != first && queued.fCopyQueued->surface != second);
+    queued.copyPresentFire(&queued, nullptr);
+    assert(queued.scheduled == 2 && queued.commits == 2);
+    pixels[0] = 44;
+    assert(queued.presentCopiedFrame(frame) == kIOReturnBusy);
+    pixels[0] = 45;
+    queued.pending = false;
+    queued.copyPresentFire(&queued, nullptr);
+    assert(queued.commits == 3 && queued.firstPixelAtCommit == 44 && !queued.fCopyQueued);
+    assert(gCopyPresentQueued == 2 && gCopyPresentDeferred == 1 && gCopyPresentLatchedHead[0] >= 2);
+    assert(first->words[0] == 41 && second->words[0] == 42);
+
+    assert(queued.presentCopiedFrame(frame) == kIOReturnBusy);
+    ticks = queued.fCopyQueuedDeadline;
+    auto *last = queued.fFrontSurf;
+    queued.copyPresentFire(&queued, nullptr);
+    assert(queued.commits == 3 && queued.fFrontSurf == last && !queued.fCopyQueued);
+    assert(queued.presentCopiedFrame(frame) == kIOReturnBusy);
+    queued.fDpyLost = true;
+    queued.copyPresentFire(&queued, nullptr);
+    assert(queued.commits == 3 && queued.fFrontSurf == last && !queued.fCopyQueued);
+    std::puts("PASS: independent heads, latch safety, pitch, l10r, queued replacement, bounded retry and disconnection");
 }
 '''
 
+methods = (
+    "bool NVRMNVDAFramebuffer::copyPresentReady(",
+    "bool NVRMNVDAFramebuffer::copyFlipPending(",
+    "IOReturn NVRMNVDAFramebuffer::submitCopiedScanout(",
+    "void NVRMNVDAFramebuffer::copyPresentFire(",
+    "IOReturn NVRMNVDAFramebuffer::presentCopiedFrame(",
+)
+assert "if (!deferLatch) fCopyQueued = nullptr;" in method(FB, "NvBool NVRMNVDAFramebuffer::submitConfig(")
+assert "&fCopyPresentCall" in method(FB, "void NVRMNVDAFramebuffer::stop(")
 run(fixture.replace("COPY_METHOD", method(FB, "static inline void nvu_copy("))
-    .replace("PRODUCTION_METHOD", method(FB, "IOReturn NVRMNVDAFramebuffer::presentCopiedFrame(")))
+    .replace("PRODUCTION_METHOD", "\n".join(method(FB, name) for name in methods)))

@@ -499,19 +499,10 @@ static unsigned nvmtl_nvencvt_scope(const char *me, bool decoderAllowed)
     if (getenv("NVMTL_NO_NVENC")) scope &= ~2u;
     return scope;
 }
-static bool nvmtl_can_register_decoder(const char *me)
+// A native client can use this path only when both RM connections work under
+// its current sandbox. The probe does not create a decode session.
+static bool nvmtl_sandbox_decoder_bridge_available(const char *me)
 {
-    if (nvmtl_is_decode_service(me) || !nvmtl_is_sandboxed()) return true;
-    // Native sandboxed players keep upstream's service delegation even if they can open the bridge. QuickTime's
-    // in-process NVDEC path can freeze its picture while the playback clock advances. Only Chromium's GPU process
-    // needs the local capability registration below; identify the process type rather than an app-name allowlist.
-    // Gecko's RDD/GPU processes take the same probe. Their stock sandbox allows (iokit-connection "IOAccelerator"),
-    // which covers both bridge clients; the decoders' denied /dev/null handle is replaced in nvmtl_codec_open.
-    if (!nvmtl_is_chromium_gpu_process() && !nvmtl_is_gecko_decoder_process()) return false;
-    // Chromium checks local VideoToolbox hardware support before it creates a decoder. Skipping registration
-    // makes H.264 disappear from that check; it does not send the query to VTDecoderXPCService. A sandboxed GPU
-    // process can already use our accelerator's RM bridge. Check both client types used by the decoder libraries
-    // under the actual sandbox, and leave restricted clients on the service path. No decoder session is created.
     static bool allowed;
     static dispatch_once_t once;
     dispatch_once(&once, ^{
@@ -531,6 +522,55 @@ static bool nvmtl_can_register_decoder(const char *me)
               me, allowed ? "available" : "unavailable", cr, gr);
     });
     return allowed;
+}
+static bool nvmtl_can_register_decoder(const char *me)
+{
+    if (nvmtl_is_decode_service(me) || !nvmtl_is_sandboxed()) return true;
+    // Chromium and Gecko check local hardware support before requesting a decoder.
+    // The built-in decoder factories retain delegation for native sandboxed players.
+    return (nvmtl_is_chromium_gpu_process() || nvmtl_is_gecko_decoder_process()) &&
+           nvmtl_sandbox_decoder_bridge_available(me);
+}
+static bool nvmtl_read_pci_value(io_service_t device, CFStringRef key, uint32_t *value)
+{
+    CFTypeRef data = IORegistryEntryCreateCFProperty(device, key, kCFAllocatorDefault, 0);
+    bool ok = data && CFGetTypeID(data) == CFDataGetTypeID() && CFDataGetLength(data) >= sizeof(*value);
+    if (ok) CFDataGetBytes(data, CFRangeMake(0, sizeof(*value)), (UInt8 *)value);
+    if (data) CFRelease(data);
+    return ok;
+}
+static bool nvmtl_only_ampere_display_gpu(void)
+{
+    // Check PCI display controllers, including an iGPU without a Metal driver.
+    // A second display GPU or an incomplete inventory retains the system route.
+    io_iterator_t devices = IO_OBJECT_NULL;
+    if (IOServiceGetMatchingServices(kIOMainPortDefault, IOServiceMatching("IOPCIDevice"), &devices) != KERN_SUCCESS)
+        return false;
+    bool found = false, valid = true;
+    for (io_service_t device; valid && (device = IOIteratorNext(devices)); IOObjectRelease(device)) {
+        uint32_t deviceClass;
+        valid = nvmtl_read_pci_value(device, CFSTR("class-code"), &deviceClass);
+        if (!valid || (deviceClass >> 16) != 0x03) continue;
+        uint32_t vendor, model;
+        valid = !found && nvmtl_read_pci_value(device, CFSTR("vendor-id"), &vendor) &&
+                nvmtl_read_pci_value(device, CFSTR("device-id"), &model) &&
+                vendor == 0x10de && model >= 0x2200 && model <= 0x25ff;
+        found = valid;
+    }
+    valid = valid && IOIteratorIsValid(devices);
+    IOObjectRelease(devices);
+    return valid && found;
+}
+static bool nvmtl_nvencvt_can_register_decoder(const char *me)
+{
+    if (nvmtl_can_register_decoder(me)) return true;
+    if (!me || strcmp(me, "QuickTime Player")) return false;
+    CFBundleRef bundle = CFBundleGetMainBundle();
+    CFStringRef identifier = bundle ? CFBundleGetIdentifier(bundle) : NULL;
+    if (!identifier || !CFEqual(identifier, CFSTR("com.apple.QuickTimePlayerX"))) return false;
+    // NVEncVT on GA10x checks the C7B0 decoder itself and uses the client's
+    // pixel-buffer requirements. Keep the exception away from the built-in factories.
+    return nvmtl_only_ampere_display_gpu() && nvmtl_sandbox_decoder_bridge_available(me);
 }
 static void nvmtl_nvdec_register(void)
 {
@@ -631,10 +671,7 @@ static void nvmtl_nvencvt_register(void)
         }
         if (!strcmp(me, "WindowServer")) return;     // the codec registrars all stay out of it
         if (!nvmtl_video_has_codecs()) return;
-        // Match the built-in decoder policy for the addon too. Registering its
-        // decoder factories in native sandboxed players bypassed service
-        // delegation on Ada/TU117 and could reintroduce the QuickTime freeze.
-        unsigned scope = nvmtl_nvencvt_scope(me, nvmtl_can_register_decoder(me));
+        unsigned scope = nvmtl_nvencvt_scope(me, nvmtl_nvencvt_can_register_decoder(me));
         if (!scope) return;
         Dl_info di;
         if (!dladdr((const void *)nvmtl_nvencvt_register, &di) || !di.dli_fname) { nvlog("nvencvt: dladdr failed - not registering"); return; }

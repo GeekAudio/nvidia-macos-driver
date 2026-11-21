@@ -24,10 +24,14 @@ plugin and a source/license record in `/Library/GPUBundles/nvmtl/video`.
 `NVMTL_NVENCVT=1` in `/Library/GPUBundles/nvmtl/nvrm610.conf` enables the addon.
 Applications register it when creating a Metal device; VideoToolbox encoder and
 decoder services also register their own codec role at plugin load, without a
-render device. Configuration is applied before service registration. Native
-sandboxed players retain decoder-service delegation. A pre-existing explicit
-setting is preserved. Restart the application after changing it; no reboot is
-needed for a userland codec update.
+render device. Configuration is applied before service registration. On systems
+where a single RTX 30-series PCI display controller is present and the existing
+accelerator bridge is accessible from the QuickTime Player sandbox, QuickTime can
+register the addon's in-process H.264 and HEVC decoders. Systems with a second
+display controller, including a headless iGPU, retain the system decoder route.
+Other native sandboxed players retain decoder-service delegation. A pre-existing
+explicit setting is preserved. Restart the application after changing it; no
+reboot is needed for a userland codec update.
 
 Applications must request VideoToolbox decoding for that codec. A registered
 VP8 decoder does not redirect an application's private software VP8 decoder.

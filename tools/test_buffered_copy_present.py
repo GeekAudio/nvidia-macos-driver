@@ -54,6 +54,7 @@ void OSAddAtomic64(int value, long long *counter) { *counter += value; }
 bool OSCompareAndSwap(int, int, unsigned *) { return false; }
 #define FBLOG(...) ((void)0)
 long long gCopyPresentLatched, gCopyPresentBusy, gCopyPresentFailed;
+COPY_METHOD
 
 struct NVRMNVDAFramebuffer {
     struct CopyScanout { Surface *surface = nullptr; void *kva = nullptr; unsigned pitch = 16; };
@@ -138,8 +139,16 @@ int main() {
     assert(main.presentCopiedFrame(frame) == kIOReturnSuccess && main.fFrontSurf == front);
     assert(main.firstPixelAtCommit == 0xffff0000u && secondary.fFrontSurf->words[0] == 7);
     assert(gCopyPresentLatched == 2 && gCopyPresentBusy == 2 && gCopyPresentFailed == 3);
+    NVRMNVDAFramebuffer tight(0);
+    tight.fPitch = tight.fCopyScanout[0].pitch = tight.fCopyScanout[1].pitch = 8;
+    frame.format = NV_IOP_FMT_BGRA;
+    frame.pitch = 8;
+    assert(tight.presentCopiedFrame(frame) == kIOReturnSuccess);
+    assert(!std::memcmp(tight.fFrontSurf->words, pixels, 4 * sizeof(unsigned)));
+    assert(tight.fFrontSurf->words[4] == 0);
     std::puts("PASS: buffered copy, independent heads, latch safety, refusal, pitch and l10r");
 }
 '''
 
-run(fixture.replace("PRODUCTION_METHOD", method(FB, "IOReturn NVRMNVDAFramebuffer::presentCopiedFrame(")))
+run(fixture.replace("COPY_METHOD", method(FB, "static inline void nvu_copy("))
+    .replace("PRODUCTION_METHOD", method(FB, "IOReturn NVRMNVDAFramebuffer::presentCopiedFrame(")))

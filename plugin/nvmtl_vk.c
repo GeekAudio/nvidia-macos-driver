@@ -9592,6 +9592,29 @@ static int nvmtl_copy_into_multisample(const char *who, const nvk_image *img)
     if (atomic_fetch_add(&said, 1) < 8) nvlog("%s: %ux%u image has %u samples - a buffer is not copied into a multisample image, refused", who, img->w, img->h, img->samples);
     return 1;
 }
+static void nvmtl_record_host_upload(nvk_cmdbuf *cmd, nvk_image *img, const nvk_buffer *host,
+                                     size_t offset, uint32_t row_length)
+{
+    const int ordered = nvmtl_surfin_ordered_on();
+    VkImageSubresourceRange range = { nvmtl_barrier_aspect(img), 0, 1, 0, 1 };
+    VkImageMemoryBarrier toDst = { VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, NULL,
+        ordered ? (VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_SHADER_READ_BIT) : 0, VK_ACCESS_TRANSFER_WRITE_BIT,
+        VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+        VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED, (VkImage)img->img, range };
+    pvkCmdPipelineBarrier(cmd->cb, ordered ? VK_PIPELINE_STAGE_ALL_COMMANDS_BIT : VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                          VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL, 1, &toDst);
+    VkBufferImageCopy bic = { (VkDeviceSize)offset, row_length, 0, { nvmtl_copy_aspect(img), 0, 0, 1 },
+        { 0, 0, 0 }, { img->w, img->h, 1 } };
+    pvkCmdCopyBufferToImage(cmd->cb, (VkBuffer)host->buf, (VkImage)img->img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &bic);
+    VkImageMemoryBarrier toRead = { VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, NULL,
+        VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT,
+        VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+        VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED, (VkImage)img->img, range };
+    pvkCmdPipelineBarrier(cmd->cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+                          0, 0, NULL, 0, NULL, 1, &toRead);
+    img->layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+}
+
 int nvmtl_vk_image_write_host(nvk_queue *q, nvk_image *img, void *base, size_t row_bytes, size_t bytes, nvk_buffer *cache)
 {
     if (nvmtl_copy_into_multisample("image_write_host", img)) return -1;
@@ -9600,24 +9623,47 @@ int nvmtl_vk_image_write_host(nvk_queue *q, nvk_image *img, void *base, size_t r
     if (img->bw > 1 || img->bh > 1 || nvmtl_host_page_span(&base, &bytes, bpp, row_bytes, img->w, img->h, &at)) return -1;
     nvk_buffer tmp, *hp = nvmtl_host_pages(cache, base, bytes, &tmp);
     if (!hp) return -1;
-    nvk_buffer hb = *hp;
     nvk_cmdbuf c;
     if (nvmtl_vk_cmd_begin(q, &c)) { nvmtl_host_pages_done(cache, hp); return -1; }
-    VkImageSubresourceRange range = { nvmtl_barrier_aspect(img), 0, 1, 0, 1 };
-    VkImageMemoryBarrier toDst = { VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, NULL, nvmtl_surfin_ordered_on() ? (VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_SHADER_READ_BIT) : 0, VK_ACCESS_TRANSFER_WRITE_BIT,
-        VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-        VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED, (VkImage)img->img, range };
-    pvkCmdPipelineBarrier(c.cb, nvmtl_surfin_ordered_on() ? VK_PIPELINE_STAGE_ALL_COMMANDS_BIT : VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL, 1, &toDst);
-    VkBufferImageCopy bic = { (VkDeviceSize)at, (uint32_t)(row_bytes / bpp), 0, { nvmtl_copy_aspect(img), 0, 0, 1 }, { 0, 0, 0 }, { img->w, img->h, 1 } };
-    pvkCmdCopyBufferToImage(c.cb, (VkBuffer)hb.buf, (VkImage)img->img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &bic);
-    VkImageMemoryBarrier toRead = { VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, NULL,
-        VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT,
-        VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-        VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED, (VkImage)img->img, range };
-    pvkCmdPipelineBarrier(c.cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0, NULL, 0, NULL, 1, &toRead);
-    img->layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    nvmtl_record_host_upload(&c, img, hp, at, (uint32_t)(row_bytes / bpp));
     const int rc = nvmtl_vk_submit_wait_at(&c, "surface upload (imported pages)");
     nvmtl_host_pages_done(cache, hp);
+    return rc;
+}
+
+int nvmtl_vk_image_write_host_pair(nvk_queue *q, const nvmtl_host_plane planes[2], void *base, size_t bytes,
+                                  nvk_buffer *cache)
+{
+    if (!base || !g_host_align || (g_host_align & (g_host_align - 1)) ||
+        ((uintptr_t)base & (g_host_align - 1)) || bytes > UINTPTR_MAX - (uintptr_t)base) return -1;
+    size_t offsets[2];
+    for (unsigned i = 0; i < 2; ++i) {
+        const nvmtl_host_plane *plane = &planes[i];
+        const uintptr_t address = (uintptr_t)plane->plane;
+        if (address < (uintptr_t)base || address - (uintptr_t)base >= bytes) return -1;
+        const size_t offset = address - (uintptr_t)base;
+        nvk_image *image = plane->image;
+        if (!image || image->bpp != i + 1 || image->samples > 1 || image->bw > 1 || image->bh > 1 ||
+            image->mips != 1 || image->layers != 1 || (offset & 3)) return -1;
+        size_t span = bytes - offset, relative;
+        void *start = plane->plane;
+        if (nvmtl_host_page_span(&start, &span, image->bpp, plane->row_bytes, image->w, image->h, &relative))
+            return -1;
+        offsets[i] = offset;
+    }
+    bytes &= ~(g_host_align - 1);
+    nvk_buffer tmp, *host = nvmtl_host_pages(cache, base, bytes, &tmp);
+    if (!host) return -1;
+    nvk_cmdbuf cmd;
+    int rc = nvmtl_vk_cmd_begin(q, &cmd);
+    if (!rc) {
+        for (unsigned i = 0; i < 2; ++i) {
+            nvk_image *image = planes[i].image;
+            nvmtl_record_host_upload(&cmd, image, host, offsets[i], (uint32_t)(planes[i].row_bytes / image->bpp));
+        }
+        rc = nvmtl_vk_submit_wait_at(&cmd, "NV12 upload (imported pages)");
+    }
+    nvmtl_host_pages_done(cache, host);
     return rc;
 }
 

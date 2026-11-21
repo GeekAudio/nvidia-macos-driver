@@ -4670,10 +4670,19 @@ IOReturn NVRMNVDAFramebuffer::presentCopiedFrame(const NVRMCopyPresentRequest &r
         return kIOReturnNoMemory;
     }
     auto *destination = static_cast<volatile unsigned *>(back.kva);
-    for (unsigned y = 0; y < request.height; ++y) {
-        nv_iop_convert_row(destination + (size_t)y * (back.pitch / 4),
-                           request.pixels + (size_t)y * (request.pitch / 4),
-                           request.width, request.format, 0);
+    const size_t rowBytes = (size_t)request.width * sizeof(unsigned);
+    if (request.format == NV_IOP_FMT_BGRA && request.pitch == rowBytes && back.pitch == rowBytes) {
+        nvu_copy(const_cast<unsigned *>(destination), const_cast<const unsigned *>(request.pixels),
+                 rowBytes * request.height);
+    } else {
+        for (unsigned y = 0; y < request.height; ++y) {
+            auto *dst = destination + (size_t)y * (back.pitch / 4);
+            const auto *src = request.pixels + (size_t)y * (request.pitch / 4);
+            if (request.format == NV_IOP_FMT_BGRA)
+                nvu_copy(const_cast<unsigned *>(dst), const_cast<const unsigned *>(src), rowBytes);
+            else
+                nv_iop_convert_row(dst, src, request.width, request.format, 0);
+        }
     }
     __asm__ __volatile__("sfence" ::: "memory"); // Flush write-combined pixel stores before the flip.
 

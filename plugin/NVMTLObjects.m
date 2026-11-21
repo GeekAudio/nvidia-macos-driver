@@ -1341,6 +1341,7 @@ static void nvmtl_surface_overwrite_recorded(NVMTLCommandBuffer *cb, NVMTLTextur
     [cb->_surfOverwrites addObject:r];
 }
 static BOOL nvmtl_surface_pending_write(NVMTLCommandBuffer *cb, NVMTLTexture *t);
+static BOOL nvmtl_upload_nv12_pair(NVMTLCommandBuffer *cb, NVMTLTexture *t);
 static void nvmtl_surface_in_for_cb(NVMTLCommandBuffer *cb, NVMTLTexture *t) {
     if (!t) return;
     NVMTLTexture *r = t->_parent ? t->_parent : t;
@@ -1355,6 +1356,7 @@ static void nvmtl_surface_in_for_cb(NVMTLCommandBuffer *cb, NVMTLTexture *t) {
     // Importing the old CPU surface here would run ahead of this buffer and
     // overwrite that earlier GPU write. Queue order or the application's event supplies the dependency.
     if (nvmtl_surface_pending_write(cb, r)) return;
+    if (cb && t->_usage == MTLTextureUsageShaderRead && r->_nv12Companion && nvmtl_upload_nv12_pair(cb, r)) return;
     [t nvmtlSurfaceIn];
 }
 static unsigned nvmtl_surf_id(NVMTLTexture *t) { NVMTLTexture *r = (t && t->_parent) ? t->_parent : t; return (r && r->_surf) ? (unsigned)IOSurfaceGetID(r->_surf) : 0u; }
@@ -2124,6 +2126,52 @@ static uint32_t nvmtl_tex_attach_vkfmt(NVMTLTexture *t, int *a8) {
     return v;
 }
 @end
+
+// CoreAnimation binds both planes of a decoded frame for the same draw.
+// Hold the IOSurface through the copy and publish both seeds after one fence.
+static BOOL nvmtl_upload_nv12_pair(NVMTLCommandBuffer *cb, NVMTLTexture *t) {
+    NVMTLTexture *companion = t->_nv12Companion;
+    if (!companion || !nvmtl_surfin_import() || [cb->_surfOverwrites containsObject:companion] ||
+        nvmtl_surface_pending_write(cb, companion)) return NO;
+    NVMTLTexture *y = t->_plane == 0 ? t : companion;
+    NVMTLTexture *uv = t->_plane == 0 ? companion : t;
+    id yLock = nvmtl_surface_sync(y);
+    id uvLock = nvmtl_surface_sync(uv);
+    @synchronized (yLock) {
+        @synchronized (uvLock) {
+            IOSurfaceRef surface = y->_surf;
+            const uint32_t yGeneration = nvmtl_vram_gen(surface, 0);
+            const uint32_t uvGeneration = nvmtl_vram_gen(surface, 1);
+            const uint32_t current = IOSurfaceGetSeed(surface);
+            if ((__atomic_load_n(&y->_surfSynced, __ATOMIC_ACQUIRE) &&
+                 __atomic_load_n(&y->_surfSeed, __ATOMIC_ACQUIRE) == current && y->_surfGen == yGeneration) ||
+                (__atomic_load_n(&uv->_surfSynced, __ATOMIC_ACQUIRE) &&
+                 __atomic_load_n(&uv->_surfSeed, __ATOMIC_ACQUIRE) == current && uv->_surfGen == uvGeneration))
+                return NO;
+            if (![y nvmtlSurfaceCopyable] || ![uv nvmtlSurfaceCopyable]) return NO;
+            uint32_t seed = 0;
+            if (IOSurfaceLock(surface, kIOSurfaceLockReadOnly, &seed) != kIOReturnSuccess) return NO;
+            const nvmtl_host_plane planes[] = {
+                { &y->_i, IOSurfaceGetBaseAddressOfPlane(surface, 0), IOSurfaceGetBytesPerRowOfPlane(surface, 0) },
+                { &uv->_i, IOSurfaceGetBaseAddressOfPlane(surface, 1), IOSurfaceGetBytesPerRowOfPlane(surface, 1) }
+            };
+            const int rc = nvmtl_vk_image_write_host_pair(y->_q, planes, IOSurfaceGetBaseAddress(surface),
+                                                        IOSurfaceGetAllocSize(surface), &y->_hostPages);
+            IOSurfaceUnlock(surface, kIOSurfaceLockReadOnly, NULL);
+            if (rc) return NO;
+            y->_surfGen = yGeneration;
+            uv->_surfGen = uvGeneration;
+            __atomic_store_n(&y->_surfSeed, seed, __ATOMIC_RELEASE);
+            __atomic_store_n(&uv->_surfSeed, seed, __ATOMIC_RELEASE);
+            __atomic_store_n(&y->_surfSynced, YES, __ATOMIC_RELEASE);
+            __atomic_store_n(&uv->_surfSynced, YES, __ATOMIC_RELEASE);
+            g_surfin_copy += 2;
+            static dispatch_once_t reported;
+            dispatch_once(&reported, ^{ nvlog("surface-in: paired NV12 upload %ux%u", y->_i.w, y->_i.h); });
+            return YES;
+        }
+    }
+}
 
 NSArray<NSDictionary *> *nvmtl_argbuf_fields(NVMTLFunction *function, NSUInteger ownerBufferIndex);
 NSArray<NSDictionary *> *nvmtl_air_argbuf_layout(NVMTLFunction *fn, NSUInteger bufferIndex, NSUInteger *size, NSUInteger *align);

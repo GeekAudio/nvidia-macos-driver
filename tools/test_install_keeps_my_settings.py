@@ -7,7 +7,7 @@ SRC = (pathlib.Path(__file__).resolve().parents[1] / "package/install.sh").read_
 start = SRC.index("MYCONF_START=")
 end = SRC.index("if [ -d \"$EXT/NMXGPU.kext\" ]", start)
 block = SRC[start:end].replace(
-    'for b in NVMTLDriver.bundle NVIDIAShared.bundle nvmtl ${GLD_BUNDLE:+"$GLD_BUNDLE"}; do rm -rf "$GB/$b" && ditto "$HERE/Library/GPUBundles/$b" "$GB/$b" || die "无法复制 ${b}（从 ${BK} 恢复）"; done',
+    'for b in NVMTLDriver.bundle NVIDIAShared.bundle nvmtl ${GLD_BUNDLE:+"$GLD_BUNDLE"}; do rm -rf "$GB/$b" && ditto "$HERE/Library/GPUBundles/$b" "$GB/$b" || die "$(install_text "无法复制 ${b}（从 ${BK} 恢复）" "copy $b (restore from $BK)")"; done',
     'rm -rf "$GB/nvmtl" && cp -R "$HERE/Library/GPUBundles/nvmtl" "$GB/nvmtl"')
 assert "cp -R" in block, "the copy line moved: update this test's anchor"
 fails = []
@@ -26,7 +26,7 @@ def run(old, new):
         if old is not None:
             open(os.path.join(gb, "nvmtl/nvrm610.conf"), "w").write(old)
         open(os.path.join(here, "Library/GPUBundles/nvmtl/nvrm610.conf"), "w").write(new)
-        script = f'GB="{gb}"; HERE="{here}"; T="{t}"; ok() {{ echo "ok $*"; }}; die() {{ echo "DIE $*"; exit 1; }}\n' + block
+        script = 'install_text() { printf "%s" "$1"; }; ' + f'GB="{gb}"; HERE="{here}"; T="{t}"; ok() {{ echo "ok $*"; }}; die() {{ echo "DIE $*"; exit 1; }}\n' + block
         r = subprocess.run(["/bin/bash", "-c", script], capture_output=True, text=True)
         return r.returncode, open(os.path.join(gb, "nvmtl/nvrm610.conf")).read(), r.stdout + r.stderr
 

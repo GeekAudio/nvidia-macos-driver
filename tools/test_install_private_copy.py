@@ -13,9 +13,10 @@ import tempfile
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 SRC = (ROOT / "package/install.sh").read_text()
-start = SRC.index('step "2. 软件包完整性检查"')
+start = SRC.index('step "$(install_text "2. 软件包完整性检查"')
 end = SRC.index("for target in 15 26; do", start)
 BLOCK = SRC[start:end]
+LANGUAGE = SRC[SRC.index('install_text() {'):SRC.index('HERE=$(cd')]
 assert "STAGE=$(mktemp -d /var/tmp/" in BLOCK, "the private copy moved: update this test's anchor"
 fails = 0
 
@@ -44,7 +45,7 @@ def run(t, here, after="", payload=False):
     """Run step 2 as install.sh would, then `after` (the attacker's move and the later copy) in the same shell."""
     (t / "tmp").mkdir(exist_ok=True)
     block = BLOCK.replace("/var/tmp/", f"{t}/tmp/")
-    script = ('step() { :; }; ok() { :; }; die() { echo "DIE $*"; exit 1; }; chown() { :; }\n'
+    script = ('INSTALL_LANG=zh\n' + LANGUAGE + 'step() { :; }; ok() { :; }; die() { echo "DIE $*"; exit 1; }; chown() { :; }\n'
               f'HERE="{here}"\n' + block + f"ORIG='{here}'\n" + after)
     where = t / "elsewhere" if payload else here
     where.mkdir(exist_ok=True)

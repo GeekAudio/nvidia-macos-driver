@@ -113,7 +113,7 @@ class Install(unittest.TestCase):
         # The actual installer is part of the verified payload too.
         with (self.payload/'SHA256SUMS').open('a') as manifest:
             manifest.write(hashlib.sha256(self.script.read_bytes()).hexdigest()+'  install.sh\n')
-        self.env=dict(os.environ,FIXTURE_ROOT=str(self.root),PATH=str(self.bin)+':/usr/bin:/bin:/usr/sbin:/sbin')
+        self.env=dict(os.environ,FIXTURE_ROOT=str(self.root),LC_ALL='zh_CN.UTF-8',PATH=str(self.bin)+':/usr/bin:/bin:/usr/sbin:/sbin')
     def tearDown(self):self.temp.cleanup()
     def run_install(self,**faults):return subprocess.run(['/bin/bash',str(self.script)],env=dict(self.env,**faults),capture_output=True,text=True)
     def assert_restored(self,result):

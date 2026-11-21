@@ -55,7 +55,19 @@ class IntelPanelInstall(Install):
     def test_noninteractive_default_skips_panel(self):
         r=self.run_panel();self.assertEqual(r.returncode,0,r.stdout+r.stderr)
         self.assertFalse(self.live.exists())
-        self.assertIn('No interactive input',r.stdout)
+        self.assertIn('未提供交互输入',r.stdout)
+
+    def test_english_install_messages(self):
+        result = self.run_panel(LC_ALL='en_US.UTF-8')
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn('No interactive input: Intel panel support skipped', result.stdout)
+        self.assertIn('Done. Reboot now', result.stdout)
+
+    def test_explicit_language_overrides_locale(self):
+        cmd = ['/bin/bash', str(self.script), '--lang=en', '--invalid-option']
+        result = subprocess.run(cmd, env=self.env, capture_output=True, text=True)
+        self.assertEqual(result.returncode, 2)
+        self.assertIn('STOP: expected --lang=zh|en', result.stderr)
 
     def test_prompt_default_no(self):
         r=self.run_panel(answer='');self.assertEqual(r.returncode,0,r.stdout+r.stderr)

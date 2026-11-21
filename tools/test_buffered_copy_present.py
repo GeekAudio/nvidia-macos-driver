@@ -21,6 +21,7 @@ fixture = r'''
 
 using IOReturn = int;
 using NvU16 = unsigned short;
+using UInt64 = unsigned long long;
 using thread_call_param_t = void *;
 uint64_t ticks = 1;
 static constexpr unsigned kMicrosecondScale = 1;
@@ -31,6 +32,7 @@ enum { kIOReturnSuccess, kIOReturnUnsupported, kIOReturnNotReady, kIOReturnBadAr
 enum { NV_FALSE, NV_TRUE, NV_KMS_FLIP_RESULT_IN_PROGRESS };
 enum { NVKMS_KAPI_LAYER_PRIMARY_IDX = 0, NVKMS_COMPOSITION_BLENDING_MODE_OPAQUE = 1 };
 struct Surface { unsigned words[8] = {}; };
+struct NvKmsKapiMemory { unsigned pixel = 90; };
 struct NvKmsKapiRequestedModeSetConfig {
     unsigned headsMask;
     struct Head {
@@ -61,10 +63,20 @@ bool OSCompareAndSwap(int, int, unsigned *) { return false; }
 #define FBLOG(...) ((void)0)
 long long gCopyPresentLatched, gCopyPresentBusy, gCopyPresentFailed;
 long long gCopyPresentQueued, gCopyPresentDeferred, gCopyPresentLatchedHead[8];
+int gCopyPresentGpu;
+bool gCopyPresentGpuFaulted;
+struct {
+    unsigned size(NvKmsKapiMemory *, UInt64 cookie) const { return cookie == 53 ? 32 : 0; }
+} gAllocations;
 COPY_METHOD
 
 struct NVRMNVDAFramebuffer {
-    struct CopyScanout { Surface *surface = nullptr; void *kva = nullptr; unsigned pitch = 16, width = 2, height = 2; };
+    struct CopyScanout {
+        Surface *surface = nullptr;
+        void *kva = nullptr;
+        unsigned pitch = 16, width = 2, height = 2;
+        NvKmsKapiMemory *quarantinedSource = nullptr;
+    };
     Surface home, owned[3];
     CopyScanout fCopyScanout[3];
     Surface *fSurf = &home, *fFrontSurf = fSurf;
@@ -78,6 +90,7 @@ struct NVRMNVDAFramebuffer {
     bool fSubmissionSeen = false, fSubmissionFaulted = false;
     bool fModeSet = true, fConsoleAperture = false, fPowerOn = true, fHeadSlept = false, fDpyLost = false;
     bool pending = false, statusAvailable = true, canAllocate = true, accept = true;
+    IOReturn gpuCopyResult = kIOReturnSuccess;
     unsigned fHead, fDisplay = 5, fMode = 9;
     unsigned fW = 2, fH = 2, fPitch = 16, fRasterW = 4, fRasterH = 4;
     unsigned fTransform = 0, fCurTransform = 0, fServerFresh = 0, fCopyPresents = 0;
@@ -118,9 +131,20 @@ struct NVRMNVDAFramebuffer {
     }
     bool copyPresentReady();
     bool copyFlipPending();
+    IOReturn copyVramToScanout(CopyScanout &back, NvKmsKapiMemory *source, UInt64 length) {
+        assert(source && length == 32 && !back.quarantinedSource);
+        if (gpuCopyResult == kIOReturnSuccess) back.surface->words[0] = source->pixel;
+        if (gpuCopyResult == kIOReturnIOError) {
+            back.quarantinedSource = source;
+            gCopyPresentGpuFaulted = true;
+        }
+        return gpuCopyResult;
+    }
+    void copyPixelsToScanout(CopyScanout &, const NVRMCopyPresentRequest &);
     IOReturn submitCopiedScanout(CopyScanout &);
     static void copyPresentFire(thread_call_param_t, thread_call_param_t);
-    IOReturn presentCopiedFrame(const NVRMCopyPresentRequest &request);
+    IOReturn presentCopiedFrame(const NVRMCopyPresentRequest &request,
+                               NvKmsKapiMemory *source = nullptr, UInt64 cookie = 0);
 };
 PRODUCTION_METHOD
 
@@ -201,7 +225,29 @@ int main() {
     queued.fDpyLost = true;
     queued.copyPresentFire(&queued, nullptr);
     assert(queued.commits == 3 && queued.fFrontSurf == last && !queued.fCopyQueued);
-    std::puts("PASS: independent heads, latch safety, pitch, l10r, queued replacement, bounded retry and disconnection");
+    NVRMNVDAFramebuffer gpu(0);
+    NvKmsKapiMemory source;
+    auto gpuFrame = frame;
+    gpuFrame.pitch = 16;
+    gpuFrame.pixels = nullptr;
+    assert(gpu.presentCopiedFrame(gpuFrame, &source, 53) == kIOReturnUnsupported);
+    gCopyPresentGpu = 1;
+    assert(gpu.presentCopiedFrame(gpuFrame, &source, 0) == kIOReturnUnsupported);
+    assert(gpu.presentCopiedFrame(frame, &source, 53) == kIOReturnUnsupported);
+    assert(!gpu.preparations);
+    gpu.gpuCopyResult = kIOReturnUnsupported;
+    assert(gpu.presentCopiedFrame(gpuFrame, &source, 53) == kIOReturnUnsupported && !gpu.commits);
+    gpu.gpuCopyResult = kIOReturnSuccess;
+    assert(gpu.presentCopiedFrame(gpuFrame, &source, 53) == kIOReturnSuccess);
+    assert(gpu.firstPixelAtCommit == source.pixel);
+    gpu.pending = false;
+    gpu.gpuCopyResult = kIOReturnIOError;
+    assert(gpu.presentCopiedFrame(gpuFrame, &source, 53) == kIOReturnIOError && gpu.commits == 1);
+    assert(gpu.fCopyScanout[1].quarantinedSource == &source);
+    assert(gpu.presentCopiedFrame(gpuFrame, &source, 53) == kIOReturnUnsupported);
+    assert(gpu.presentCopiedFrame(frame) == kIOReturnSuccess && gpu.commits == 2);
+    assert(gpu.fFrontSurf == gpu.fCopyScanout[2].surface);
+    std::puts("PASS: independent heads, latch safety, pitch, l10r, playback queue and direct copy fallback/quarantine");
 }
 '''
 
@@ -211,6 +257,7 @@ methods = (
     "IOReturn NVRMNVDAFramebuffer::submitCopiedScanout(",
     "void NVRMNVDAFramebuffer::copyPresentFire(",
     "IOReturn NVRMNVDAFramebuffer::presentCopiedFrame(",
+    "void NVRMNVDAFramebuffer::copyPixelsToScanout(",
 )
 assert "if (!deferLatch) fCopyQueued = nullptr;" in method(FB, "NvBool NVRMNVDAFramebuffer::submitConfig(")
 assert "&fCopyPresentCall" in method(FB, "void NVRMNVDAFramebuffer::stop(")

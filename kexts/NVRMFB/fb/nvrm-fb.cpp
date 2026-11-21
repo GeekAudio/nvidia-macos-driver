@@ -86,6 +86,11 @@ extern "C" {
 #include <libkern/OSAtomic.h>
 #include "nvrm_vram_abi.h"
 #include "../../NVRM/nvrm_copy_present.h"
+#define NVRM_SS_KERNEL_ABI 1
+#include "../../NVRM/nvrm_surfshare_abi.h"
+#ifndef NVRM_COPY_GPU_DEFAULT
+#define NVRM_COPY_GPU_DEFAULT 0
+#endif
 #include "nvrm-dvi-modes.h"
 
 // Surfaces may use half of a resizable BAR1 (>= 4 GB) and three quarters of a smaller one. WAS: a fixed 192 MB below
@@ -577,6 +582,7 @@ class NVRMNVDAFramebuffer : public IOFramebuffer {
         void *kva;
         NvU32 width, height, pitch;
         NvU64 barBytes;
+        struct NvKmsKapiMemory *quarantinedSource;
     };
     CopyScanout fCopyScanout[3] = {};
     struct NvKmsKapiSurface *fCopyRetiring = nullptr;
@@ -589,9 +595,12 @@ class NVRMNVDAFramebuffer : public IOFramebuffer {
     void teardownCopyScanout(CopyScanout &slot);
     bool copyFlipPending();
     bool copyPresentReady();
+    IOReturn copyVramToScanout(CopyScanout &back, struct NvKmsKapiMemory *source, UInt64 length);
+    void copyPixelsToScanout(CopyScanout &back, const NVRMCopyPresentRequest &request);
     IOReturn submitCopiedScanout(CopyScanout &back);
     static void copyPresentFire(thread_call_param_t, thread_call_param_t);
-    IOReturn presentCopiedFrame(const NVRMCopyPresentRequest &request);
+    IOReturn presentCopiedFrame(const NVRMCopyPresentRequest &request,
+                               struct NvKmsKapiMemory *source = nullptr, UInt64 cookie = 0);
     NVRMHeadGateState fPrimaryGate;
     static inline volatile SInt32 sFlipLatched[8] = {};
     bool flipToMemory(struct NvKmsKapiMemory *mem, unsigned w, unsigned h, unsigned pitch, int *rcOut, bool pure = false, UInt64 cookie = 0);
@@ -3173,7 +3182,10 @@ bool NVRMNVDAFramebuffer::start(IOService *provider)
         NVRMDisplayGate gate; if (gate.valid() && fOwnsHead) { gHeadsTaken &= ~(1u << fHead); fOwnsHead = false; }
         FBLOG("super::start failed after kapiInit succeeded"); return false;
     }
-    if (fCopyPresent) fCopyPresentCall = nvrmfbCall(copyPresentFire, this);
+    if (fCopyPresent) {
+        fCopyPresentCall = nvrmfbCall(copyPresentFire, this);
+        if (NVRM_COPY_GPU_DEFAULT) setProperty(NVRM_COPY_PRESENT_VRAM_PROPERTY, kOSBooleanTrue);
+    }
     fSleepTap = addFramebufferNotification(&NVRMNVDAFramebuffer::sleepTap, this, nullptr);
     if (!fSleepTap) FBLOG("sleep/wake notification tap not registered - a wake after dark wakes may leave the accelerator off");
     fVblTimer = nvrmfbCall(vblFire, this);
@@ -3258,7 +3270,7 @@ void NVRMNVDAFramebuffer::stop(IOService *provider)
                 rmGpuReady() && (!fSubmissionSeen || waitFlipDone(0))) {
                 for (auto &slot : fCopyScanout) {
                     // This head may still be scanning the accepted front after IOService stops.
-                    if (slot.surface != fFrontSurf) teardownCopyScanout(slot);
+                    if (slot.surface != fFrontSurf && !slot.quarantinedSource) teardownCopyScanout(slot);
                 }
             }
         }
@@ -4228,6 +4240,19 @@ static volatile SInt64 gCntGrant, gCntGrantBytes, gCntRelease, gCntReleaseBytes;
 static SInt64 gCopyPresentLatched, gCopyPresentBusy, gCopyPresentFailed;
 static SInt64 gCopyPresentQueued, gCopyPresentDeferred;
 static SInt64 gCopyPresentLatchedHead[8];
+// This path is independently selectable for a same-boot comparison.
+static int gCopyPresentGpu = NVRM_COPY_GPU_DEFAULT;
+static bool gCopyPresentGpuFaulted;
+static SInt64 gCopyPresentGpuCompleted, gCopyPresentGpuQuarantined;
+static SInt64 gCopyPresentGpuUsec, gCopyPresentGpuHead[8];
+SYSCTL_INT(_debug, OID_AUTO, nvrmfb_copy_present_gpu, CTLFLAG_RW | CTLFLAG_LOCKED,
+           &gCopyPresentGpu, 0, "copy pitch-matched compositor frames directly into the private scanout");
+SYSCTL_QUAD(_debug, OID_AUTO, nvrmfb_copy_present_gpu_completed, CTLFLAG_RD | CTLFLAG_LOCKED,
+            &gCopyPresentGpuCompleted, "direct compositor copies completed by the copy engine");
+SYSCTL_QUAD(_debug, OID_AUTO, nvrmfb_copy_present_gpu_quarantined, CTLFLAG_RD | CTLFLAG_LOCKED,
+            &gCopyPresentGpuQuarantined, "direct copies with uncertain completion; buffers remain pinned");
+SYSCTL_QUAD(_debug, OID_AUTO, nvrmfb_copy_present_gpu_us, CTLFLAG_RD | CTLFLAG_LOCKED,
+            &gCopyPresentGpuUsec, "microseconds spent on successful direct compositor copies");
 SYSCTL_QUAD(_debug, OID_AUTO, nvrmfb_vram_grants,        CTLFLAG_RD | CTLFLAG_LOCKED, (SInt64 *)&gCntGrant,        "vramGrant successes");
 SYSCTL_QUAD(_debug, OID_AUTO, nvrmfb_vram_grant_bytes,   CTLFLAG_RD | CTLFLAG_LOCKED, (SInt64 *)&gCntGrantBytes,   "bytes granted");
 SYSCTL_QUAD(_debug, OID_AUTO, nvrmfb_vram_releases,      CTLFLAG_RD | CTLFLAG_LOCKED, (SInt64 *)&gCntRelease,      "vramRelease calls");
@@ -4246,11 +4271,14 @@ SYSCTL_QUAD(_debug, OID_AUTO, nvrmfb_copy_present_queued, CTLFLAG_RD | CTLFLAG_L
             "frames copied while the previous scanout was still pending");
 SYSCTL_QUAD(_debug, OID_AUTO, nvrmfb_copy_present_deferred, CTLFLAG_RD | CTLFLAG_LOCKED, &gCopyPresentDeferred,
             "buffered frames submitted by the retry after the previous scanout latched");
-#define COPY_LATCH_COUNT(n) SYSCTL_QUAD(_debug, OID_AUTO, nvrmfb_copy_present_latched_h##n, \
-    CTLFLAG_RD | CTLFLAG_LOCKED, &gCopyPresentLatchedHead[n], "buffered copy flips proven complete on this head")
-COPY_LATCH_COUNT(0); COPY_LATCH_COUNT(1); COPY_LATCH_COUNT(2); COPY_LATCH_COUNT(3);
-COPY_LATCH_COUNT(4); COPY_LATCH_COUNT(5); COPY_LATCH_COUNT(6); COPY_LATCH_COUNT(7);
-#undef COPY_LATCH_COUNT
+#define COPY_HEAD_COUNTERS(n) \
+    SYSCTL_QUAD(_debug, OID_AUTO, nvrmfb_copy_present_latched_h##n, CTLFLAG_RD | CTLFLAG_LOCKED, \
+                &gCopyPresentLatchedHead[n], "buffered copy flips proven complete on this head"); \
+    SYSCTL_QUAD(_debug, OID_AUTO, nvrmfb_copy_present_gpu_h##n, CTLFLAG_RD | CTLFLAG_LOCKED, \
+                &gCopyPresentGpuHead[n], "direct compositor copies completed for this head")
+COPY_HEAD_COUNTERS(0); COPY_HEAD_COUNTERS(1); COPY_HEAD_COUNTERS(2); COPY_HEAD_COUNTERS(3);
+COPY_HEAD_COUNTERS(4); COPY_HEAD_COUNTERS(5); COPY_HEAD_COUNTERS(6); COPY_HEAD_COUNTERS(7);
+#undef COPY_HEAD_COUNTERS
 SYSCTL_INT(_debug, OID_AUTO, nvrmfb_vram_display_aware, CTLFLAG_RW | CTLFLAG_LOCKED, &gVramDisplayAware, 0, "1 = the accel budget reserves the BAR1 the display holds; 0 = the old fixed fraction");
 static struct NVRMVramRequest gVramTest[256]; static int gVramTestN; static int gVramTestMode;
 static int nvrmfb_vramtest_sysctl SYSCTL_HANDLER_ARGS
@@ -4321,13 +4349,17 @@ static void nvrmfbInstallSysctl(void)
     sysctl_register_oid(&sysctl__debug_nvrmfb_copy_present_failed);
     sysctl_register_oid(&sysctl__debug_nvrmfb_copy_present_queued);
     sysctl_register_oid(&sysctl__debug_nvrmfb_copy_present_deferred);
-    struct sysctl_oid *latchCounters[] = {
-        &sysctl__debug_nvrmfb_copy_present_latched_h0, &sysctl__debug_nvrmfb_copy_present_latched_h1,
-        &sysctl__debug_nvrmfb_copy_present_latched_h2, &sysctl__debug_nvrmfb_copy_present_latched_h3,
-        &sysctl__debug_nvrmfb_copy_present_latched_h4, &sysctl__debug_nvrmfb_copy_present_latched_h5,
-        &sysctl__debug_nvrmfb_copy_present_latched_h6, &sysctl__debug_nvrmfb_copy_present_latched_h7,
+    sysctl_register_oid(&sysctl__debug_nvrmfb_copy_present_gpu);
+    sysctl_register_oid(&sysctl__debug_nvrmfb_copy_present_gpu_completed);
+    sysctl_register_oid(&sysctl__debug_nvrmfb_copy_present_gpu_quarantined);
+    sysctl_register_oid(&sysctl__debug_nvrmfb_copy_present_gpu_us);
+#define COPY_HEAD_OIDS(n) &sysctl__debug_nvrmfb_copy_present_latched_h##n, &sysctl__debug_nvrmfb_copy_present_gpu_h##n
+    struct sysctl_oid *headCounters[] = {
+        COPY_HEAD_OIDS(0), COPY_HEAD_OIDS(1), COPY_HEAD_OIDS(2), COPY_HEAD_OIDS(3),
+        COPY_HEAD_OIDS(4), COPY_HEAD_OIDS(5), COPY_HEAD_OIDS(6), COPY_HEAD_OIDS(7),
     };
-    for (auto *oid : latchCounters) sysctl_register_oid(oid);
+#undef COPY_HEAD_OIDS
+    for (auto *oid : headCounters) sysctl_register_oid(oid);
 }
 
 bool NVRMNVDAFramebuffer::vramGrant(struct NVRMVramRequest *r)
@@ -4528,6 +4560,15 @@ IOReturn NVRMNVDAFramebuffer::callPlatformFunction(const OSSymbol *functionName,
         if (!request || request->version != NVRM_COPY_PRESENT_ABI_VERSION) return kIOReturnBadArgument;
         return presentCopiedFrame(*request);
     }
+    if (functionName && functionName->isEqualTo(NVRM_COPY_PRESENT_VRAM_FN)) {
+        const auto *vram = static_cast<const NVRMCopyVramPresentRequest *>(param1);
+        if (!vram || vram->version != NVRM_COPY_PRESENT_ABI_VERSION || !vram->sourceMemory)
+            return kIOReturnBadArgument;
+        const NVRMCopyPresentRequest request = {vram->version, NV_IOP_FMT_BGRA, vram->width,
+                                               vram->height, vram->pitch, nullptr};
+        return presentCopiedFrame(request, static_cast<struct NvKmsKapiMemory *>(vram->sourceMemory),
+                                  vram->allocationCookie);
+    }
     if (functionName && functionName->isEqualTo("NVRMGpuPower")) {   // from NVRM: 0 standby, 1 resumed, 2 lost
         const uintptr_t st = (uintptr_t)param1;
         if (st == 0) {
@@ -4645,7 +4686,7 @@ bool NVRMNVDAFramebuffer::prepareCopyScanout(CopyScanout &slot)
             params.height = fH;
             params.format = NvKmsSurfaceMemoryFormatX8R8G8B8;
             if (auto *surface = fKms->createSurface(fDev, &params)) {
-                slot = {memory, surface, kva, fW, fH, fPitch, video ? size : 0};
+                slot = {memory, surface, kva, fW, fH, fPitch, video ? size : 0, nullptr};
                 if (slot.barBytes) OSAddAtomic64((SInt64)slot.barBytes, &gVramDisplayBytes);
                 FBLOG("buffered copy head %u: %ux%u pitch %u scanout allocated in %s memory",
                       fHead, fW, fH, fPitch, video ? "video" : "system");
@@ -4756,7 +4797,42 @@ void NVRMNVDAFramebuffer::copyPresentFire(thread_call_param_t p0, thread_call_pa
         OSAddAtomic64(1, &gCopyPresentDeferred);
 }
 
-IOReturn NVRMNVDAFramebuffer::presentCopiedFrame(const NVRMCopyPresentRequest &request)
+IOReturn NVRMNVDAFramebuffer::copyVramToScanout(CopyScanout &back, struct NvKmsKapiMemory *source, UInt64 length)
+{
+    const uint64_t begin = mach_absolute_time();
+    IOService *rm = getProvider();
+    while (rm && strcmp(rm->getMetaClass()->getClassName(), "NVRM") != 0) rm = rm->getProvider();
+    const OSSymbol *fn = OSSymbol::withCStringNoCopy(NVRM_SS_FN_COPY_MEMORY);
+    if (!rm || !fn) { OSSafeReleaseNULL(fn); return kIOReturnUnsupported; }
+    // The source cookie was checked under the same gate that serializes its
+    // release. Keep a separate RM reference if completion is uncertain.
+    auto *pin = fKms->dupMemory(fDev, fDev, source);
+    if (!pin) { OSSafeReleaseNULL(fn); return kIOReturnUnsupported; }
+    NVRMSurfCopyMemory request = {NVRM_SS_RM_VERSION, NVRM_SS_COPY_UNAVAILABLE, fDev, pin, back.memory, length};
+    const IOReturn status = rm->callPlatformFunction(fn, false, &request, nullptr, nullptr, nullptr);
+    OSSafeReleaseNULL(fn);
+    if (request.result == NVRM_SS_COPY_UNCERTAIN) {
+        // No CPU fallback or scanout may touch this destination. Keep both
+        // references through reboot and stop attempting further engine copies.
+        back.quarantinedSource = pin;
+        gCopyPresentGpuFaulted = true;
+        OSAddAtomic64(1, &gCopyPresentGpuQuarantined);
+        FBLOG("direct present copy completion unknown on head %u; source and scanout retained", fHead);
+        return kIOReturnIOError;
+    }
+    fKms->freeMemory(fDev, pin);
+    if (request.result != NVRM_SS_COPY_COMPLETE)
+        return status == kIOReturnNotReady ? status : kIOReturnUnsupported;
+    uint64_t elapsed = 0;
+    absolutetime_to_nanoseconds(mach_absolute_time() - begin, &elapsed);
+    OSAddAtomic64(static_cast<SInt64>(elapsed / 1000), &gCopyPresentGpuUsec);
+    OSAddAtomic64(1, &gCopyPresentGpuHead[fHead]);
+    OSAddAtomic64(1, &gCopyPresentGpuCompleted);
+    return kIOReturnSuccess;
+}
+
+IOReturn NVRMNVDAFramebuffer::presentCopiedFrame(const NVRMCopyPresentRequest &request,
+                                                struct NvKmsKapiMemory *source, UInt64 cookie)
 {
     if (!fCopyPresent) return kIOReturnUnsupported;
     NVRMDisplayGate gate;
@@ -4764,7 +4840,7 @@ IOReturn NVRMNVDAFramebuffer::presentCopiedFrame(const NVRMCopyPresentRequest &r
     NVRMHeadGate primary(startLock(), fPrimaryGate, false);
     if (!primary.valid() || !copyPresentReady()) return kIOReturnNotReady;
     nvrmfbInstallSysctl();
-    if (!request.pixels || (reinterpret_cast<uintptr_t>(request.pixels) & 3) ||
+    if ((!source && (!request.pixels || (reinterpret_cast<uintptr_t>(request.pixels) & 3))) ||
         (request.format != NV_IOP_FMT_BGRA && request.format != NV_IOP_FMT_L10R) ||
         !request.width || !request.height || request.width != fW || request.height != fH ||
         fW > 16384 || fH > 16384 || !fRasterW || !fRasterH ||
@@ -4773,6 +4849,10 @@ IOReturn NVRMNVDAFramebuffer::presentCopiedFrame(const NVRMCopyPresentRequest &r
         OSAddAtomic64(1, &gCopyPresentFailed);
         return kIOReturnBadArgument;
     }
+    const UInt64 length = (UInt64)request.pitch * request.height;
+    if (source && (!__atomic_load_n(&gCopyPresentGpu, __ATOMIC_RELAXED) || gCopyPresentGpuFaulted ||
+                   request.pitch != fPitch || length > gAllocations.size(source, cookie)))
+        return kIOReturnUnsupported;
     const bool pending = copyFlipPending();
     if (pending && (!fCopyPresentCall || !fCopyAwaitingLatch)) {
         OSAddAtomic64(1, &gCopyPresentBusy);
@@ -4783,6 +4863,7 @@ IOReturn NVRMNVDAFramebuffer::presentCopiedFrame(const NVRMCopyPresentRequest &r
     CopyScanout *back = fCopyQueued;
     if (!back) {
         for (auto &slot : fCopyScanout) {
+            if (slot.quarantinedSource) continue;
             if (slot.surface && (slot.surface == fFrontSurf || slot.surface == fCopyRetiring)) continue;
             back = &slot;
             break;
@@ -4793,14 +4874,39 @@ IOReturn NVRMNVDAFramebuffer::presentCopiedFrame(const NVRMCopyPresentRequest &r
         OSAddAtomic64(1, &gCopyPresentFailed);
         return kIOReturnNoMemory;
     }
-    auto *destination = static_cast<volatile unsigned *>(back->kva);
+    if (source) {
+        const IOReturn copied = copyVramToScanout(*back, source, length);
+        if (copied != kIOReturnSuccess || !copyPresentReady()) {
+            if (back == fCopyQueued && (back->quarantinedSource || copied == kIOReturnSuccess))
+                fCopyQueued = nullptr;
+            return copied == kIOReturnSuccess ? kIOReturnNotReady : copied;
+        }
+    } else {
+        copyPixelsToScanout(*back, request);
+    }
+    if (fCopyQueued) OSAddAtomic64(1, &gCopyPresentBusy);
+    if (pending && copyFlipPending()) {
+        // Only the private scanout is retained after the caller returns.
+        fCopyQueued = back;
+        fCopyQueuedDeadline = mach_absolute_time() + vblPeriodAbs();
+        scheduleCall(fCopyPresentCall, 0);
+        OSAddAtomic64(1, &gCopyPresentQueued);
+        return kIOReturnBusy;
+    }
+    fCopyQueued = nullptr;
+    return submitCopiedScanout(*back);
+}
+
+void NVRMNVDAFramebuffer::copyPixelsToScanout(CopyScanout &back, const NVRMCopyPresentRequest &request)
+{
+    auto *destination = static_cast<volatile unsigned *>(back.kva);
     const size_t rowBytes = (size_t)request.width * sizeof(unsigned);
-    if (request.format == NV_IOP_FMT_BGRA && request.pitch == rowBytes && back->pitch == rowBytes) {
+    if (request.format == NV_IOP_FMT_BGRA && request.pitch == rowBytes && back.pitch == rowBytes) {
         nvu_copy(const_cast<unsigned *>(destination), const_cast<const unsigned *>(request.pixels),
                  rowBytes * request.height);
     } else {
         for (unsigned y = 0; y < request.height; ++y) {
-            auto *dst = destination + (size_t)y * (back->pitch / 4);
+            auto *dst = destination + (size_t)y * (back.pitch / 4);
             const auto *src = request.pixels + (size_t)y * (request.pitch / 4);
             if (request.format == NV_IOP_FMT_BGRA)
                 nvu_copy(const_cast<unsigned *>(dst), const_cast<const unsigned *>(src), rowBytes);
@@ -4809,18 +4915,6 @@ IOReturn NVRMNVDAFramebuffer::presentCopiedFrame(const NVRMCopyPresentRequest &r
         }
     }
     __asm__ __volatile__("sfence" ::: "memory");
-    if (fCopyQueued) OSAddAtomic64(1, &gCopyPresentBusy);
-    if (pending && copyFlipPending()) {
-        // The caller can reuse its source immediately. Only copied pixels are
-        // retained, and a newer frame replaces this one if the flip is still busy.
-        fCopyQueued = back;
-        fCopyQueuedDeadline = mach_absolute_time() + vblPeriodAbs();
-        scheduleCall(fCopyPresentCall, 0);
-        OSAddAtomic64(1, &gCopyPresentQueued);
-        return kIOReturnBusy; // No KMS submission yet; the worker accounts for it.
-    }
-    fCopyQueued = nullptr;
-    return submitCopiedScanout(*back);
 }
 
 bool NVRMNVDAFramebuffer::flipToMemory(struct NvKmsKapiMemory *mem, unsigned w, unsigned h,

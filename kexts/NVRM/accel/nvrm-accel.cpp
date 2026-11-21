@@ -1428,6 +1428,7 @@ bool NVDisplayPipe::isTransactionComplete(IOAccelDisplayPipeTransaction2 *)
 
 static void nvAccelSurfScanoutSync(IOSurface *s);
 static bool nvAccelSurfCopyReady(IOSurface *s, unsigned head, bool strict);
+static IOReturn nvAccelPresentVramCopy(NVAccel *a, IOService *fb, IOSurface *s);
 static bool nvAccelIopFlip(IOService *fb, unsigned head, IOSurface *s, void *pipe);
 static bool nvSurfWaitReady(unsigned int id);
 static void nvAccelIopHome(IOService *fb, unsigned head);
@@ -1481,6 +1482,17 @@ IOReturn NVDisplayPipe::performTransaction(IOAccelDisplayPipeTransaction2 *txn)
         // Such a frame now keeps the previous picture on the panel instead.
         const bool gpuReady = nvSurfWaitReady(s->getSurfaceID());
         if ((intelFrame.active() || buffered) && !gpuReady) return kIOReturnSuccess;
+        if (buffered && fb->getProperty(NVRM_COPY_PRESENT_VRAM_PROPERTY) == kOSBooleanTrue) {
+            const IOReturn result = nvAccelPresentVramCopy(a, fb, s);
+            if (result != kIOReturnUnsupported) {
+                if (result == kIOReturnSuccess) {
+                    OSAddAtomic64(1, &gCntIopSrcSurf);
+                    OSAddAtomic64(1, &gCntIopOk);
+                    OSAddAtomic64(1, &gCntIopOkHead[head]);
+                }
+                return kIOReturnSuccess;
+            }
+        }
         const int directMode = __atomic_load_n(&gIopDirect, __ATOMIC_ACQUIRE);
         if (intelFrame.active() && (directMode == 1 || directMode == 2)) {
             const uint64_t start = mach_absolute_time();
@@ -2540,6 +2552,38 @@ static void nvAccelSurfScanoutSync(IOSurface *s)
 // page-off fails. Legacy scanout holds at most four frames per head. Buffered
 // presentation can keep the prior complete frame until the new copy is ready.
 static unsigned gIopCopyHeld[kNvMaxFB];
+static IOReturn nvAccelPresentVramCopy(NVAccel *a, IOService *fb, IOSurface *s)
+{
+    const auto width = s->getWidth(), height = s->getHeight(), pitch = s->getBytesPerRow();
+    const unsigned id = s->getSurfaceID();
+    if (s->getPixelFormat() != NV_IOP_FMT_BGRA || !width || !height ||
+        width > 16384 || height > 16384 || pitch < width * 4 || pitch > 16384ull * 8 || (pitch & 3) ||
+        !nvSVPend(id, 2) || !nvFamLock(a, true)) return kIOReturnUnsupported;
+    void *cache = _ZN22IOGraphicsAccelerator223deviceCacheForIOSurfaceEP9IOSurfacej(a, s, 0);
+    OSObject *object = cache ? *reinterpret_cast<OSObject *volatile *>(static_cast<unsigned char *>(cache) + 0x20) : nullptr;
+    auto *resource = OSDynamicCast(NVResource, object);
+    auto *memory = resource ? nvres_vidmem(resource) : nullptr;
+    const volatile unsigned short *valid = resource ?
+        *reinterpret_cast<unsigned short *volatile *>(reinterpret_cast<volatile unsigned char *>(resource) + 0x30) : nullptr;
+    NVRMCopyVramPresentRequest request = {NVRM_COPY_PRESENT_ABI_VERSION, (unsigned)width, (unsigned)height,
+                                           (unsigned)pitch, nullptr, 0};
+    if (memory && memory->fRmHandle && !memory->fScanout && memory->fBytes >= pitch * height &&
+        valid && !(valid[0] & 1u) && (valid[6] & 1u) && nvAccelResPluginWrote(resource)) {
+        request.sourceMemory = memory->fRmHandle;
+        request.allocationCookie = memory->fAllocationCookie;
+    }
+    if (cache) static_cast<OSObject *>(cache)->release();
+    nvFamUnlock(a);
+    if (!request.sourceMemory || !request.allocationCookie) return kIOReturnUnsupported;
+    // The framebuffer validates the cookie before using the pointer. Drop the
+    // family lock before entering the framebuffer's allocation and display gate.
+    const OSSymbol *present = OSSymbol::withCStringNoCopy(NVRM_COPY_PRESENT_VRAM_FN);
+    if (!present) return kIOReturnUnsupported;
+    const IOReturn result = fb->callPlatformFunction(present, false, &request, nullptr, nullptr, nullptr);
+    present->release();
+    return result;
+}
+
 static bool nvAccelSurfCopyReady(IOSurface *s, unsigned head, bool strict)
 {
     NVAccel *a = NVAccel::gAccel;

@@ -21,6 +21,8 @@
 
 NV_STATUS nvrm_ce_copy_to_pages(nv_state_t *nv, NvU32 hClient, NvU32 hMemory, const NvU64 *pages, NvU64 pageCount,
                                 NvU64 length, NvU64 *pUsec);
+NV_STATUS nvrm_ce_copy_memory(nv_state_t *nv, NvU32 hClient, NvU32 source, NvU32 destination,
+                             NvU64 length, NvBool *issued);
 
 volatile NvU64 nvrm_pageoff_last_runs, nvrm_pageoff_last_pages, nvrm_pageoff_coalesced, nvrm_pageoff_perpage;
 
@@ -132,4 +134,58 @@ NV_STATUS nvrm_ce_copy_to_pages(nv_state_t *nv, NvU32 hClient, NvU32 hMemory, co
     threadStateFree(&threadState, THREAD_STATE_FLAGS_NONE);
     NV_EXIT_RM_RUNTIME(sp, fp);
     return st;
+}
+
+static NV_STATUS _nvrmCopyMemoryLocked(OBJGPU *gpu, NvU32 hClient, NvU32 source, NvU32 destination,
+                                       NvU64 length, NvBool *issued)
+{
+    MemoryManager *manager = GPU_GET_MEMORY_MANAGER(gpu);
+    RsClient *client = NULL;
+    Memory *src = NULL, *dst = NULL;
+    if (!manager) return NV_ERR_INVALID_STATE;
+    NV_STATUS status = serverGetClientUnderLock(&g_resServ, hClient, &client);
+    if (status != NV_OK) return status;
+    status = memGetByHandle(client, source, &src);
+    if (status != NV_OK) return status;
+    status = memGetByHandle(client, destination, &dst);
+    if (status != NV_OK) return status;
+    if (src->pMemDesc == dst->pMemDesc || length > memdescGetSize(src->pMemDesc) ||
+        length > memdescGetSize(dst->pMemDesc)) return NV_ERR_INVALID_ARGUMENT;
+    if (!manager->pCeUtils) {
+        status = memmgrInitCeUtils(manager, NV_FALSE, NV_TRUE);
+        if (status != NV_OK) return status;
+    }
+    CEUTILS_MEMCOPY_PARAMS copy = {0};
+    copy.pSrcMemDesc = src->pMemDesc;
+    copy.pDstMemDesc = dst->pMemDesc;
+    copy.length = length;
+    // Even a failed CE submission may have emitted part of a multi-run copy.
+    // The caller retains both allocations unless the synchronous copy finished.
+    *issued = NV_TRUE;
+    return ceutilsMemcopy(manager->pCeUtils, &copy);
+}
+
+NV_STATUS nvrm_ce_copy_memory(nv_state_t *nv, NvU32 hClient, NvU32 source, NvU32 destination,
+                             NvU64 length, NvBool *issued)
+{
+    THREAD_STATE_NODE threadState;
+    NV_STATUS status;
+    void *fp;
+    nvidia_stack_t *sp = NULL;
+    OBJGPU *gpu = NV_GET_NV_PRIV_PGPU(nv);
+    *issued = NV_FALSE;
+    if (!gpu || !source || !destination || source == destination || !length)
+        return NV_ERR_INVALID_ARGUMENT;
+    NV_ENTER_RM_RUNTIME(sp, fp);
+    threadStateInit(&threadState, THREAD_STATE_FLAGS_NONE);
+    if ((status = rmapiLockAcquire(API_LOCK_FLAGS_NONE, RM_LOCK_MODULES_OSAPI)) == NV_OK) {
+        if ((status = rmDeviceGpuLocksAcquire(gpu, GPUS_LOCK_FLAGS_NONE, RM_LOCK_MODULES_OSAPI)) == NV_OK) {
+            status = _nvrmCopyMemoryLocked(gpu, hClient, source, destination, length, issued);
+            rmDeviceGpuLocksRelease(gpu, GPUS_LOCK_FLAGS_NONE, NULL);
+        }
+        rmapiLockRelease();
+    }
+    threadStateFree(&threadState, THREAD_STATE_FLAGS_NONE);
+    NV_EXIT_RM_RUNTIME(sp, fp);
+    return status;
 }

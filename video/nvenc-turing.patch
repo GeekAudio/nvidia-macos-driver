@@ -11,8 +11,46 @@ index ac6ebe2..e5d108e 100644
  }
  static int decode_signed_subexp_with_ref(Br *r, int low, int high, int ref) { return decode_unsigned_subexp_with_ref(r, high - low, ref - low) + low; }
  
+diff --git a/src/channel.h b/src/channel.h
+index f40fa95..8c62650 100644
+--- a/src/channel.h
++++ b/src/channel.h
+@@ -3,6 +3,8 @@
+ // channel (engineType), bind, object, schedule, work-submit token.
+ #pragma once
+ #include "rm.h"
++#include <stdint.h>
++#include <time.h>
+ 
+ typedef struct {
+     Rm *rm;
+@@ -26,3 +28,24 @@ size_t chan_push_used(Chan *c);                // bytes of push buffer in use
+ NvU32 chan_error(Chan *c);                     // RM's error notifier status (0 = none)
+ // the channel's last MMU fault (NV906F_CTRL_CMD_GET_MMU_FAULT_INFO; RM clears it on read)
+ NV_STATUS chan_fault(Chan *c, NvU64 *addr, NvU32 *type, char str[32]);
++
++// Preserve the one-second completion deadline and the immediate fast path.
++// On GA10x, yield the CPU in short intervals while the hardware owns the job.
++static inline void nvdec_wait_ampere(volatile uint32_t *completion, uint32_t expected, double submit_ms)
++{
++    if (*completion == expected) return;
++    const uint64_t start = (uint64_t)(submit_ms * 1000000.0);
++    const uint64_t deadline = start + 1000000000ULL;
++    const uint64_t spin_until = start + 50000ULL;
++    while (*completion != expected) {
++        const uint64_t now = clock_gettime_nsec_np(CLOCK_MONOTONIC);
++        if (now >= deadline) return;
++        if (now < spin_until) {
++            __builtin_ia32_pause();
++            continue;
++        }
++        const uint64_t remaining = deadline - now;
++        const struct timespec delay = { .tv_nsec = (long)(remaining < 50000ULL ? remaining : 50000ULL) };
++        nanosleep(&delay, NULL);
++    }
++}
 diff --git a/src/dec.c b/src/dec.c
-index b47d533..6d53949 100644
+index b47d533..1641fd0 100644
 --- a/src/dec.c
 +++ b/src/dec.c
 @@ -7,9 +7,76 @@
@@ -92,6 +130,18 @@ index b47d533..6d53949 100644
  static NvU32 hi(NvU64 a) { return (NvU32)(a >> 8); }
  static double now_ms(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec * 1e3 + t.tv_nsec / 1e6; }
  
+@@ -305,7 +372,10 @@ static int decode_pending(H264Dec *d)
+               DRF_DEF(C9B0, _SEMAPHORE_D, _OPERATION, _RELEASE) | DRF_DEF(C9B0, _SEMAPHORE_D, _PAYLOAD_SIZE, _32BIT));
+     const double t0 = now_ms();
+     chan_submit(c);
+-    while (sv[0] != val && now_ms() - t0 < 1000) { }
++    if (rm_class(d->rm, RM_CLS_NVDEC) == 0xc7b0)
++        nvdec_wait_ampere(sv, val, t0);
++    else
++        while (sv[0] != val && now_ms() - t0 < 1000) { }
+     d->engine_ms = now_ms() - t0;
+     if (sv[0] != val) { fprintf(stderr, "dec: no completion (error notifier 0x%x)\n", chan_error(c)); return -1; }
+     const nvdec_status_s *st = d->status.cpu;
 diff --git a/src/h264parse.c b/src/h264parse.c
 index 5df4ea0..b23b966 100644
 --- a/src/h264parse.c
@@ -132,7 +182,7 @@ index 5df4ea0..b23b966 100644
      if (!s.bitstream_restriction_flag) s.max_dec_frame_buffering = s.max_num_reorder_frames = 16;
      s.valid = true;
 diff --git a/src/hevcdec.c b/src/hevcdec.c
-index 7dc999d..9ad0574 100644
+index 7dc999d..a8a0d79 100644
 --- a/src/hevcdec.c
 +++ b/src/hevcdec.c
 @@ -1,5 +1,6 @@
@@ -189,6 +239,18 @@ index 7dc999d..9ad0574 100644
          ps->RefDiffPicOrderCnts[i] = (short)diff;
          if (d->ref[i] == 2) ps->longtermflag |= (unsigned short)(1u << (15 - i));
      }
+@@ -359,7 +368,10 @@ static int decode_pending(HevcDec *d)
+     const double t0 = now_ms();
+     memset(d->status.cpu, 0, sizeof(nvdec_status_s));
+     chan_submit(c);
+-    while (sv[0] != val && now_ms() - t0 < 1000) { }
++    if (rm_class(d->rm, RM_CLS_NVDEC) == 0xc7b0)
++        nvdec_wait_ampere(sv, val, t0);
++    else
++        while (sv[0] != val && now_ms() - t0 < 1000) { }
+     d->engine_ms = now_ms() - t0;
+     d->auN = 0;
+     if (sv[0] != val) { fprintf(stderr, "hevcdec: no completion (error notifier 0x%x)\n", chan_error(c)); return -1; }
 diff --git a/src/hevcparse.c b/src/hevcparse.c
 index e35ec38..48f8fce 100644
 --- a/src/hevcparse.c

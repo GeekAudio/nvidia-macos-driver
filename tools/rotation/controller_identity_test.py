@@ -69,7 +69,7 @@ static void OSBitOrAtomic(unsigned value,volatile unsigned *slot){*slot|=value;}
 @@CONSTANTS@@
 @@HELPERS@@
 struct NVRMNVDAFramebuffer:IOService {
- unsigned fIndex; bool fRotationEnabled=true;
+ unsigned fIndex; bool fRotationEnabled=true,fHotplugBorn=false,fStandby=false;
  NVRMNVDAFramebuffer(IOService *p,unsigned i):IOService(p,"NVRMFramebuffer",p->id+1000),fIndex(i){}
  bool configureControllerIdentity(IOService *);
 };
@@ -77,9 +77,15 @@ struct NVRMNVDAFramebuffer:IOService {
 static const unsigned kNvMaxFB=5;
 static unsigned gNvHeadsPublished=0;
 static int gNvAccelArmed=0;
+static int gNvScanout=0;
+struct Timer {
+ unsigned queued=0;
+ void setTimeoutMS(unsigned delay){assert(delay>0);++queued;}
+};
 struct DisplayMachine { unsigned getFramebufferCount(){return 0;} };
 struct NVAccel {
  IOService *fPCI,*fFB=nullptr,*fFBs[kNvMaxFB]={}; DisplayMachine *fDM=nullptr;
+ Timer *fLateFramebufferTimer=nullptr;
  explicit NVAccel(IOService *p):fPCI(p){}
  ~NVAccel(){if(fFB)fFB->release();for(auto *p:fFBs)if(p)p->release();}
  @@CALLBACK@@
@@ -139,6 +145,17 @@ int main(){
   // Rotation disabled (including Sequoia) wins over an explicit split request.
   boot=1;heads[2]->fRotationEnabled=false;assert(heads[2]->configureControllerIdentity(nubs[2]));
   assert(number(heads[2],"IOFBDependentIndex")==2);
+  // A newly discovered output opens a new controller, keeping its accelerator slot.
+  boot=0;heads[2]->fHotplugBorn=true;assert(heads[2]->configureControllerIdentity(nubs[2]));
+  assert(number(heads[2],"IOFBDependentID")==nubs[2]->id);
+  assert(number(heads[2],"IOFBDependentIndex")==0&&number(heads[2],NVRM_DISPLAY_INDEX_KEY)==2);
+  heads[2]->fHotplugBorn=false;
+  // The offline slot joins the boot controller even with independent controllers enabled.
+  boot=1;heads[2]->fRotationEnabled=true;heads[2]->fStandby=true;
+  assert(heads[2]->configureControllerIdentity(nubs[2]));
+  assert(number(heads[2],"IOFBDependentID")==NVRM_LEGACY_CONTROLLER_ID);
+  assert(number(heads[2],"IOFBDependentIndex")==2&&number(heads[2],NVRM_DISPLAY_INDEX_KEY)==2);
+  heads[2]->fStandby=false;
   // Older framebuffer builds still register using their original dependent indices.
   for(auto *fb:heads)fb->removeProperty(NVRM_DISPLAY_INDEX_KEY);
   heads[0]->setProperty("IOFBDependentIndex",0ull,32);heads[1]->setProperty("IOFBDependentIndex",1ull,32);
@@ -147,6 +164,18 @@ int main(){
   for(auto *fb:heads){unsigned long long slot=99;assert(nvrmFramebufferIndex(fb,&slot)&&slot==fb->fIndex);}
   // Repeated publication does not replace the original slot or leak references.
   int before=heads[0]->refs;NVAccel::fbPublished(&accelerator,nullptr,heads[0],nullptr);assert(heads[0]->refs==before);
+ }
+ {
+  // Keep boot registration and the optional Intel panel out of the late worker.
+  IOService panel(&nvrm,"NMIntelFB",700);panel.setProperty("IOFBDependentIndex",4ull,32);
+  Timer timer;NVAccel accelerator(&gpu);accelerator.fLateFramebufferTimer=&timer;
+  NVAccel::fbPublished(&accelerator,nullptr,heads[0],nullptr);assert(timer.queued==0);
+  gNvAccelArmed=1;
+  NVAccel::fbPublished(&accelerator,nullptr,heads[1],nullptr);assert(timer.queued==0);
+  gNvScanout=1;
+  NVAccel::fbPublished(&accelerator,nullptr,&panel,nullptr);assert(timer.queued==0);
+  NVAccel::fbPublished(&accelerator,nullptr,heads[2],nullptr);assert(timer.queued==1);
+  NVAccel::fbPublished(&accelerator,nullptr,heads[2],nullptr);assert(timer.queued==1);
  }
  registry.clear();
  // Property failure refuses startup; it cannot publish a partially usable split.

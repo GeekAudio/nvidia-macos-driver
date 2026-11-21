@@ -26,6 +26,7 @@
 #include <IOKit/IOWorkLoop.h>
 #include <IOKit/IOTimerEventSource.h>
 #include <IOKit/IOMemoryDescriptor.h>
+#include <IOKit/graphics/IOGraphicsTypes.h>
 #include "IOAccelerator.h"
 #include "IOGraphicsAccelerator2.h"
 #include "IOAccelEventMachineFast2.h"
@@ -316,7 +317,22 @@ public:
     IOService *volatile fFBs[kNvMaxFB] = {};
     unsigned fFBRegistered = 0;
     IOLock *fRegLock = nullptr;
+    IOWorkLoop *fLateFramebufferLoop = nullptr;
+    IOTimerEventSource *fLateFramebufferTimer = nullptr;
     OSObject *fMetalPlugin = nullptr;
+    static void registerLateFramebuffers(OSObject *owner, IOTimerEventSource *) {
+        auto *me = static_cast<NVAccel *>(owner);
+        IOLockLock(me->fRegLock);
+        const unsigned added = me->registerPendingLocked("hot-plug", kNvMaxFB - 1);
+        if (added) me->onCountGrewLocked();
+        IOService *primary = me->fFB;
+        IOLockUnlock(me->fRegLock);
+
+        // Re-probe from the open head once the new pipe is available. The
+        // new framebuffer cannot signal its own connect handler before open.
+        if (added && primary)
+            primary->requestProbe(kIOFBUserRequestProbe);
+    }
     static bool fbPublished(void *target, void *ref, IOService *newService, IONotifier *note) {
         (void)ref; (void)note;
         NVAccel *me = (NVAccel *)target;
@@ -329,10 +345,12 @@ public:
         }
         const unsigned idx = (unsigned)slot;
         const char *what = "kept";
+        bool added = false;
         if (idx >= kNvMaxFB) what = "OUT OF RANGE -- this head will get no pipe";
         else {
             newService->retain();
-            if (OSCompareAndSwapPtr(nullptr, newService, (void *volatile *)&me->fFBs[idx])) OSBitOrAtomic(1u << idx, &gNvHeadsPublished);
+            added = OSCompareAndSwapPtr(nullptr, newService, (void *volatile *)&me->fFBs[idx]);
+            if (added) OSBitOrAtomic(1u << idx, &gNvHeadsPublished);
             else { newService->release(); what = "DUPLICATE -- the first one keeps the slot"; }
         }
         newService->retain();
@@ -352,11 +370,10 @@ public:
         } else if (idx != 0 || !OSCompareAndSwapPtr(nullptr, newService, (void *volatile *)&me->fFB)) newService->release();
         unsigned before = me->fDM ? me->fDM->getFramebufferCount() : 0xFFFFFFFFu;
         ALOG("%s published -- display machine framebuffer count = %u (index %u %s)", newService->getName(), before, idx, what);
-        if (gNvAccelArmed)
-            ALOG("  index %u published AFTER the arm: it gets a pipe only when debug.nvaccelfb=3 is written again, "
-                 "and WindowServer composites it only after a WindowServer restart", idx);
-        else
-            ALOG("  to register it:  sudo sysctl -w debug.nvaccelfb=1   (2 = re-run the family's own sweep)");
+        // Leave IOKit matching before handing the framebuffer to the display
+        // machine. Boot registration still owns the initial set of pipes.
+        if (added && idx < kNvMaxFB - 1 && gNvAccelArmed && gNvScanout && me->fLateFramebufferTimer)
+            me->fLateFramebufferTimer->setTimeoutMS(50);
         return true;
     }
     // Headless GPU (laptops whose panel and outputs are all on the Intel or AMD GPU: issues #76, #106). NVKMS finds no
@@ -526,9 +543,9 @@ public:
                  when, i, *(const volatile uint8_t *)(p + 0x298), *(const volatile uint8_t *)(p + 0x282));
         }
     }
-    unsigned registerPendingLocked(const char *why) {
+    unsigned registerPendingLocked(const char *why, unsigned slotCount = kNvMaxFB) {
         unsigned added = 0;
-        for (unsigned i = 0; i < kNvMaxFB; i++) {
+        for (unsigned i = 0; i < slotCount; i++) {
             IOService *fb = fFBs[i];
             if (!fb) {
                 // The Intel panel (index 4, NMIntelFB) does not wait for NVIDIA heads that never publish: a machine with one
@@ -823,6 +840,15 @@ public:
             OSDictionary *fbm = serviceMatching("NVRMNVDAFramebuffer");
 #endif
             if (fbm) {
+                if (fRegLock && (fLateFramebufferLoop = IOWorkLoop::workLoop())) {
+                    fLateFramebufferTimer = IOTimerEventSource::timerEventSource(this, registerLateFramebuffers);
+                    if (!fLateFramebufferTimer ||
+                        fLateFramebufferLoop->addEventSource(fLateFramebufferTimer) != kIOReturnSuccess) {
+                        OSSafeReleaseNULL(fLateFramebufferTimer);
+                        OSSafeReleaseNULL(fLateFramebufferLoop);
+                        ALOG("late framebuffer registration worker could not start");
+                    }
+                }
                 fFBNote = addMatchingNotification(gIOFirstPublishNotification, fbm, &NVAccel::fbPublished, this, nullptr, 0);
                 fbm->release();
                 ALOG("watching for NVRMFramebuffer to publish -> notifier %p", fFBNote);
@@ -1033,6 +1059,14 @@ public:
 
     virtual void stop(IOService *provider) APPLE_KEXT_OVERRIDE {
         ALOG("stop");
+        if (fFBNote) { fFBNote->remove(); fFBNote = nullptr; }
+        if (fIntelNote) { fIntelNote->remove(); fIntelNote = nullptr; }
+        if (fLateFramebufferTimer) {
+            fLateFramebufferTimer->cancelTimeout();
+            fLateFramebufferLoop->removeEventSource(fLateFramebufferTimer);
+            OSSafeReleaseNULL(fLateFramebufferTimer);
+            OSSafeReleaseNULL(fLateFramebufferLoop);
+        }
         stopTemperature();
         stopUtilization();
         IOGraphicsAccelerator2::stop(provider);

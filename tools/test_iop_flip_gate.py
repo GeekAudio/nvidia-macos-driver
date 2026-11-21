@@ -36,7 +36,7 @@ assert 'res->fPluginWroteCookie = vm ? vm->fAllocationCookie : 0;' in dirty, 'th
 flip = body('static bool nvAccelIopFlip(IOService *fb, unsigned head, IOSurface *s, void *pipe)')
 assert 'nvAccelIopVramFlippable(vramNewest, nvAccelPluginWrote(res->fPluginWroteCookie, vm->fAllocationCookie))' in flip, \
     'the zero-copy flip no longer checks the plugin write against the allocation it submits'
-copy = body('static bool nvAccelSurfCopyReady(IOSurface *s, unsigned head)')
+copy = body('static bool nvAccelSurfCopyReady(IOSurface *s, unsigned head, bool strict)')
 assert 'nvAccelIopCopyNeedsPageoff(false, nvAccelResPluginWrote(res))' in copy, 'the copied-frame path no longer checks the plugin write before paging off'
 
 control = '''

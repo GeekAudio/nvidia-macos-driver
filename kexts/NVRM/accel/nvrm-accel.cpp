@@ -55,6 +55,7 @@ static bool nvaccel_verbose() { static int v = -1; if (v < 0) { int x = 0; v = P
 #define ALOGV(fmt, ...) do { if (nvaccel_verbose()) ALOG(fmt, ##__VA_ARGS__); } while (0)
 #include <libkern/c++/OSSymbol.h>
 #include "nvrm_vram_abi.h"
+#include "nvrm_copy_present.h"
 #include <IOKit/IODeviceMemory.h>
 #include "tahoe_fwd.h"   // macOS 26: inherited slots Apple no longer exports, forwarded through its vtables
 #include "nvaccel_stubs.h"
@@ -1392,7 +1393,7 @@ bool NVDisplayPipe::isTransactionComplete(IOAccelDisplayPipeTransaction2 *)
 }
 
 static void nvAccelSurfScanoutSync(IOSurface *s);
-static bool nvAccelSurfCopyReady(IOSurface *s, unsigned head);
+static bool nvAccelSurfCopyReady(IOSurface *s, unsigned head, bool strict);
 static bool nvAccelIopFlip(IOService *fb, unsigned head, IOSurface *s, void *pipe);
 static bool nvSurfWaitReady(unsigned int id);
 static void nvAccelIopHome(IOService *fb, unsigned head);
@@ -1406,6 +1407,8 @@ IOReturn NVDisplayPipe::performTransaction(IOAccelDisplayPipeTransaction2 *txn)
     if (!fb) NVIOP_FAIL(kIOReturnNotAttached, "no accelerator, or pipe %p drives a framebuffer that is none of ours", this);
     NVIntelFrameLease intelFrame(fb);
     if (intelFrame.blocked()) return kIOReturnSuccess; // Preserve the last frame; never reuse an unsafe buffer.
+    const bool buffered = fb->metaCast("NVRMNVDAFramebuffer") &&
+        fb->getProperty(NVRM_COPY_PRESENT_PROPERTY) == kOSBooleanTrue;
 
     IOSurface *s  = txn->getPlaneIOSurface(0, 0);
     OSObject  *ro = txn->getPlaneResource(0, 0);
@@ -1434,7 +1437,7 @@ IOReturn NVDisplayPipe::performTransaction(IOAccelDisplayPipeTransaction2 *txn)
         if ((unsigned long long)pitch < 4ull * w) NVIOP_FAIL(kIOReturnBadArgument, "resource %ux%u: +0xb8 reads %u, which is not a row pitch (need >= %u) — not a surface buffer", w, h, pitch, 4u * w);
         if ((unsigned long long)h * pitch > vm->fBytes) NVIOP_FAIL(kIOReturnOverrun, "resource %ux%u pitch %u exceeds its %llu bytes", w, h, pitch, (unsigned long long)vm->fBytes);
         src = (const volatile unsigned int *)vm->fKva; fromRes = true;
-    } else if (s && nvAccelIopFlip(fb, head, s, this)) {
+    } else if (s && !buffered && nvAccelIopFlip(fb, head, s, this)) {
         OSAddAtomic64(1, &gCntIopSrcSurf); OSAddAtomic64(1, &gCntIopOk); OSAddAtomic64(1, &gCntIopOkHead[head]);
         return kIOReturnSuccess;
     } else if (s) {
@@ -1443,7 +1446,7 @@ IOReturn NVDisplayPipe::performTransaction(IOAccelDisplayPipeTransaction2 *txn)
         // (1.13-1.14.1), nvaccel_iop_blank about half of every copied frame, never on machines whose frames all flip.
         // Such a frame now keeps the previous picture on the panel instead.
         const bool gpuReady = nvSurfWaitReady(s->getSurfaceID());
-        if (intelFrame.active() && !gpuReady) return kIOReturnSuccess;
+        if ((intelFrame.active() || buffered) && !gpuReady) return kIOReturnSuccess;
         const int directMode = __atomic_load_n(&gIopDirect, __ATOMIC_ACQUIRE);
         if (intelFrame.active() && (directMode == 1 || directMode == 2)) {
             const uint64_t start = mach_absolute_time();
@@ -1462,7 +1465,7 @@ IOReturn NVDisplayPipe::performTransaction(IOAccelDisplayPipeTransaction2 *txn)
                 return kIOReturnSuccess;
             }
         }
-        if (!nvAccelSurfCopyReady(s, head)) return kIOReturnSuccess;
+        if (!nvAccelSurfCopyReady(s, head, buffered)) return kIOReturnSuccess;
         const unsigned fmt = s->getPixelFormat();
         from10 = (fmt == NV_IOP_FMT_L10R);
         if (fmt != NV_IOP_FMT_BGRA && !from10) NVIOP_FAIL(kIOReturnUnsupported, "surface 0x%x format 0x%08x is not BGRA or l10r", s->getSurfaceID(), fmt);
@@ -1478,6 +1481,23 @@ IOReturn NVDisplayPipe::performTransaction(IOAccelDisplayPipeTransaction2 *txn)
         NVIOP_FAIL(kIOReturnUnsupported, "plane resource %p is not an NVResource with a CPU mapping, and there is no IOSurface", ro);
     }
     if (!w || !h || pitch < 4) NVIOP_FAIL(kIOReturnBadArgument, "source geometry %ux%u pitch %u", w, h, pitch);
+
+    if (buffered) {
+        NVRMCopyPresentRequest request = {NVRM_COPY_PRESENT_ABI_VERSION,
+            from10 ? NV_IOP_FMT_L10R : NV_IOP_FMT_BGRA, w, h, pitch, src};
+        const OSSymbol *present = OSSymbol::withCStringNoCopy(NVRM_COPY_PRESENT_FN);
+        if (!present) return kIOReturnSuccess;
+        const IOReturn result = fb->callPlatformFunction(present, false, &request, nullptr, nullptr, nullptr);
+        present->release();
+        if (result == kIOReturnSuccess) {
+            if (from10) OSAddAtomic64(1, &gCntIopL10r);
+            OSAddAtomic64(1, fromRes ? &gCntIopSrcRes : &gCntIopSrcSurf);
+            OSAddAtomic64(1, &gCntIopOk);
+            OSAddAtomic64(1, &gCntIopOkHead[head]);
+        }
+        // A refused or busy flip keeps the old frame. Never write the home aperture as a fallback.
+        return kIOReturnSuccess;
+    }
 
     struct NVRMVramRequest q;
     for (unsigned i = 0; i < sizeof q; i++) ((volatile unsigned char *)&q)[i] = 0;
@@ -2483,10 +2503,10 @@ static void nvAccelSurfScanoutSync(IOSurface *s)
 }
 // True when the surface's system memory holds its newest pixels, after moving them there if the GPU drew them into VRAM.
 // Unlike nvAccelSurfScanoutSync it waits a few ms for the accelerator lock and does not clear the pending mark when the
-// page-off fails. At most 4 frames in a row are held back per head: a surface that never syncs is copied as before
-// rather than freezing the panel.
+// page-off fails. Legacy scanout holds at most four frames per head. Buffered
+// presentation can keep the prior complete frame until the new copy is ready.
 static unsigned gIopCopyHeld[kNvMaxFB];
-static bool nvAccelSurfCopyReady(IOSurface *s, unsigned head)
+static bool nvAccelSurfCopyReady(IOSurface *s, unsigned head, bool strict)
 {
     NVAccel *a = NVAccel::gAccel;
     if (!s || !a) return true;
@@ -2510,7 +2530,7 @@ static bool nvAccelSurfCopyReady(IOSurface *s, unsigned head)
     }
     if (head >= kNvMaxFB) return true;
     if (ready) { gIopCopyHeld[head] = 0; return true; }
-    if (++gIopCopyHeld[head] > 4) { gIopCopyHeld[head] = 0; return true; }
+    if (!strict && ++gIopCopyHeld[head] > 4) { gIopCopyHeld[head] = 0; return true; }
     OSAddAtomic64(1, &gCntIopCopySkip);
     return false;
 }

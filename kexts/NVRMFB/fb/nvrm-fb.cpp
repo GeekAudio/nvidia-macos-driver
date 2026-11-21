@@ -85,6 +85,7 @@ extern "C" {
 #pragma clang diagnostic pop
 #include <libkern/OSAtomic.h>
 #include "nvrm_vram_abi.h"
+#include "../../NVRM/nvrm_copy_present.h"
 #include "nvrm-dvi-modes.h"
 
 // Surfaces may use half of a resizable BAR1 (>= 4 GB) and three quarters of a smaller one. WAS: a fixed 192 MB below
@@ -565,6 +566,19 @@ class NVRMNVDAFramebuffer : public IOFramebuffer {
     IOSimpleLock *fFlipCacheLock = nullptr;
     unsigned    fFlipCacheN = 0, fFlipCount = 0, fFlipRejects = 0, fFlipEvict = 0;
     struct NvKmsKapiSurface *fFrontSurf = nullptr;
+    struct CopyScanout {
+        struct NvKmsKapiMemory *memory;
+        struct NvKmsKapiSurface *surface;
+        void *kva;
+        NvU32 width, height, pitch;
+        NvU64 barBytes;
+    };
+    CopyScanout fCopyScanout[2] = {};
+    bool fCopyPresent = false, fCopyAwaitingLatch = false;
+    unsigned fCopyPresents = 0;
+    bool prepareCopyScanout(CopyScanout &slot);
+    void teardownCopyScanout(CopyScanout &slot);
+    IOReturn presentCopiedFrame(const NVRMCopyPresentRequest &request);
     NVRMHeadGateState fPrimaryGate;
     static inline volatile SInt32 sFlipLatched[8] = {};
     bool flipToMemory(struct NvKmsKapiMemory *mem, unsigned w, unsigned h, unsigned pitch, int *rcOut, bool pure = false, UInt64 cookie = 0);
@@ -581,7 +595,7 @@ class NVRMNVDAFramebuffer : public IOFramebuffer {
     uint64_t fEnableAbs = 0;    // when enableController ran, for the first-primary-flip timing line
     bool fFirstPrimaryLogged = false;   // a login screen that never gets one is the black-screen-with-cursor signature
     NvBool submitConfig(struct NvKmsKapiRequestedModeSetConfig *cfg, struct NvKmsKapiModeSetReplyConfig *rep, NvBool commit,
-                        bool bootstrap = false, bool cursorOnly = false, bool frame = false);
+                        bool bootstrap = false, bool cursorOnly = false, bool frame = false, bool deferLatch = false);
     thread_call_t fReflip = nullptr;
     unsigned fReflips = 0; int fReflipRc = -99;
     unsigned fVblReg = 0;
@@ -2029,7 +2043,7 @@ void NVRMNVDAFramebuffer::flipFaultLog(const char *why)
 }
 NvBool NVRMNVDAFramebuffer::submitConfig(struct NvKmsKapiRequestedModeSetConfig *cfg,
                                             struct NvKmsKapiModeSetReplyConfig *rep, NvBool commit, bool bootstrap,
-                                            bool cursorOnly, bool frame)
+                                            bool cursorOnly, bool frame, bool deferLatch)
 {
     if (!fKms || !fDev || !cfg || !rep || fHead >= 8 || fSubmissionFaulted) return NV_FALSE;
     if (!commit) return fKms->applyModeSetConfig(fDev, cfg, rep, NV_FALSE);
@@ -2107,6 +2121,8 @@ NvBool NVRMNVDAFramebuffer::submitConfig(struct NvKmsKapiRequestedModeSetConfig 
     }
     fSubmissionSeen = true;
     fFlipSubmitAbs = submit0;
+    // A buffered copy owns both scanouts until a subsequent poll confirms the latch.
+    if (deferLatch) return NV_TRUE;
     // Initial acceptance permits console handoff, never surface retirement. The owned boot surface remains pinned.
     if (bootstrap || !gFlipLatch) return NV_TRUE;
     if (gFlipLatch == 2) { OSIncrementAtomic((volatile SInt32 *)&gFlipLatchDeferred); return NV_TRUE; }
@@ -2999,6 +3015,9 @@ bool NVRMNVDAFramebuffer::start(IOService *provider)
         return false;
     }
     setName("NVRMFramebuffer");
+    int copyPresent = 0;
+    if (!fConsoleAperture && PE_parse_boot_argn("nvrmfbcopyflip", &copyPresent, sizeof copyPresent) && copyPresent == 1)
+        fCopyPresent = setProperty(NVRM_COPY_PRESENT_PROPERTY, kOSBooleanTrue);
     if (fInternal) publishBacklight();   // before super::start(): IOFramebuffer::open looks for "backlight"
     publishDdcBus();                     // before super::start() too: IOFramebuffer::open creates the I2C interface from it
     if (fDdcOn) publishDdcBrightness();
@@ -3077,7 +3096,16 @@ void NVRMNVDAFramebuffer::stop(IOService *provider)
     // Drop both guards before draining workers that can enter this same head.
     {
         NVRMDisplayGate gate;
-        if (gate.valid()) { NVRMHeadGate primary(startLock(), fPrimaryGate, true); }
+        if (gate.valid()) {
+            NVRMHeadGate primary(startLock(), fPrimaryGate, true);
+            if (primary.valid() && (fCopyScanout[0].memory || fCopyScanout[1].memory) &&
+                rmGpuReady() && (!fSubmissionSeen || waitFlipDone(0))) {
+                for (auto &slot : fCopyScanout) {
+                    // This head may still be scanning the accepted front after IOService stops.
+                    if (slot.surface != fFrontSurf) teardownCopyScanout(slot);
+                }
+            }
+        }
     }
     if (fHwVblCb && fKms && fDev) {
         fKms->unregisterVblankIntrCallback(fDev, fHead, fHwVblCb); fHwVblCb = nullptr;
@@ -4031,6 +4059,7 @@ static struct { struct NvKmsKapiMemory *m; void *k; NvU64 n; } gParkedForever[64
 static int      gNParkedForever   = 0;
 static volatile SInt64 gVramParkedBytes = 0;
 static volatile SInt64 gCntGrant, gCntGrantBytes, gCntRelease, gCntReleaseBytes;
+static SInt64 gCopyPresentLatched, gCopyPresentBusy, gCopyPresentFailed;
 SYSCTL_QUAD(_debug, OID_AUTO, nvrmfb_vram_grants,        CTLFLAG_RD | CTLFLAG_LOCKED, (SInt64 *)&gCntGrant,        "vramGrant successes");
 SYSCTL_QUAD(_debug, OID_AUTO, nvrmfb_vram_grant_bytes,   CTLFLAG_RD | CTLFLAG_LOCKED, (SInt64 *)&gCntGrantBytes,   "bytes granted");
 SYSCTL_QUAD(_debug, OID_AUTO, nvrmfb_vram_releases,      CTLFLAG_RD | CTLFLAG_LOCKED, (SInt64 *)&gCntRelease,      "vramRelease calls");
@@ -4038,7 +4067,13 @@ SYSCTL_QUAD(_debug, OID_AUTO, nvrmfb_vram_release_bytes, CTLFLAG_RD | CTLFLAG_LO
 static volatile SInt64 gVramBudgetBytes = 0;
 SYSCTL_QUAD(_debug, OID_AUTO, nvrmfb_vram_budget_bytes, CTLFLAG_RD | CTLFLAG_LOCKED, (SInt64 *)&gVramBudgetBytes, "the BAR1 grant budget in force");
 SYSCTL_QUAD(_debug, OID_AUTO, nvrmfb_vram_mapped_bytes,  CTLFLAG_RD | CTLFLAG_LOCKED, (SInt64 *)&gVramMappedBytes,  "the BAR1 budget counter, live");
-SYSCTL_QUAD(_debug, OID_AUTO, nvrmfb_vram_display_bytes, CTLFLAG_RD | CTLFLAG_LOCKED, (SInt64 *)&gVramDisplayBytes, "scanout+cursor the framebuffer itself maps into BAR1");
+SYSCTL_QUAD(_debug, OID_AUTO, nvrmfb_vram_display_bytes, CTLFLAG_RD | CTLFLAG_LOCKED, (SInt64 *)&gVramDisplayBytes, "display memory the framebuffer itself maps into BAR1");
+SYSCTL_QUAD(_debug, OID_AUTO, nvrmfb_copy_present_latched, CTLFLAG_RD | CTLFLAG_LOCKED, &gCopyPresentLatched,
+            "buffered copy flips with hardware completion observed");
+SYSCTL_QUAD(_debug, OID_AUTO, nvrmfb_copy_present_busy, CTLFLAG_RD | CTLFLAG_LOCKED, &gCopyPresentBusy,
+            "buffered copies skipped because a prior flip was pending or could not be verified");
+SYSCTL_QUAD(_debug, OID_AUTO, nvrmfb_copy_present_failed, CTLFLAG_RD | CTLFLAG_LOCKED, &gCopyPresentFailed,
+            "buffered copies refused for invalid geometry, unavailable buffers, or a failed commit");
 SYSCTL_INT(_debug, OID_AUTO, nvrmfb_vram_display_aware, CTLFLAG_RW | CTLFLAG_LOCKED, &gVramDisplayAware, 0, "1 = the accel budget reserves the BAR1 the display holds; 0 = the old fixed fraction");
 static struct NVRMVramRequest gVramTest[256]; static int gVramTestN; static int gVramTestMode;
 static int nvrmfb_vramtest_sysctl SYSCTL_HANDLER_ARGS
@@ -4104,6 +4139,9 @@ static void nvrmfbInstallSysctl(void)
     sysctl_register_oid(&sysctl__debug_nvrmfb_flip_latch); sysctl_register_oid(&sysctl__debug_nvrmfb_flip_latch_waits);
     sysctl_register_oid(&sysctl__debug_nvrmfb_flip_latch_timeouts); sysctl_register_oid(&sysctl__debug_nvrmfb_flip_latch_max_us);
     sysctl_register_oid(&sysctl__debug_nvrmfb_flip_latch_late); sysctl_register_oid(&sysctl__debug_nvrmfb_flip_latch_deferred);
+    sysctl_register_oid(&sysctl__debug_nvrmfb_copy_present_latched);
+    sysctl_register_oid(&sysctl__debug_nvrmfb_copy_present_busy);
+    sysctl_register_oid(&sysctl__debug_nvrmfb_copy_present_failed);
 }
 
 bool NVRMNVDAFramebuffer::vramGrant(struct NVRMVramRequest *r)
@@ -4299,6 +4337,11 @@ IOReturn NVRMNVDAFramebuffer::callPlatformFunction(const OSSymbol *functionName,
 {
     bool isAlloc = functionName && functionName->isEqualTo(NVRM_VRAM_FN_ALLOC);
     bool isFree  = functionName && functionName->isEqualTo(NVRM_VRAM_FN_FREE);
+    if (functionName && functionName->isEqualTo(NVRM_COPY_PRESENT_FN)) {
+        const auto *request = static_cast<const NVRMCopyPresentRequest *>(param1);
+        if (!request || request->version != NVRM_COPY_PRESENT_ABI_VERSION) return kIOReturnBadArgument;
+        return presentCopiedFrame(*request);
+    }
     if (functionName && functionName->isEqualTo("NVRMGpuPower")) {   // from NVRM: 0 standby, 1 resumed, 2 lost
         const uintptr_t st = (uintptr_t)param1;
         if (st == 0) {
@@ -4374,6 +4417,147 @@ IOReturn NVRMNVDAFramebuffer::callPlatformFunction(const OSSymbol *functionName,
     }
     if (isAlloc) return vramGrant(r)   ? kIOReturnSuccess : kIOReturnNoMemory;
     return              vramRelease(r) ? kIOReturnSuccess : kIOReturnBadArgument;
+}
+
+void NVRMNVDAFramebuffer::teardownCopyScanout(CopyScanout &slot)
+{
+    if (!slot.memory) return;
+    fKms->destroySurface(fDev, slot.surface);
+    fKms->unmapMemory(fDev, slot.memory, NVKMS_KAPI_MAPPING_TYPE_KERNEL, slot.kva);
+    fKms->freeMemory(fDev, slot.memory);
+    if (slot.barBytes) OSAddAtomic64(-(SInt64)slot.barBytes, &gVramDisplayBytes);
+    slot = {};
+}
+
+bool NVRMNVDAFramebuffer::prepareCopyScanout(CopyScanout &slot)
+{
+    if (slot.surface && slot.width == fW && slot.height == fH && slot.pitch == fPitch) return true;
+    teardownCopyScanout(slot);
+    const NvU64 size = ((NvU64)fPitch * fH + 0xffffull) & ~0xffffull;
+    if (!size || size > (128ull << 20)) return false;
+    for (unsigned attempt = 0; attempt < 2; ++attempt) {
+        const bool video = attempt == 0;
+        // Do not use aperture space already committed to compositor surfaces.
+        if (video && fBarLen && gVramMappedBytes + gVramParkedBytes >
+            (SInt64)nvrmSurfaceBudget(fBarLen, gVramDisplayBytes + (SInt64)size))
+            continue;
+        NvU8 compressible = 0;
+        struct NvKmsKapiAllocateMemoryParams allocation = {};
+        allocation.layout = NvKmsSurfaceMemoryLayoutPitch;
+        allocation.type = NVKMS_KAPI_ALLOCATION_TYPE_SCANOUT;
+        allocation.size = size;
+        allocation.useVideoMemory = video ? NV_TRUE : NV_FALSE;
+        allocation.compressible = &compressible;
+        auto *memory = fKms->allocateMemory(fDev, &allocation);
+        if (!memory) continue;
+        void *kva = nullptr;
+        if (fKms->mapMemory(fDev, memory, NVKMS_KAPI_MAPPING_TYPE_KERNEL, &kva) && kva) {
+            struct NvKmsKapiCreateSurfaceParams params = {};
+            params.planes[0].memory = memory;
+            params.planes[0].pitch = fPitch;
+            params.width = fW;
+            params.height = fH;
+            params.format = NvKmsSurfaceMemoryFormatX8R8G8B8;
+            if (auto *surface = fKms->createSurface(fDev, &params)) {
+                slot = {memory, surface, kva, fW, fH, fPitch, video ? size : 0};
+                if (slot.barBytes) OSAddAtomic64((SInt64)slot.barBytes, &gVramDisplayBytes);
+                FBLOG("buffered copy head %u: %ux%u pitch %u scanout allocated in %s memory",
+                      fHead, fW, fH, fPitch, video ? "video" : "system");
+                return true;
+            }
+            fKms->unmapMemory(fDev, memory, NVKMS_KAPI_MAPPING_TYPE_KERNEL, kva);
+        }
+        fKms->freeMemory(fDev, memory);
+    }
+    return false;
+}
+
+IOReturn NVRMNVDAFramebuffer::presentCopiedFrame(const NVRMCopyPresentRequest &request)
+{
+    if (!fCopyPresent) return kIOReturnUnsupported;
+    NVRMDisplayGate gate;
+    if (!gate.valid()) return kIOReturnNotReady;
+    NVRMHeadGate primary(startLock(), fPrimaryGate, false);
+    if (!primary.valid() || OSAddAtomic(0, &fStopping) || fSubmissionFaulted ||
+        !fKms || !fDev || !fSurf || !fModeSet || fConsoleAperture ||
+        !fPowerOn || fHeadSlept || fDpyLost || fHead >= 8 || !rmGpuReady()) return kIOReturnNotReady;
+    nvrmfbInstallSysctl();
+    if (!request.pixels || (reinterpret_cast<uintptr_t>(request.pixels) & 3) ||
+        (request.format != NV_IOP_FMT_BGRA && request.format != NV_IOP_FMT_L10R) ||
+        !request.width || !request.height || request.width != fW || request.height != fH ||
+        fW > 16384 || fH > 16384 || !fRasterW || !fRasterH ||
+        request.pitch < fW * 4 || request.pitch > 16384u * 8 || (request.pitch & 3) ||
+        fPitch < fW * 4 || (fPitch & 3)) {
+        OSAddAtomic64(1, &gCopyPresentFailed);
+        return kIOReturnBadArgument;
+    }
+    // After an accepted flip the former front may still be on the panel. Both
+    // slots stay pinned until NVKMS proves that the pending primary flip latched.
+    if (fSubmissionSeen && !waitFlipDone(0)) {
+        OSAddAtomic64(1, &gCopyPresentBusy);
+        return kIOReturnBusy;
+    }
+    if (fCopyAwaitingLatch) {
+        OSAddAtomic64(1, &gCopyPresentLatched);
+        fCopyAwaitingLatch = false;
+    }
+    CopyScanout &back = fCopyScanout[fCopyScanout[0].surface &&
+                                    fCopyScanout[0].surface == fFrontSurf ? 1 : 0];
+    if (!prepareCopyScanout(back)) {
+        OSAddAtomic64(1, &gCopyPresentFailed);
+        return kIOReturnNoMemory;
+    }
+
+    auto *cfg = static_cast<struct NvKmsKapiRequestedModeSetConfig *>(IOMalloc(sizeof(NvKmsKapiRequestedModeSetConfig)));
+    auto *rep = static_cast<struct NvKmsKapiModeSetReplyConfig *>(IOMalloc(sizeof(NvKmsKapiModeSetReplyConfig)));
+    if (!cfg || !rep) {
+        if (cfg) IOFree(cfg, sizeof *cfg);
+        if (rep) IOFree(rep, sizeof *rep);
+        OSAddAtomic64(1, &gCopyPresentFailed);
+        return kIOReturnNoMemory;
+    }
+    auto *destination = static_cast<volatile unsigned *>(back.kva);
+    for (unsigned y = 0; y < request.height; ++y) {
+        nv_iop_convert_row(destination + (size_t)y * (back.pitch / 4),
+                           request.pixels + (size_t)y * (request.pitch / 4),
+                           request.width, request.format, 0);
+    }
+    __asm__ __volatile__("sfence" ::: "memory"); // Flush write-combined pixel stores before the flip.
+
+    nvu_zero(cfg, sizeof *cfg);
+    nvu_zero(rep, sizeof *rep);
+    cfg->headsMask = 1u << fHead;
+    auto &head = cfg->headRequestedConfig[fHead];
+    head.modeSetConfig.bActive = NV_TRUE;
+    head.modeSetConfig.numDisplays = 1;
+    head.modeSetConfig.displays[0] = fDisplay;
+    head.modeSetConfig.mode = fMode;
+    auto &layer = head.layerRequestedConfig[NVKMS_KAPI_LAYER_PRIMARY_IDX];
+    layer.config.surface = back.surface;
+    layer.config.srcWidth = (NvU16)fW;
+    layer.config.srcHeight = (NvU16)fH;
+    layer.config.dstWidth = (NvU16)fRasterW;
+    layer.config.dstHeight = (NvU16)fRasterH;
+    layer.config.compParams.compMode = NVKMS_COMPOSITION_BLENDING_MODE_OPAQUE;
+    layer.config.minPresentInterval = 1;
+    layer.config.tearing = NV_FALSE;
+    layer.flags.surfaceChanged = NV_TRUE;
+    const bool accepted = submitConfig(cfg, rep, NV_TRUE, false, false, true, true);
+    const bool busy = rep->flipResult == NV_KMS_FLIP_RESULT_IN_PROGRESS;
+    IOFree(cfg, sizeof *cfg);
+    IOFree(rep, sizeof *rep);
+    if (!accepted) {
+        OSAddAtomic64(1, busy ? &gCopyPresentBusy : &gCopyPresentFailed);
+        return busy ? kIOReturnBusy : kIOReturnIOError;
+    }
+
+    fFrontSurf = back.surface;
+    fCopyAwaitingLatch = true;
+    if (++fCopyPresents == 1)
+        FBLOG("buffered copy head %u (fb%u): first vblank-synchronized flip accepted", fHead, fIndex);
+    if (OSCompareAndSwap(1, 0, &fServerFresh) && (fTransform || fCurTransform) && fConnect.proc)
+        notifyConnectionChanged(1);
+    return kIOReturnSuccess;
 }
 
 bool NVRMNVDAFramebuffer::flipToMemory(struct NvKmsKapiMemory *mem, unsigned w, unsigned h,

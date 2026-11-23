@@ -190,6 +190,8 @@ static void nvmtl_alloc_failed(const char *what) {
 }
 @interface MTLIOAccelDevice : NSObject
 - (instancetype)initWithAcceleratorPort:(mach_port_t)port;
+- (id<MTLSharedEvent>)newSharedEvent;
+- (id<MTLSharedEvent>)newSharedEventWithHandle:(MTLSharedEventHandle *)handle;
 @end
 @protocol MTLDeviceSPI <NSObject> @end
 @interface NVMTLDevice : MTLIOAccelDevice <MTLDevice, MTLDeviceSPI>
@@ -2900,8 +2902,7 @@ static void nvmtl_log_compute_descriptor(MTLComputePipelineDescriptor *d) {
     return t;
 }
 - (id<MTLSharedEvent>)newSharedEventWithHandle:(MTLSharedEventHandle *)h {
-    nvlog("newSharedEventWithHandle: %p -> nil (cross-process shared events are not built; apps3)", (__bridge void *)h);
-    return nil;
+    return h ? [super newSharedEventWithHandle:h] : nil;
 }
 
 - (id<MTLDepthStencilState>)newDepthStencilStateWithDescriptor:(MTLDepthStencilDescriptor *)dd {
@@ -3137,7 +3138,16 @@ static void nvmtl_log_compute_descriptor(MTLComputePipelineDescriptor *d) {
     nvlog("newResidencySetWithDescriptor: -> %p (residency is implicit here)", (__bridge void *)r); return r;
 }
 - (id<MTLEvent>)newEvent { NVMTLEvent *e = [NVMTLEvent new]; e->_dev = self; return e; }
-- (id<MTLSharedEvent>)newSharedEvent { NVMTLSharedEvent *e = [NVMTLSharedEvent new]; e->_dev = self; return e; }
+- (id<MTLSharedEvent>)newSharedEvent {
+    // Native Metal command buffers require a kernel-backed event for cross-GPU waits and signals.
+    id<MTLSharedEvent> nativeEvent = [super newSharedEvent];
+    if (nativeEvent) return nativeEvent;
+    // A software event cannot be passed to a command buffer on a native device.
+    if (nvmtl_other_metal_gpu()) return nil;
+    NVMTLSharedEvent *event = [NVMTLSharedEvent new];
+    event->_dev = self;
+    return event;
+}
 - (MTLArgumentBuffersTier)argumentBuffersSupport { return MTLArgumentBuffersTier2; }
 // Whether this process is a game, by what macOS's own Game Mode daemon reads from the app's Info.plist: the games category, or
 // LSSupportsGameMode. Used only by the opt-in Game Mode GPU priority (nvmtl_game_priority.h).

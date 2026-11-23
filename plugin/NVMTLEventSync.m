@@ -18,6 +18,7 @@
     nvmtl_inflight *inflight;
     int aheadFailed;
     BOOL waitFolded;
+    BOOL waitNotificationRequested;
     BOOL aheadEmpty;
     BOOL claimed;
     NSArray<NVMTLBuffer *> *copyInputs;
@@ -299,6 +300,22 @@ static void nvmtl_surface_finish_writes(NVMTLCommandBuffer *cb) {
 static NSMutableArray<NVMTLCommandBuffer *> *nvmtl_pending_buffers;
 static BOOL nvmtl_pumping;
 static void nvmtl_pump_buffers(void);
+static BOOL nvmtl_native_shared_event(id event) {
+    return [event respondsToSelector:@selector(notifyListener:atValue:block:)] &&
+        ![event isKindOfClass:[NVMTLSharedEvent class]];
+}
+static void nvmtl_request_wait_notification(NVMTLSubmissionPart *part) {
+    if (part->waitNotificationRequested) return;
+    static dispatch_once_t once;
+    static MTLSharedEventListener *listener;
+    dispatch_once(&once, ^{ listener = [MTLSharedEventListener new]; });
+    part->waitNotificationRequested = YES;
+    // A signal from Metal or another process does not wake the NVMTL worker directly.
+    [(id<MTLSharedEvent>)part->waitEvent notifyListener:listener atValue:part->value
+        block:^(__unused id<MTLSharedEvent> event, __unused uint64_t value) {
+            nvmtl_pump_buffers();
+        }];
+}
 static BOOL nvmtl_async_commit_on(void) {
     static int on = -1;
     if (on < 0) { const char *e = getenv("NVMTL_ASYNC_COMMIT"); on = !(e && e[0] == '0');
@@ -419,7 +436,8 @@ static NSError *nvmtl_device_removed_error(void)
 }
 - (void)nvmtlRecordSignal:(id)event value:(uint64_t)value {
     if (!event || _committed || _recordingUnavailable) return;
-    if (nvmtl_g79_on(NVMTL_G79_EV)) {
+    // Publish signals at their own boundary when another GPU can observe the event.
+    if (nvmtl_g79_on(NVMTL_G79_EV) && !nvmtl_native_shared_event(event)) {
         if (!_g79Sig) _g79Sig = [NSMutableArray new];
         if (!_g79Promised) _g79Promised = [NSMutableArray new];
         [_g79Sig addObject:@[event, @(value)]]; [_g79Promised addObject:@[event, @(value)]];
@@ -669,7 +687,8 @@ static void nvmtl_prepare_submission_copies(NVMTLSubmissionPart *part) {
         if (![part isKindOfClass:[NVMTLSubmissionPart class]]) return NO;
         if (part->claimed) return NO;
         if (part->waitEvent) {
-            if (!nvmtl_evfold_on() || nvmtl_evfold_promised(part->waitEvent) < part->value) return NO;
+            if (nvmtl_native_shared_event(part->waitEvent) || !nvmtl_evfold_on() ||
+                nvmtl_evfold_promised(part->waitEvent) < part->value) return NO;
             part->waitFolded = YES; _nextSubmit++; nvmtl_evfold_census(&gEvFold, "event waits ordered by the channel (no CPU hold)");
             continue;
         }
@@ -747,7 +766,17 @@ static void nvmtl_gsub_ahead_pass1(void) {
             return YES;
         }
         uint64_t have = ((uint64_t(*)(id,SEL))objc_msgSend)(part->waitEvent,@selector(signaledValue));
-        if (have < part->value) { @synchronized ([NVMTLCommandBuffer class]) { part->claimed = NO; } return NO; }
+        if (have < part->value) {
+            if (nvmtl_native_shared_event(part->waitEvent)) nvmtl_request_wait_notification(part);
+            else if (![part->waitEvent isKindOfClass:[NVMTLEvent class]] &&
+                ![part->waitEvent isKindOfClass:[NVMTLSharedEvent class]]) {
+                [self nvmtlFinishExecution:[NSError errorWithDomain:MTLCommandBufferErrorDomain code:MTLCommandBufferErrorInternal
+                    userInfo:@{NSLocalizedDescriptionKey:@"An external wait requires a shared event"}]];
+                return YES;
+            }
+            @synchronized ([NVMTLCommandBuffer class]) { part->claimed = NO; }
+            return NO;
+        }
     }
     if (!ahead && part->commands.cb && !part->encoders && !part->resources.count && !part->surfaces.count && !part->scratch.count && nvmtl_skip_empty_on()) {
         if (!_legacyKernelStart) _legacyKernelStart = clock_gettime_nsec_np(CLOCK_UPTIME_RAW) / 1e9;

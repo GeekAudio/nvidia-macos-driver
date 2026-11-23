@@ -27,6 +27,7 @@
 #include <IOKit/IOWorkLoop.h>
 #include <IOKit/IOTimerEventSource.h>
 #include <IOKit/IOMemoryDescriptor.h>
+#include <IOKit/graphics/IOGraphicsTypes.h>
 #include "IOAccelerator.h"
 #include "IOGraphicsAccelerator2.h"
 #include "IOAccelEventMachineFast2.h"
@@ -56,6 +57,7 @@ static bool nvaccel_verbose() { static int v = -1; if (v < 0) { int x = 0; v = P
 #define ALOGV(fmt, ...) do { if (nvaccel_verbose()) ALOG(fmt, ##__VA_ARGS__); } while (0)
 #include <libkern/c++/OSSymbol.h>
 #include "nvrm_vram_abi.h"
+#include "nvrm_copy_present.h"
 #include <IOKit/IODeviceMemory.h>
 #include "tahoe_fwd.h"   // macOS 26: inherited slots Apple no longer exports, forwarded through its vtables
 #include "nvaccel_stubs.h"
@@ -323,7 +325,22 @@ public:
     IOService *volatile fFBs[kNvMaxFB] = {};
     unsigned fFBRegistered = 0;
     IOLock *fRegLock = nullptr;
+    IOWorkLoop *fLateFramebufferLoop = nullptr;
+    IOTimerEventSource *fLateFramebufferTimer = nullptr;
     OSObject *fMetalPlugin = nullptr;
+    static void registerLateFramebuffers(OSObject *owner, IOTimerEventSource *) {
+        auto *me = static_cast<NVAccel *>(owner);
+        IOLockLock(me->fRegLock);
+        const unsigned added = me->registerPendingLocked("hot-plug", kNvMaxFB - 1);
+        if (added) me->onCountGrewLocked();
+        IOService *primary = me->fFB;
+        IOLockUnlock(me->fRegLock);
+
+        // Re-probe from the open head once the new pipe is available. The
+        // new framebuffer cannot signal its own connect handler before open.
+        if (added && primary)
+            primary->requestProbe(kIOFBUserRequestProbe);
+    }
     static bool fbPublished(void *target, void *ref, IOService *newService, IONotifier *note) {
         (void)ref; (void)note;
         NVAccel *me = (NVAccel *)target;
@@ -337,10 +354,12 @@ public:
         const unsigned idx = (unsigned)slot;
         if (newService->metaCast(NVRM_GOP_PANEL) && (!me->fGopCopy || idx != kNvrmGopSlot)) return true;
         const char *what = "kept";
+        bool added = false;
         if (idx >= kNvMaxFB) what = "OUT OF RANGE -- this head will get no pipe";
         else {
             newService->retain();
-            if (OSCompareAndSwapPtr(nullptr, newService, (void *volatile *)&me->fFBs[idx])) OSBitOrAtomic(1u << idx, &gNvHeadsPublished);
+            added = OSCompareAndSwapPtr(nullptr, newService, (void *volatile *)&me->fFBs[idx]);
+            if (added) OSBitOrAtomic(1u << idx, &gNvHeadsPublished);
             else { newService->release(); what = "DUPLICATE -- the first one keeps the slot"; }
         }
         newService->retain();
@@ -360,11 +379,10 @@ public:
         } else if (idx != 0 || !OSCompareAndSwapPtr(nullptr, newService, (void *volatile *)&me->fFB)) newService->release();
         unsigned before = me->fDM ? me->fDM->getFramebufferCount() : 0xFFFFFFFFu;
         ALOG("%s published -- display machine framebuffer count = %u (index %u %s)", newService->getName(), before, idx, what);
-        if (gNvAccelArmed)
-            ALOG("  index %u published AFTER the arm: it gets a pipe only when debug.nvaccelfb=3 is written again, "
-                 "and WindowServer composites it only after a WindowServer restart", idx);
-        else
-            ALOG("  to register it:  sudo sysctl -w debug.nvaccelfb=1   (2 = re-run the family's own sweep)");
+        // Leave IOKit matching before handing the framebuffer to the display
+        // machine. Boot registration still owns the initial set of pipes.
+        if (added && idx < kNvMaxFB - 1 && gNvAccelArmed && gNvScanout && me->fLateFramebufferTimer)
+            me->fLateFramebufferTimer->setTimeoutMS(50);
         return true;
     }
     IOService *gopPanel() const {
@@ -544,10 +562,10 @@ public:
                  when, i, *(const volatile uint8_t *)(p + 0x298), *(const volatile uint8_t *)(p + 0x282));
         }
     }
-    unsigned registerPendingLocked(const char *why) {
+    unsigned registerPendingLocked(const char *why, unsigned slotCount = kNvMaxFB) {
         unsigned added = 0;
         IOService *gop = gopPanel();
-        for (unsigned i = 0; i < kNvMaxFB; i++) {
+        for (unsigned i = 0; i < slotCount; i++) {
             IOService *fb = fFBs[i];
             if (!fb) {
                 // The Intel panel (index 4, NMIntelFB) does not wait for NVIDIA heads that never publish: a machine with one
@@ -858,6 +876,15 @@ public:
             OSDictionary *fbm = serviceMatching("NVRMNVDAFramebuffer");
 #endif
             if (fbm) {
+                if (fRegLock && (fLateFramebufferLoop = IOWorkLoop::workLoop())) {
+                    fLateFramebufferTimer = IOTimerEventSource::timerEventSource(this, registerLateFramebuffers);
+                    if (!fLateFramebufferTimer ||
+                        fLateFramebufferLoop->addEventSource(fLateFramebufferTimer) != kIOReturnSuccess) {
+                        OSSafeReleaseNULL(fLateFramebufferTimer);
+                        OSSafeReleaseNULL(fLateFramebufferLoop);
+                        ALOG("late framebuffer registration worker could not start");
+                    }
+                }
                 fFBNote = addMatchingNotification(gIOFirstPublishNotification, fbm, &NVAccel::fbPublished, this, nullptr, 0);
                 fbm->release();
                 ALOG("watching for NVRMFramebuffer to publish -> notifier %p", fFBNote);
@@ -1075,6 +1102,14 @@ public:
 
     virtual void stop(IOService *provider) APPLE_KEXT_OVERRIDE {
         ALOG("stop");
+        if (fFBNote) { fFBNote->remove(); fFBNote = nullptr; }
+        if (fIntelNote) { fIntelNote->remove(); fIntelNote = nullptr; }
+        if (fLateFramebufferTimer) {
+            fLateFramebufferTimer->cancelTimeout();
+            fLateFramebufferLoop->removeEventSource(fLateFramebufferTimer);
+            OSSafeReleaseNULL(fLateFramebufferTimer);
+            OSSafeReleaseNULL(fLateFramebufferLoop);
+        }
         stopTemperature();
         stopUtilization();
         if (fGopNote) { fGopNote->remove(); fGopNote = nullptr; }
@@ -1448,7 +1483,8 @@ bool NVDisplayPipe::isTransactionComplete(IOAccelDisplayPipeTransaction2 *)
 }
 
 static void nvAccelSurfScanoutSync(IOSurface *s);
-static bool nvAccelSurfCopyReady(IOSurface *s, unsigned head, bool strict = false);
+static bool nvAccelSurfCopyReady(IOSurface *s, unsigned head, bool strict);
+static IOReturn nvAccelPresentVramCopy(NVAccel *a, IOService *fb, IOSurface *s);
 static bool nvAccelIopFlip(IOService *fb, unsigned head, IOSurface *s, void *pipe);
 static bool nvSurfWaitReady(unsigned int id);
 static void nvAccelIopHome(IOService *fb, unsigned head);
@@ -1463,6 +1499,8 @@ IOReturn NVDisplayPipe::performTransaction(IOAccelDisplayPipeTransaction2 *txn)
     const bool gopPanel = head == kNvrmGopSlot && fb->metaCast(NVRM_GOP_PANEL);
     NVIntelFrameLease intelFrame(fb);
     if (intelFrame.blocked()) return kIOReturnSuccess; // Preserve the last frame; never reuse an unsafe buffer.
+    const bool buffered = fb->metaCast("NVRMNVDAFramebuffer") &&
+        fb->getProperty(NVRM_COPY_PRESENT_PROPERTY) == kOSBooleanTrue;
 
     IOSurface *s  = txn->getPlaneIOSurface(0, 0);
     OSObject  *ro = txn->getPlaneResource(0, 0);
@@ -1491,7 +1529,7 @@ IOReturn NVDisplayPipe::performTransaction(IOAccelDisplayPipeTransaction2 *txn)
         if ((unsigned long long)pitch < 4ull * w) NVIOP_FAIL(kIOReturnBadArgument, "resource %ux%u: +0xb8 reads %u, which is not a row pitch (need >= %u) — not a surface buffer", w, h, pitch, 4u * w);
         if ((unsigned long long)h * pitch > vm->fBytes) NVIOP_FAIL(kIOReturnOverrun, "resource %ux%u pitch %u exceeds its %llu bytes", w, h, pitch, (unsigned long long)vm->fBytes);
         src = (const volatile unsigned int *)vm->fKva; fromRes = true;
-    } else if (s && nvAccelIopFlip(fb, head, s, this)) {
+    } else if (s && !buffered && nvAccelIopFlip(fb, head, s, this)) {
         OSAddAtomic64(1, &gCntIopSrcSurf); OSAddAtomic64(1, &gCntIopOk); OSAddAtomic64(1, &gCntIopOkHead[head]);
         return kIOReturnSuccess;
     } else if (s) {
@@ -1500,7 +1538,18 @@ IOReturn NVDisplayPipe::performTransaction(IOAccelDisplayPipeTransaction2 *txn)
         // (1.13-1.14.1), nvaccel_iop_blank about half of every copied frame, never on machines whose frames all flip.
         // Such a frame now keeps the previous picture on the panel instead.
         const bool gpuReady = nvSurfWaitReady(s->getSurfaceID());
-        if ((intelFrame.active() || gopPanel) && !gpuReady) return kIOReturnSuccess;
+        if ((intelFrame.active() || gopPanel || buffered) && !gpuReady) return kIOReturnSuccess;
+        if (buffered && fb->getProperty(NVRM_COPY_PRESENT_VRAM_PROPERTY) == kOSBooleanTrue) {
+            const IOReturn result = nvAccelPresentVramCopy(a, fb, s);
+            if (result != kIOReturnUnsupported) {
+                if (result == kIOReturnSuccess) {
+                    OSAddAtomic64(1, &gCntIopSrcSurf);
+                    OSAddAtomic64(1, &gCntIopOk);
+                    OSAddAtomic64(1, &gCntIopOkHead[head]);
+                }
+                return kIOReturnSuccess;
+            }
+        }
         const int directMode = __atomic_load_n(&gIopDirect, __ATOMIC_ACQUIRE);
         if (intelFrame.active() && (directMode == 1 || directMode == 2)) {
             const uint64_t start = mach_absolute_time();
@@ -1519,7 +1568,7 @@ IOReturn NVDisplayPipe::performTransaction(IOAccelDisplayPipeTransaction2 *txn)
                 return kIOReturnSuccess;
             }
         }
-        if (!nvAccelSurfCopyReady(s, head, gopPanel)) return kIOReturnSuccess;
+        if (!nvAccelSurfCopyReady(s, head, buffered || gopPanel)) return kIOReturnSuccess;
         const unsigned fmt = s->getPixelFormat();
         from10 = (fmt == NV_IOP_FMT_L10R);
         if (fmt != NV_IOP_FMT_BGRA && !from10) NVIOP_FAIL(kIOReturnUnsupported, "surface 0x%x format 0x%08x is not BGRA or l10r", s->getSurfaceID(), fmt);
@@ -1545,7 +1594,25 @@ IOReturn NVDisplayPipe::performTransaction(IOAccelDisplayPipeTransaction2 *txn)
         OSAddAtomic64(1, fromRes ? &gCntIopSrcRes : &gCntIopSrcSurf);
         OSAddAtomic64(1, &gCntIopOk);
         OSAddAtomic64(1, &gCntIopOkHead[head]);
+
         return kIOReturnSuccess;
+    }
+    if (buffered) {
+        NVRMCopyPresentRequest request = {NVRM_COPY_PRESENT_ABI_VERSION,
+            from10 ? NV_IOP_FMT_L10R : NV_IOP_FMT_BGRA, w, h, pitch, src};
+        const OSSymbol *present = OSSymbol::withCStringNoCopy(NVRM_COPY_PRESENT_FN);
+        if (!present) return kIOReturnSuccess;
+        const IOReturn result = fb->callPlatformFunction(present, false, &request, nullptr, nullptr, nullptr);
+        present->release();
+        if (result == kIOReturnSuccess) {
+            if (from10) OSAddAtomic64(1, &gCntIopL10r);
+            OSAddAtomic64(1, fromRes ? &gCntIopSrcRes : &gCntIopSrcSurf);
+            OSAddAtomic64(1, &gCntIopOk);
+            OSAddAtomic64(1, &gCntIopOkHead[head]);
+        }
+        // A refused or busy flip keeps the old frame. A mode outside the buffered
+        // renderer's capabilities uses the normal scanout path for that mode.
+        if (result != kIOReturnUnsupported) return kIOReturnSuccess;
     }
 
     struct NVRMVramRequest q;
@@ -2664,9 +2731,41 @@ static void nvAccelSurfScanoutSync(IOSurface *s)
 }
 // True when the surface's system memory holds its newest pixels, after moving them there if the GPU drew them into VRAM.
 // Unlike nvAccelSurfScanoutSync it waits a few ms for the accelerator lock and does not clear the pending mark when the
-// page-off fails. At most 4 frames in a row are held back per head: a surface that never syncs is copied as before
-// rather than freezing the panel.
+// page-off fails. Legacy scanout holds at most four frames per head. Buffered
+// presentation can keep the prior complete frame until the new copy is ready.
 static unsigned gIopCopyHeld[kNvMaxFB];
+static IOReturn nvAccelPresentVramCopy(NVAccel *a, IOService *fb, IOSurface *s)
+{
+    const auto width = s->getWidth(), height = s->getHeight(), pitch = s->getBytesPerRow();
+    const unsigned id = s->getSurfaceID();
+    if (s->getPixelFormat() != NV_IOP_FMT_BGRA || !width || !height ||
+        width > 16384 || height > 16384 || pitch < width * 4 || pitch > 16384ull * 8 || (pitch & 3) ||
+        !nvSVPend(id, 2) || !nvFamLock(a, true)) return kIOReturnUnsupported;
+    void *cache = _ZN22IOGraphicsAccelerator223deviceCacheForIOSurfaceEP9IOSurfacej(a, s, 0);
+    OSObject *object = cache ? *reinterpret_cast<OSObject *volatile *>(static_cast<unsigned char *>(cache) + 0x20) : nullptr;
+    auto *resource = OSDynamicCast(NVResource, object);
+    auto *memory = resource ? nvres_vidmem(resource) : nullptr;
+    const volatile unsigned short *valid = resource ?
+        *reinterpret_cast<unsigned short *volatile *>(reinterpret_cast<volatile unsigned char *>(resource) + 0x30) : nullptr;
+    NVRMCopyVramPresentRequest request = {NVRM_COPY_PRESENT_ABI_VERSION, (unsigned)width, (unsigned)height,
+                                           (unsigned)pitch, nullptr, 0};
+    if (memory && memory->fRmHandle && !memory->fScanout && memory->fBytes >= pitch * height &&
+        valid && !(valid[0] & 1u) && (valid[6] & 1u) && nvAccelResPluginWrote(resource)) {
+        request.sourceMemory = memory->fRmHandle;
+        request.allocationCookie = memory->fAllocationCookie;
+    }
+    if (cache) static_cast<OSObject *>(cache)->release();
+    nvFamUnlock(a);
+    if (!request.sourceMemory || !request.allocationCookie) return kIOReturnUnsupported;
+    // The framebuffer validates the cookie before using the pointer. Drop the
+    // family lock before entering the framebuffer's allocation and display gate.
+    const OSSymbol *present = OSSymbol::withCStringNoCopy(NVRM_COPY_PRESENT_VRAM_FN);
+    if (!present) return kIOReturnUnsupported;
+    const IOReturn result = fb->callPlatformFunction(present, false, &request, nullptr, nullptr, nullptr);
+    present->release();
+    return result;
+}
+
 static bool nvAccelSurfCopyReady(IOSurface *s, unsigned head, bool strict)
 {
     NVAccel *a = NVAccel::gAccel;

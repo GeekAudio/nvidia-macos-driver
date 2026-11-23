@@ -50,6 +50,23 @@ SYSCTL_QUAD(_debug, OID_AUTO, nvrm_pageoff_perpage, CTLFLAG_RD | CTLFLAG_LOCKED,
 static volatile SInt32 gSsSysctl = 0;
 extern "C" NV_STATUS nvrm_ce_copy_to_pages(void *nv, NvU32 hClient, NvU32 hMemory, const NvU64 *pages, NvU64 pageCount,
                                            NvU64 length, NvU64 *pUsec);
+extern "C" NV_STATUS nvrm_ce_copy_memory(void *nv, NvU32 hClient, NvU32 source, NvU32 destination,
+                                         NvU64 length, NvBool *issued);
+
+extern "C" void nvrm_surfshare_copy_memory(NVRMSurfCopyMemory *copy, void *nv)
+{
+    copy->result = NVRM_SS_COPY_UNAVAILABLE;
+    if (copy->version != NVRM_SS_RM_VERSION || !copy->length) return;
+    unsigned client = 0;
+    if (!nvrm_kapi_dev_handles(copy->kapiDevice, &client, nullptr, nullptr) || !client) return;
+    const unsigned source = nvrm_kapi_mem_handle(copy->sourceMemory);
+    const unsigned destination = nvrm_kapi_mem_handle(copy->destinationMemory);
+    NvBool issued = NV_FALSE;
+    const NV_STATUS status = nvrm_ce_copy_memory(nv, client, source, destination, copy->length, &issued);
+    if (status == NV_OK) copy->result = NVRM_SS_COPY_COMPLETE;
+    else if (issued) copy->result = NVRM_SS_COPY_UNCERTAIN;
+}
+
 extern "C" int nvrm_surfshare_pageoff(struct NVRMSurfPageoff *p, void *nv)
 {
     if (!p || p->version != NVRM_SS_RM_VERSION) { if (p) p->status = NVRM_SS_BAD_VERSION; return 0; }

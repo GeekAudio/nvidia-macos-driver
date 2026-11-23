@@ -39,6 +39,15 @@ assert 'nvAccelIopVramFlippable(vramNewest, nvAccelPluginWrote(res->fPluginWrote
 copy = body('static bool nvAccelSurfCopyReady(IOSurface *s, unsigned head, bool strict)')
 assert 'nvAccelIopCopyNeedsPageoff(false, nvAccelResPluginWrote(res))' in copy, 'the copied-frame path no longer checks the plugin write before paging off'
 assert 'if (!strict && ++gIopCopyHeld[head] > 4)' in copy, 'an AMD panel must keep the last good frame when page-off fails'
+transaction = body('IOReturn NVDisplayPipe::performTransaction(IOAccelDisplayPipeTransaction2 *txn)')
+assert 'const bool gopPanel = head == kNvrmGopSlot && fb->metaCast(NVRM_GOP_PANEL);' in transaction, \
+    'the AMD GOP panel path is no longer identified'
+assert 'const bool buffered = fb->metaCast("NVRMNVDAFramebuffer") &&' in transaction, \
+    'the NVIDIA buffered-copy path is no longer identified'
+assert 'nvAccelSurfCopyReady(s, head, buffered || gopPanel)' in transaction, \
+    'strict source readiness must cover both the GOP and buffered-copy paths'
+assert transaction.index('if (gopPanel) {') < transaction.index('if (buffered) {'), \
+    'GOP scanout must keep its own copy entry point before the NVIDIA buffered path'
 
 control = '''
 static inline bool nvAccelIopVramFlippable(bool vramNewest, bool) { return vramNewest; }

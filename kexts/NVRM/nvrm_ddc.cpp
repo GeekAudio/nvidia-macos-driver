@@ -67,8 +67,9 @@ extern "C" int nvrm_ddc_transfer(struct NVRMDdcRequest *r)
 {
     if (!r) return -1;
     r->status = 0;
-    if (!nvrmDdcAddrAllowed(r->addr7) || !r->len || r->len > kNvrmDdcMax || (r->op != kNvrmDdcWrite && r->op != kNvrmDdcRead)
-        || (r->op == kNvrmDdcWrite && !nvrmDdcWriteLenAllowed(r->addr7, r->len)))
+    if (!nvrmDdcAddrAllowed(r->addr7) || !r->len || r->len > kNvrmDdcMax ||
+        (r->op != kNvrmDdcWrite && r->op != kNvrmDdcRead) ||
+        (r->op == kNvrmDdcWrite && !nvrmDdcWriteLenAllowed(r->addr7, r->len)))
         { r->status = NV_ERR_INVALID_ARGUMENT; return -1; }
     nv_state_t *nv = nv_xnu_gpu_state();
     if (!nv || nv->gpu_id != r->gpuId || !nv->rmapi.hClient || !nv->rmapi.hDisp) { r->status = NV_ERR_OBJECT_NOT_FOUND; return -1; }
@@ -102,7 +103,6 @@ extern "C" int nvrm_ddc_transfer(struct NVRMDdcRequest *r)
                                 (NvU8)r->addr7, 0, r->len, r->data);
     return r->status == 0 ? 0 : -1;
 }
-
 // One native DPCD read or write on the display's AUX channel (NV0073_CTRL_CMD_DP_AUXCH_CTRL, public control interface).
 // Only the eDP panel-control range is reachable: DPCD 0x700 to 0x7ff, where the backlight registers are.
 #include "ctrl/ctrl0073/ctrl0073dp.h"

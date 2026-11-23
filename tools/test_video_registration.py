@@ -10,6 +10,7 @@ START = SOURCE.index("static bool nvmtl_is_decode_service(")
 END = SOURCE.index("static void nvmtl_nvdec_register(", START)
 
 HARNESS = r'''
+#include <CoreFoundation/CoreFoundation.h>
 #include <dispatch/dispatch.h>
 #include <assert.h>
 #include <stdbool.h>
@@ -19,13 +20,14 @@ HARNESS = r'''
 #include <string.h>
 #include <mach/mach.h>
 #include <mach/mach_vm.h>
-typedef uint32_t io_service_t, io_connect_t;
+typedef uint32_t io_service_t, io_connect_t, io_iterator_t;
 typedef int IOReturn;
 #define IO_OBJECT_NULL 0
 #define kIOMainPortDefault 0
 #define kIOReturnSuccess 0
 #define kIOReturnNotFound 1
 static int scenario, queries, opens, closes, releases, matches, logs;
+static int pci_index;
 static int program_argc = 2;
 static char *argument_storage[6] = {"VideoApp", "--type=gpu-process", NULL, NULL, NULL, NULL};
 static char **program_argv = argument_storage;
@@ -47,18 +49,62 @@ static void nvlog(const char *fmt, ...) { logs++; }
 #undef mach_task_self
 static unsigned mach_task_self(void) { return 99; }
 static void *IOServiceMatching(const char *name) {
+    if (!strcmp(name, "IOPCIDevice")) return (void *)2;
     assert(!strcmp(name, "NVAccel")); return (void *)1;
 }
 static io_service_t IOServiceGetMatchingService(unsigned port, void *match) {
     assert(!port && match == (void *)1); matches++;
     return scenario == 2 ? 0 : 17;
 }
+static int IOServiceGetMatchingServices(unsigned port, void *match, io_iterator_t *out)
+{
+    assert(!port && match == (void *)2);
+    if (scenario == 42) return 1;
+    pci_index = 0;
+    *out = 21;
+    return 0;
+}
+static io_service_t IOIteratorNext(io_iterator_t iterator)
+{
+    assert(iterator == 21);
+    return pci_index < 2 ? 30 + pci_index++ : 0;
+}
+static bool IOIteratorIsValid(io_iterator_t iterator)
+{
+    assert(iterator == 21);
+    return scenario != 43;
+}
+static CFTypeRef IORegistryEntryCreateCFProperty(io_service_t device, CFStringRef key,
+                                                CFAllocatorRef allocator, unsigned options)
+{
+    assert((device == 30 || device == 31) && !options);
+    uint32_t value = 0;
+    if (CFEqual(key, CFSTR("class-code"))) {
+        if (scenario == 44) return NULL;
+        value = device == 30 && scenario != 41 ? 0x030000 : 0x040300;
+        if (device == 31 && scenario >= 38 && scenario <= 40) value = 0x030200;
+    } else if (CFEqual(key, CFSTR("vendor-id"))) {
+        value = device == 31 && scenario == 38 ? 0x8086 : device == 31 && scenario == 39 ? 0x1002 : 0x10de;
+    } else {
+        assert(CFEqual(key, CFSTR("device-id")));
+        value = scenario == 47 ? 0x2800 : 0x2206;
+    }
+    return CFDataCreate(allocator, (const UInt8 *)&value, sizeof(value));
+}
+static CFBundleRef test_main_bundle(void) { return (CFBundleRef)(uintptr_t)1; }
+static CFStringRef test_bundle_identifier(CFBundleRef bundle)
+{
+    assert(bundle);
+    return scenario == 45 ? CFSTR("example.not-quicktime") : CFSTR("com.apple.QuickTimePlayerX");
+}
+#define CFBundleGetMainBundle test_main_bundle
+#define CFBundleGetIdentifier test_bundle_identifier
 static IOReturn IOServiceOpen(io_service_t service, unsigned task, uint32_t type,
                              io_connect_t *out) {
     assert(service == 17 && task == 99);
     assert(type == 0x4E560000u + (unsigned)opens++);
     assert(*out == 0);
-    if ((scenario == 3 && type == 0x4E560000u) ||
+    if (((scenario == 3 || scenario == 46) && type == 0x4E560000u) ||
         (scenario == 4 && type == 0x4E560001u)) return 2;
     if (scenario != 6) *out = type == 0x4E560000u ? 101 : 102;
     return 0;
@@ -66,7 +112,10 @@ static IOReturn IOServiceOpen(io_service_t service, unsigned task, uint32_t type
 static void IOServiceClose(io_connect_t port) {
     assert(port == 101 || port == 102); closes++;
 }
-static void IOObjectRelease(io_service_t service) { assert(service == 17); releases++; }
+static void IOObjectRelease(io_service_t service) {
+    if (service == 21 || service == 30 || service == 31) return;
+    assert(service == 17); releases++;
+}
 PRODUCTION
 int main(int argc, char **argv) {
     scenario = atoi(argv[1]);
@@ -81,7 +130,9 @@ int main(int argc, char **argv) {
         assert(nvmtl_can_register_decoder(name) == expected);
         assert(nvmtl_can_register_decoder(name) == expected);
         if (!strcmp(name, "com.apple.WebKit.GPU")) {
-            assert(nvmtl_nvencvt_scope(name, expected) == (expected ? 1u : 0u));
+            const bool addon = nvmtl_nvencvt_can_register_decoder(name);
+            assert(addon == expected);
+            assert(nvmtl_nvencvt_scope(name, addon) == (addon ? 1u : 0u));
             assert(!queries);
             if (!strcmp(argv[3], "1") && !*argv[4]) {
                 assert(matches == 1 && logs == 1);
@@ -125,6 +176,17 @@ int main(int argc, char **argv) {
         }
         if (scenario == 35) { program_argc=4097; }
         if (scenario == 36) { argument_storage[0]=(char *)(uintptr_t)1; }
+    }
+    if (scenario >= 37) {
+        program_argc = 1;
+        name = "QuickTime Player";
+        assert(!nvmtl_can_register_decoder(name));
+        bool addon = nvmtl_nvencvt_can_register_decoder(name);
+        assert(addon == (scenario == 37));
+        assert(nvmtl_nvencvt_scope(name, addon) == (scenario == 37 ? 3u : 2u));
+        setenv("NVMTL_NO_NVDEC", "1", 1);
+        assert(nvmtl_nvencvt_scope(name, addon) == 2u);
+        return 0;
     }
     if (scenario < 23 && program_argv && program_argc > 0) {
         // the other scenarios get exec's layout too, so the Gecko walk reads exactly these strings
@@ -211,6 +273,17 @@ def main():
         "overflowing Gecko parent pid is rejected",
         "unreasonable Gecko argument count is rejected",
         "an unreadable argv string pointer is rejected without dereferencing it",
+        "QuickTime uses only the external decoder for one Ampere GPU with a working bridge",
+        "QuickTime keeps default decoding when a headless Intel display controller exists",
+        "QuickTime keeps default decoding when an AMD display controller exists",
+        "QuickTime keeps default decoding with two NVIDIA display controllers",
+        "QuickTime keeps default decoding when no display GPU was found",
+        "QuickTime keeps default decoding when PCI enumeration fails",
+        "QuickTime keeps default decoding when the PCI iterator becomes invalid",
+        "QuickTime keeps default decoding when a PCI class cannot be read",
+        "an unrelated bundle named QuickTime Player is not opted in",
+        "QuickTime keeps default decoding when the sandbox denies the bridge",
+        "QuickTime keeps default decoding on Ada",
     )
     with tempfile.TemporaryDirectory(prefix="nvmtl-video-registration-") as tmp:
         src, exe = Path(tmp) / "test.m", Path(tmp) / "test"
@@ -244,6 +317,10 @@ def main():
         assert body.index('"WindowServer"') < body.index("nvmtl_can_register_decoder(me)")
         assert "NVMTL_NO_NVDEC" in body
     print("PASS both decoders retain disable/WindowServer guards and use the access check")
+    addon_start = SOURCE.index("static void nvmtl_nvencvt_register(void)\n{")
+    addon_body = SOURCE[addon_start:SOURCE.index("\n}\n", addon_start) + 3]
+    assert "nvmtl_nvencvt_scope(me, nvmtl_nvencvt_can_register_decoder(me))" in addon_body
+    print("PASS external addon uses the scoped QuickTime exception while built-in factories retain upstream policy")
 
 
 if __name__ == "__main__":

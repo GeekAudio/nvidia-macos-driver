@@ -35,6 +35,24 @@ assert unlocked < hotplug.index('notify[f]->notifyConnectionChanged(500);')
 assert unlocked < hotplug.index('fb->reflip()')
 assert 'fb->fDpyLost = false;' in hotplug and 'fb->notifyConnectionChanged(500);' in hotplug
 assert 'fb->fSurf =' not in hotplug and 'fb->fSize =' not in hotplug
+standby = extract(src, 'bool NVRMNVDAFramebuffer::activateStandby(')
+assert standby.index('if (!sink.connected) return false;') < standby.index('switchMode(kModeId')
+assert standby.index('if (result != kIOReturnSuccess)') < standby.index('takeEdid(sink.edid')
+assert standby.index('takeEdid(sink.edid') < standby.index('fDpyLost = false;')
+assert standby.index('clock_interval_to_deadline(15000, kMillisecondScale, &fBlackLutDeadline)') < standby.index('fDpyLost = false;')
+gamma = extract(src, 'IOReturn NVRMNVDAFramebuffer::nvrmSetGamma(')
+assert 'black && (fStandby || (fBlackLutDeadline && mach_absolute_time() < fBlackLutDeadline))' in gamma
+assert gamma.index('all-black table ignored') < gamma.index('if (!fGamma)')
+assert 'fBlackLutDeadline = 0' not in gamma
+assert standby.index('fDpyLost = false;') < standby.index('publishDisplayAudioProperties();')
+assert 'if (standby->activateStandby()) standby->notifyConnectionChanged(100);' in hotplug
+assert hotplug.index('IORecursiveLockUnlock(sl);', hotplug.index('const unsigned displayCount')) < hotplug.index('standby->activateStandby()')
+for method in ('applyMode(', 'flipToMemory(', 'setDisplayMode('):
+    assert 'if (fStandby) return' in extract(src, 'NVRMNVDAFramebuffer::' + method)
+assert 'if (fDpyLost) return kIOReturnSuccess;' in extract(src, 'IOReturn NVRMNVDAFramebuffer::enableController(')
+vbl = extract(src, 'void NVRMNVDAFramebuffer::vblFire(')
+assert '!me->fStandby && me->fOwnsHead && me->fModeSet && !me->fDpyLost &&' in vbl
+assert vbl.index('!me->fStandby && me->fOwnsHead') < vbl.index('registerVblankIntrCallback(')
 fixture = r'''
 #include <cassert>
 #include <cstdint>
@@ -48,20 +66,43 @@ kConnectionControllerDepthsSupported=6,kConnectionColorMode=7,kConnectionCheckEn
 kConnectionSupportsHLDDCSense=10,kConnectionSupportsAppleSense=11,kConnectionSupportsLLDDCSense=12,
 kConnectionDisplayParameterCount=13,kConnectionDisplayParameters=14,kIOConnectionBuiltIn=1,kIODDCBlockTypeEDID=1 };
 #define FBSEL(a) char _s[5]={(char)((a)>>24),(char)((a)>>16),(char)((a)>>8),(char)(a),0}
-#define FBLOG(...) ((void)0)
+#define FBLOG(...) do { if (false) std::printf(__VA_ARGS__); } while (0)
 static void nvu_copy(void*d,const void*s,size_t n){std::memcpy(d,s,n);}
 static void clock_interval_to_deadline(unsigned ms,int,std::uint64_t*d){*d=ms;} static int kMillisecondScale=1;
 struct OSObject{int refs=1;void retain(){++refs;}void release(){--refs;}};
-class Base{public:IOReturn getAttributeForConnection(IOIndex,IOSelect,std::uintptr_t*){return 77;}};
-struct NVRMNVDAFramebuffer:OSObject,Base{
+class IOFramebuffer {
+public:
+    IOReturn getAttributeForConnection(IOIndex,IOSelect,std::uintptr_t*){return 77;}
+    IOReturn open();
+};
+struct NVRMNVDAFramebuffer:OSObject,IOFramebuffer{
 volatile int fConnectOwed=0;
-using super=Base; bool fDpyLost=false,fHidden=false,fInternal=false,fConnectFired=false,fRotationEnabled=false; unsigned fEdidSize=0,fIndex=0; UInt8 fEdid[256]={};
+using super=IOFramebuffer; bool fDpyLost=false,fHidden=false,fInternal=false,fConnectFired=false,fRotationEnabled=false; unsigned fEdidSize=0,fIndex=0; UInt8 fEdid[256]={};
+bool fHotplugBorn=false,fHotplugStarted=false,hasAccelIndex=false,hasAccelPath=false;
+unsigned fEnableAbs=0,opens=0;
+bool getProperty(const char *name) { return !std::strcmp(name, "IOAccelIndex") ? hasAccelIndex : hasAccelPath; }
 volatile int fStopping=0; thread_call_t fConnectNotify=reinterpret_cast<void*>(1);
 struct{void(*proc)(void*,void*);void*target;void*ref;}fConnect{}; unsigned scheduled=0;std::uint64_t deadline=0;
 void scheduleCall(thread_call_t,std::uint64_t d){++scheduled;deadline=d;retain();}
 IOReturn getAttributeForConnection(IOIndex,IOSelect,std::uintptr_t*); IOReturn getDDCBlock(IOIndex,UInt32,IOSelect,IOOptionBits,UInt8*,IOByteCount*);
 void notifyConnectionChanged(unsigned); static void connectNotifyFire(thread_call_param_t,thread_call_param_t);
 };
+static unsigned displayGateDepth=0;
+struct NVRMDisplayGate {
+    NVRMDisplayGate(){++displayGateDepth;}
+    ~NVRMDisplayGate(){--displayGateDepth;}
+    bool valid() const {return true;}
+};
+static NVRMNVDAFramebuffer *gFBs[1]={};
+IOReturn IOFramebuffer::open() {
+    assert(displayGateDepth==0);
+    auto *fb=static_cast<NVRMNVDAFramebuffer *>(this);
+    ++fb->opens;
+    fb->fEnableAbs=1;
+    fb->fConnect.proc=[](void *,void *){};
+    fb->notifyConnectionChanged(1500);
+    return kIOReturnSuccess;
+}
 class NVRMCallReference{OSObject*p;public:explicit NVRMCallReference(OSObject*v):p(v){}~NVRMCallReference(){p->release();}};
 static int OSAddAtomic(int,volatile int*v){return *v;}
 static bool OSCompareAndSwap(int o,int n,volatile int*v){if(*v!=o)return false;*v=n;return true;}
@@ -88,7 +129,25 @@ assert(f.getDDCBlock(0,1,99,0,out,&n)==kIOReturnUnsupported);f.notifyConnectionC
 assert(f.scheduled==1&&f.deadline==500&&f.refs==2);unsigned calls=0;
 f.fConnect.proc=[](void*t,void*r){++*static_cast<unsigned*>(t);assert(r==reinterpret_cast<void*>(7));};
 f.fConnect.target=&calls;f.fConnect.ref=reinterpret_cast<void*>(7);NVRMNVDAFramebuffer::connectNotifyFire(&f,nullptr);
-assert(calls==1&&f.fConnectFired&&f.refs==1);puts("PASS: extracted production connection, DDC, scheduling, callback methods");}
+assert(calls==1&&f.fConnectFired&&f.refs==1);
+
+NVRMNVDAFramebuffer primary, late;
+gFBs[0]=&primary;
+auto fire=[&] {late.retain();NVRMNVDAFramebuffer::connectNotifyFire(&late,nullptr);};
+late.hasAccelIndex=late.hasAccelPath=true;
+fire();assert(late.opens==0); // Original boot framebuffer ownership.
+late.fHotplugBorn=true;
+fire();assert(late.opens==0); // Start is not complete.
+late.fHotplugStarted=true;late.hasAccelPath=false;
+fire();assert(late.opens==0); // The accelerator has not bound it.
+late.hasAccelPath=true;late.fDpyLost=true;
+fire();assert(late.opens==0); // It was disconnected before activation.
+late.fDpyLost=false;
+fire();
+assert(late.opens==1&&late.scheduled==1&&late.deadline==1500);
+assert(primary.scheduled==1&&primary.deadline==100);
+fire();assert(late.opens==1&&primary.scheduled==1);
+puts("PASS: connection and DDC methods, plus late framebuffer activation after the accelerator binds it");}
 '''
 with tempfile.TemporaryDirectory() as td:
     temp=pathlib.Path(td); cpp=temp/'check.cpp'; cpp.write_text(fixture+'\n'+attrs+'\n'+ddc+'\n'+notify+'\n'+callback+'\n'+checks,encoding='utf-8')

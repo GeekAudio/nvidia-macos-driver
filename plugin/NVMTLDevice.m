@@ -541,6 +541,47 @@ static bool nvmtl_can_register_decoder(const char *me)
     return (nvmtl_is_chromium_gpu_process() || nvmtl_is_gecko_decoder_process())
         && nvmtl_sandbox_decoder_bridge_available(me);
 }
+static bool nvmtl_read_pci_value(io_service_t device, CFStringRef key, uint32_t *value)
+{
+    CFTypeRef data = IORegistryEntryCreateCFProperty(device, key, kCFAllocatorDefault, 0);
+    bool ok = data && CFGetTypeID(data) == CFDataGetTypeID() && CFDataGetLength(data) >= sizeof(*value);
+    if (ok) CFDataGetBytes(data, CFRangeMake(0, sizeof(*value)), (UInt8 *)value);
+    if (data) CFRelease(data);
+    return ok;
+}
+static bool nvmtl_only_ampere_display_gpu(void)
+{
+    // Check PCI display controllers, including an iGPU without a Metal driver.
+    // A second display GPU or an incomplete inventory retains the system route.
+    io_iterator_t devices = IO_OBJECT_NULL;
+    if (IOServiceGetMatchingServices(kIOMainPortDefault, IOServiceMatching("IOPCIDevice"), &devices) != KERN_SUCCESS)
+        return false;
+    bool found = false, valid = true;
+    for (io_service_t device; valid && (device = IOIteratorNext(devices)); IOObjectRelease(device)) {
+        uint32_t deviceClass;
+        valid = nvmtl_read_pci_value(device, CFSTR("class-code"), &deviceClass);
+        if (!valid || (deviceClass >> 16) != 0x03) continue;
+        uint32_t vendor, model;
+        valid = !found && nvmtl_read_pci_value(device, CFSTR("vendor-id"), &vendor) &&
+                nvmtl_read_pci_value(device, CFSTR("device-id"), &model) &&
+                vendor == 0x10de && model >= 0x2200 && model <= 0x25ff;
+        found = valid;
+    }
+    valid = valid && IOIteratorIsValid(devices);
+    IOObjectRelease(devices);
+    return valid && found;
+}
+static bool nvmtl_nvencvt_can_register_decoder(const char *me)
+{
+    if (nvmtl_can_register_decoder(me)) return true;
+    if (!me || strcmp(me, "QuickTime Player")) return false;
+    CFBundleRef bundle = CFBundleGetMainBundle();
+    CFStringRef identifier = bundle ? CFBundleGetIdentifier(bundle) : NULL;
+    if (!identifier || !CFEqual(identifier, CFSTR("com.apple.QuickTimePlayerX"))) return false;
+    // NVEncVT on GA10x checks the C7B0 decoder itself and uses the client's
+    // pixel-buffer requirements. Keep the exception away from the built-in factories.
+    return nvmtl_only_ampere_display_gpu() && nvmtl_sandbox_decoder_bridge_available(me);
+}
 static void nvmtl_nvdec_register(void)
 {
     static dispatch_once_t once;
@@ -640,7 +681,7 @@ static void nvmtl_nvencvt_register(void)
             if (!named) return;
         }
         if (!nvmtl_video_has_codecs()) return;
-        unsigned scope = nvmtl_nvencvt_scope(me, nvmtl_can_register_decoder(me));
+        unsigned scope = nvmtl_nvencvt_scope(me, nvmtl_nvencvt_can_register_decoder(me));
         if (!scope) return;
         Dl_info di;
         if (!dladdr((const void *)nvmtl_nvencvt_register, &di) || !di.dli_fname) { nvlog("nvencvt: dladdr failed - not registering"); return; }
@@ -1832,6 +1873,26 @@ static NSUInteger nvmtl_surface_usage(NSUInteger usage, BOOL fbo, BOOL storage) 
 }
 
 static char nvmtl_surface_cache_key;
+static void nvmtl_pair_nv12_textures(NVMTLTexture *t, NSMapTable *cache) {
+    if (!t->_surf || t->_fbo || t->_usage != MTLTextureUsageShaderRead ||
+        IOSurfaceGetPlaneCount(t->_surf) != 2 || t->_plane > 1) return;
+    const uint32_t format = IOSurfaceGetPixelFormat(t->_surf);
+    if (format != 0x34323076u && format != 0x34323066u) return; // '420v' / '420f'
+    const bool luma = t->_plane == 0;
+    if (t->_fmt != (luma ? MTLPixelFormatR8Unorm : MTLPixelFormatRG8Unorm) ||
+        t->_i.w != IOSurfaceGetWidthOfPlane(t->_surf, t->_plane) ||
+        t->_i.h != IOSurfaceGetHeightOfPlane(t->_surf, t->_plane)) return;
+    const NSUInteger plane = luma ? 1 : 0;
+    const uint64_t key[] = {
+        IOSurfaceGetID(t->_surf), plane, IOSurfaceGetWidthOfPlane(t->_surf, plane),
+        IOSurfaceGetHeightOfPlane(t->_surf, plane),
+        luma ? MTLPixelFormatRG8Unorm : MTLPixelFormatR8Unorm, t->_ropt, 0
+    };
+    NVMTLTexture *sibling = [cache objectForKey:[NSData dataWithBytes:key length:sizeof key]];
+    if (!sibling || sibling->_usage != MTLTextureUsageShaderRead || sibling->_surf != t->_surf) return;
+    t->_nv12Companion = sibling;
+    sibling->_nv12Companion = t;
+}
 - (id<MTLTexture>)newTextureWithDescriptor:(MTLTextureDescriptor *)d iosurface:(IOSurfaceRef)surf plane:(NSUInteger)plane {
     @synchronized(self) {
         NSMapTable *cache = objc_getAssociatedObject(self, &nvmtl_surface_cache_key);
@@ -1890,7 +1951,11 @@ static char nvmtl_surface_cache_key;
     t->_stex = t->_i.storage == 1;
     t->_usage = nvmtl_surface_usage(d.usage, t->_fbo, t->_stex);
     nvmtl_texture_desc_swizzle(t, d);
-    if (key && (!t->_vramOn || t->_surfaceLinear.img)) [cache setObject:t forKey:key];
+    if (key && (!t->_vramOn || t->_surfaceLinear.img)) {
+        [cache setObject:t forKey:key];
+        // WindowServer keeps the original ShaderRead descriptor for video planes.
+        if (!nvmtl_surface_widen_usage(NO)) nvmtl_pair_nv12_textures(t, cache);
+    }
     nvlog("newTextureWithDescriptor:iosurface:%p plane:%lu -> %p (%zux%zu fmt %lu)",
           (void *)surf, (unsigned long)plane, (__bridge void *)t, w, h, (unsigned long)d.pixelFormat);
     return t; }

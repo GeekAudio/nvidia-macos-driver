@@ -35,6 +35,7 @@ struct NVRMSurfShareEsc {
 #ifdef NVRM_SS_KERNEL_ABI
 #define NVACCEL_SS_FN   "nvSurfVram"
 #define NVRM_SS_FN_PAGEOFF "nvSurfPageoff"
+#define NVRM_SS_FN_COPY_MEMORY "nvSurfCopyMemory"
 #define NVRM_SS_FN_RM   "nvSurfShareRm"
 #define NVRM_SS_RM_VERSION 2u
 enum { NVRM_SS_RM_SHARE_KAPI = 5 };
@@ -53,5 +54,12 @@ struct NVRMSurfPageoff {
     unsigned long long pageCount;
     unsigned long long length;
     unsigned long long usec;
+};
+// These pointers are private, pinned NVKMS allocations on the same device.
+enum { NVRM_SS_COPY_UNAVAILABLE, NVRM_SS_COPY_COMPLETE, NVRM_SS_COPY_UNCERTAIN };
+struct NVRMSurfCopyMemory {
+    unsigned int version, result;
+    void *kapiDevice, *sourceMemory, *destinationMemory;
+    unsigned long long length;
 };
 #endif

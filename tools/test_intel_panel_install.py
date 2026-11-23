@@ -95,7 +95,7 @@ class IntelPanelInstall(Install):
 
     def test_removal_rejects_collection_still_containing_panel(self):
         self.existing();r=self.run_panel('no',EXPECT_PANEL='1');self.assert_restored(r)
-        self.assertIn('retained deselected '+self.name,r.stderr);self.assert_creates(1)
+        self.assertIn('test collection retained deselected '+self.name,r.stderr);self.assert_creates(1)
 
     def test_preflight_missing_panel_stops_before_live_changes(self):
         r=self.run_panel('yes',EXPECT_PANEL='1',MISSING_PANEL='1');self.assert_restored(r)
@@ -113,7 +113,7 @@ class IntelPanelInstall(Install):
         import shutil
         shutil.rmtree(self.panel);self.refresh_manifest()
         r=self.run_panel('yes');self.assert_restored(r)
-        self.assertIn('lacks the optional',r.stderr)
+        self.assertIn('缺少可选的 '+('Intel' if self.name=='NMIntelFB' else 'AMD')+' 内屏 kext',r.stderr)
 
 
 class AMDPanelInstall(IntelPanelInstall):
@@ -135,7 +135,7 @@ class AMDPanelInstall(IntelPanelInstall):
 
         r = self.run_panel()
         self.assertEqual(r.returncode, 0, r.stdout+r.stderr)
-        self.assertIn('interrupted install was rolled back', r.stdout)
+        self.assertTrue('interrupted install was rolled back' in r.stdout or '回滚中断的安装' in r.stdout, r.stdout)
         self.assertFalse(self.live.exists())
 
     def test_second_prompt_can_install_amd_after_declining_intel(self):

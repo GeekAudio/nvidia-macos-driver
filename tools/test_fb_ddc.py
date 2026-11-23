@@ -24,8 +24,12 @@ fixture = r'''
 #include <cstring>
 #include <vector>
 #include "nvrm_ddc_abi.h"
-typedef int IOReturn; typedef uint32_t UInt32; typedef uint32_t IOOptionBits;
-enum { kIOReturnSuccess=0, kIOReturnUnsupported=-1, kIOReturnUnsupportedMode=-2, kIOReturnBadArgument=-3, kIOReturnNoDevice=-4, kIOReturnNotReady=-9 };
+#include "nvrm_ddc_vcp.h"
+#include "nvrm_eld.h"
+#include "nvrm-fb-safety.h"
+typedef int IOReturn; typedef uint32_t UInt32; typedef uint32_t IOOptionBits; typedef uint64_t UInt64;
+enum { kIOReturnSuccess=0, kIOReturnUnsupported=-1, kIOReturnUnsupportedMode=-2, kIOReturnBadArgument=-3,
+       kIOReturnNoDevice=-4, kIOReturnNotReady=-9, kIOReturnBusy=-10, kMillisecondScale=1000 };
 enum { kIOI2CNoTransactionType=0, kIOI2CSimpleTransactionType=1, kIOI2CDDCciReplyTransactionType=2, kIOI2CUseSubAddressCommFlag=2 };
 struct IOI2CBusTiming; struct IOI2CRequest {
     IOOptionBits sendTransactionType, replyTransactionType; uint32_t sendAddress, replyAddress; uint8_t sendSubAddress, replySubAddress;
@@ -34,6 +38,15 @@ struct IOI2CBusTiming; struct IOI2CRequest {
 };
 static void absolutetime_to_nanoseconds(uint64_t a, uint64_t *n) { *n = a; }
 static unsigned gSlept; static void IOSleep(unsigned ms) { gSlept += ms; }
+static void clock_interval_to_deadline(unsigned ms, int, uint64_t *deadline) { *deadline = ms; }
+class NVRMDdcTransaction {
+    bool *flag;
+    bool acquired;
+public:
+    explicit NVRMDdcTransaction(bool *busy) : flag(busy), acquired(!__atomic_exchange_n(flag, true, __ATOMIC_ACQUIRE)) {}
+    ~NVRMDdcTransaction() { if (acquired) __atomic_store_n(flag, false, __ATOMIC_RELEASE); }
+    bool held() const { return acquired; }
+};
 struct Call { unsigned op, addr, len; std::vector<unsigned char> w; };
 static std::vector<Call> gCalls; static IOReturn gFail = 0; static std::vector<unsigned char> gReply;
 struct NVRMDisplayGate { bool valid() { return true; } };
@@ -43,6 +56,8 @@ struct FB {
     int fStopping = 0;
     bool rmGpuReady() { return awake; }
     bool fDdcOn = true, fDpyLost = false; void *fKms = this;
+    bool fDdcInFlight = false; uint64_t fDdcWriteAfter = 0;
+    UInt32 fDdcSinkGeneration = 1, fDdcFastReadGeneration = 0;
     IOReturn ddcTransfer(unsigned op, unsigned addr, unsigned char *d, unsigned len) {
         Call c{op, addr, len, {}};
         if (op == kNvrmDdcWrite) c.w.assign(d, d + len); else memcpy(d, gReply.data(), len < gReply.size() ? len : gReply.size());
@@ -56,6 +71,71 @@ static IOI2CRequest req(unsigned char *w, unsigned wn, unsigned char *r, unsigne
     IOI2CRequest q{}; q.sendTransactionType = wn ? kIOI2CSimpleTransactionType : 0; q.sendAddress = 0x6E; q.sendBytes = wn; q.sendBuffer = (uintptr_t)w;
     q.replyTransactionType = rn ? kIOI2CDDCciReplyTransactionType : 0; q.replyAddress = 0x6F; q.replyBytes = rn; q.replyBuffer = (uintptr_t)r; return q;
 }
+
+static void checkVolume(FB &fb)
+{
+    uint8_t query[5], reply[11] = {}, write[7];
+    const uint8_t getVolume[] = {0x51, 0x82, 0x01, 0x62, 0xde};
+    const uint8_t setVolume[] = {0x51, 0x84, 0x03, 0x62, 0x00, 0x2a, 0xf0};
+    nvrmVcpGet(kNvrmVcpSpeakerVolume, query);
+    assert(memcmp(query, getVolume, sizeof query) == 0);
+    nvrmVcpSet(kNvrmVcpSpeakerVolume, 42, write);
+    assert(memcmp(write, setVolume, sizeof write) == 0);
+
+    gReply = {0x6e, 0x88, 0x02, 0x00, 0x62, 0x00, 0x00, 0x64, 0x00, 0x2a, 0};
+    auto checksum = [](uint8_t *bytes) {
+        bytes[10] = 0x50;
+        for (size_t i = 0; i < 10; ++i) bytes[10] ^= bytes[i];
+    };
+    checksum(gReply.data());
+    auto request = req(query, sizeof query, reply, sizeof reply);
+    assert(fb.doI2CRequest(0, nullptr, &request) == kIOReturnSuccess);
+    uint32_t value = 0, maximum = 0;
+    assert(nvrmVcpParse(kNvrmVcpSpeakerVolume, reply, request.replyBytes, value, maximum) == NVRMVcpReply::valid);
+    assert(value == 42 && maximum == 100);
+    assert(nvrmVcpParse(kNvrmVcpBrightness, reply, sizeof reply, value, maximum) == NVRMVcpReply::retry);
+    assert(nvrmVcpParse(kNvrmVcpSpeakerVolume, reply, sizeof reply - 1, value, maximum) == NVRMVcpReply::retry);
+    reply[9] = 101;
+    assert(nvrmVcpParse(kNvrmVcpSpeakerVolume, reply, sizeof reply, value, maximum) == NVRMVcpReply::retry);
+    checksum(reply);
+    assert(nvrmVcpParse(kNvrmVcpSpeakerVolume, reply, sizeof reply, value, maximum) == NVRMVcpReply::retry);
+    reply[3] = 1;
+    checksum(reply);
+    assert(nvrmVcpParse(kNvrmVcpSpeakerVolume, reply, sizeof reply, value, maximum) == NVRMVcpReply::unsupported);
+    reply[3] = 0;
+    reply[7] = 255;
+    reply[9] = 255;
+    checksum(reply);
+    assert(nvrmVcpParse(kNvrmVcpSpeakerVolume, reply, sizeof reply, value, maximum) == NVRMVcpReply::muted);
+    assert(value == 1 && maximum == 254);
+    reply[9] = 0;
+    checksum(reply);
+    assert(nvrmVcpParse(kNvrmVcpSpeakerVolume, reply, sizeof reply, value, maximum) == NVRMVcpReply::unsupported);
+    reply[9] = 254;
+    checksum(reply);
+    assert(nvrmVcpParse(kNvrmVcpSpeakerVolume, reply, sizeof reply, value, maximum) == NVRMVcpReply::valid);
+    assert(value == 254 && maximum == 254);
+    puts("PASS: volume VCP framing, checksum, unsupported opcodes, reported range and reserved values");
+}
+
+static void checkDisplayName()
+{
+    uint8_t edid[128] = {};
+    auto *descriptor = edid + 108;
+    descriptor[3] = 0xfc;
+    memcpy(descriptor + 5, "Redmi 215 NF\n", 13);
+    char name[14];
+    assert(nvrm_edid_product_name(edid, sizeof edid, &name) == 12);
+    assert(strcmp(name, "Redmi 215 NF") == 0);
+    memcpy(descriptor + 5, "T2751U\n      ", 13);
+    assert(nvrm_edid_product_name(edid, sizeof edid, &name) == 6);
+    assert(strcmp(name, "T2751U") == 0);
+    descriptor[5] = 0x80;
+    assert(nvrm_edid_product_name(edid, sizeof edid, &name) == 0 && name[0] == 0);
+    assert(nvrm_edid_product_name(edid, sizeof edid - 1, &name) == 0 && name[0] == 0);
+    puts("PASS: EDID product names are per display and reject malformed descriptors");
+}
+
 int main() {
     FB fb; unsigned char w[6] = {0x51, 0x82, 0x01, 0x10, 0x00, 0x00}, r[40] = {};
     // DDC/CI "get VCP 0x10": write 0x6E, wait, read 0x6F; the reply says 8 payload bytes of 40 asked for
@@ -66,6 +146,26 @@ int main() {
     assert(gCalls[1].op == kNvrmDdcRead && gCalls[1].addr == 0x37);
     assert(gSlept >= 40);                              // the monitor gets its 40 ms before the reply is read
     assert(q.replyBytes == 11);                        // 0x88 & 0x7f = 8 payload + 3 framing bytes
+    assert(fb.fDdcWriteAfter == 140);
+    unsigned char edid[128] = {};
+    edid[8] = 0x21; edid[9] = 0x63; edid[10] = 0x51; edid[11] = 0x27;
+    assert(nvrmDdcFastBrightnessRead(edid, sizeof edid, 0x400));
+    assert(!nvrmDdcFastBrightnessRead(edid, sizeof edid, 0x800));
+    assert(!nvrmDdcFastBrightnessRead(edid, 12, 0x400));
+    edid[10] = 0x52;
+    assert(!nvrmDdcFastBrightnessRead(edid, sizeof edid, 0x400));
+    unsigned char brightness[] = {0x51, 0x82, 0x01, 0x10, 0xac};
+    auto readBrightness = [&] {
+        IOI2CRequest get = req(brightness, sizeof brightness, r, sizeof r);
+        assert(fb.doI2CRequest(0, nullptr, &get) == kIOReturnSuccess);
+        return fb.fDdcWriteAfter;
+    };
+    fb.fDdcFastReadGeneration = fb.fDdcSinkGeneration;
+    assert(readBrightness() == 140);                   // a short read cannot cut an outstanding deadline
+    fb.fDdcWriteAfter = 0;
+    assert(readBrightness() == 40);
+    ++fb.fDdcSinkGeneration;
+    assert(readBrightness() == 140);                   // an unplug invalidates the old display's timing
     // set VCP: write only, no reply, no wait
     gCalls.clear(); gSlept = 0; IOI2CRequest s = req(w, 6, nullptr, 0);
     assert(fb.doI2CRequest(0, nullptr, &s) == kIOReturnSuccess && gCalls.size() == 1 && gSlept == 0);
@@ -97,10 +197,13 @@ int main() {
     unsigned char unframed[4] = {1, 2, 3, 4}; assert(nvrmDdcReplyLength(unframed, 4) == 4);
     assert(nvrmDdcReplyDelayMs(0) == 40 && nvrmDdcReplyDelayMs(100000000ull) == 100 && nvrmDdcReplyDelayMs(9000000000ull) == 500);
     puts("PASS: DDC/CI request translation, address whitelist, 40 ms reply wait, reply framing, dead display, opt-in");
+    checkVolume(fb);
+    checkDisplayName();
 }
 '''
 with tempfile.TemporaryDirectory() as d:
     d = pathlib.Path(d)
     (d / 't.cpp').write_text(fixture + method.replace('NVRMNVDAFramebuffer::', 'FB::').replace('struct IOI2CBusTiming *', 'IOI2CBusTiming *').replace('struct IOI2CRequest *rq', 'IOI2CRequest *rq') + checks)
-    subprocess.run(['clang++', '-std=c++17', '-Wall', f'-I{root}/kexts/NVRMFB', str(d / 't.cpp'), '-o', str(d / 't')], check=True)
+    subprocess.run(['clang++', '-std=c++17', '-Wall', f'-I{root}/kexts/NVRMFB',
+                    f'-I{root}/kexts/NVRMFB/fb', str(d / 't.cpp'), '-o', str(d / 't')], check=True)
     subprocess.run([str(d / 't')], check=True)

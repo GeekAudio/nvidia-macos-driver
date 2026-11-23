@@ -1,5 +1,29 @@
 # Retained fork changes for upstream merges
 
+## HighDelay NVK 3.0.3 integration
+
+This integration uses [v3.0.3-nvk at 12f45ce4](https://github.com/HighDelay/nvidia-macos-driver-nvk/releases/tag/v3.0.3-nvk).
+Keep the upstream DDC transfer and eDP AUX ABI, Mesa 26.3.1 NVK and Zink,
+hybrid Wine presentation, Safari registration, AMD/Intel panel support,
+HDR, Surround, and runtime power transitions. The GeekAudio changes kept
+on top are the external brightness and speaker controls, EDID display names,
+optional NMXAudio, reserved DP head activation, and installer localization.
+
+QuickTime retains the single-Ampere GPU exception for the external decoder.
+It shares the existing access checks with the upstream Safari policy. A
+second display controller, failed enumeration, or denied sandbox bridge
+keeps the normal decoder route. The codec overlay retains C7B0 decode,
+device identity reporting, and completion polling. The separate two-worker
+untile trial and VBlank diagnostics are outside this integration.
+
+The buffered-copy path still tracks a retiring scanout and a queued frame per
+head. HDR, 10-bit scanout and Surround use the corresponding 3.0.3 path.
+Rebuild NVRM, NVRMFB, both NVAccel variants, and the plugin together. Match
+the package and tests to the pinned upstream assets. Offline tests cover
+policy, DDC, display lifecycle and buffer ownership. Playback stability,
+CPU comparisons and GA106 still need hardware acceptance on this build.
+
+
 ## Mesa 26.3.1
 
 Keep NVK and Zink on the stable release at `fec8830e9c94b1d67f3d8469467d5529fb2978cd`.

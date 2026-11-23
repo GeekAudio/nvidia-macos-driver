@@ -16,7 +16,7 @@
 #include "nv_rtd3_policy.h"
 #include "nvrm_console_abi.h"
 
-extern "C" int nvrm_ddc_transfer(struct NVRMDdcRequest *);
+extern "C" int nvrm_ddc_transfer(struct NVRMDdcRequest *);   // nvrm_ddc.cpp
 extern "C" int nvrm_edp_backlight(struct NVRMEdpBacklightRequest *);
 extern "C" void nv_xnu_power_refresh(void);   // nv_xnu_power.cpp
 #include <IOKit/IOService.h>
@@ -51,6 +51,7 @@ static bool nvrm_kernel_supported(void) { return version_major == 24 || version_
 #include "nvrm_surfshare_abi.h"
 extern "C" int nvrm_surfshare_rm(struct NVRMSurfShareRm *);
 extern "C" int nvrm_surfshare_pageoff(struct NVRMSurfPageoff *, void *nv);
+extern "C" void nvrm_surfshare_copy_memory(struct NVRMSurfCopyMemory *, void *nv);
 extern "C" task_t current_task(void);
 extern "C" int nvrm_gpuva_alloc(struct NVRMGpuVaRequest *);
 extern "C" int nvrm_gpuva_map(struct NVRMGpuVaRequest *);
@@ -2635,6 +2636,16 @@ IOReturn NVRM::callPlatformFunction(const OSSymbol *fn, bool wait, void *p1, voi
     }
     if (fn && fn->isEqualTo("NVRMGpuReady"))         // NVRMFB: may the display engine be touched (not in system sleep)?
         return OSAddAtomic(0, &fGpuPm) == kGpuPmRunning ? kIOReturnSuccess : kIOReturnNotReady;
+    if (fn && fn->isEqualTo(NVRM_SS_FN_COPY_MEMORY)) {
+        if (!p1) return kIOReturnBadArgument;
+        // NVRMFB holds the display gate. Never wait here for a GPU resume.
+        int counted = 0;
+        if (!nv_xnu_pm_try_enter(&counted)) return kIOReturnNotReady;
+        const bool ready = !isInactive() && OSAddAtomic(0, &fGpuPm) == kGpuPmRunning;
+        if (ready) nvrm_surfshare_copy_memory(static_cast<NVRMSurfCopyMemory *>(p1), &fNv);
+        nv_xnu_pm_exit(counted);
+        return ready ? kIOReturnSuccess : kIOReturnNotReady;
+    }
     if (fn && fn->isEqualTo("NVRMGpuPower"))         // sent down to the framebuffers; an older NVRMFB passes it back up
         return kIOReturnUnsupported;
     if (fn && fn->isEqualTo("NVRMBootScreenDone")) {

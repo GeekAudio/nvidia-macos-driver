@@ -50,6 +50,8 @@ static inline thread_call_t nvrmfbCall(thread_call_func_t fn, thread_call_param_
 #include "../../NVRM/nvrm_gopfb.h"
 #include "../../NVRM/nv_rtd3_demand.h"
 #include "../../NVRM/nvrm_console_abi.h"
+#include <IOKit/IOMessage.h>
+#include "../nvrm_ddc_vcp.h"
 #include "nvrm-allocation-table.h"
 #include "nvrm-head-gate.h"
 static IORecursiveLock *startLock();
@@ -63,7 +65,7 @@ public:
 class NVRMDisplayGate {
     IORecursiveLock *lock;
 public:
-    NVRMDisplayGate() : lock(startLock()) { if (lock) IORecursiveLockLock(lock); }
+    explicit NVRMDisplayGate(IORecursiveLock *gate = startLock()) : lock(gate) { if (lock) IORecursiveLockLock(lock); }
     ~NVRMDisplayGate() { if (lock) IORecursiveLockUnlock(lock); }
     bool valid() const { return lock != nullptr; }
 };
@@ -86,6 +88,12 @@ extern "C" {
 #pragma clang diagnostic pop
 #include <libkern/OSAtomic.h>
 #include "nvrm_vram_abi.h"
+#include "../../NVRM/nvrm_copy_present.h"
+#define NVRM_SS_KERNEL_ABI 1
+#include "../../NVRM/nvrm_surfshare_abi.h"
+#ifndef NVRM_COPY_GPU_DEFAULT
+#define NVRM_COPY_GPU_DEFAULT 0
+#endif
 #include "nvrm-dvi-modes.h"
 
 // Surfaces may use half of a resizable BAR1 (>= 4 GB) and three quarters of a smaller one. WAS: a fixed 192 MB below
@@ -470,7 +478,55 @@ void NVRMBacklightHandler::persistFire(thread_call_param_t p, thread_call_param_
 // counted as a failed start (nvrm_off.h).
 static int gGuardCleared;
 static void fbGuardCleared(const char *why);
+class NVRMNVDAFramebuffer;
+
+class NVRMDdcTransaction {
+    bool *flag;
+    bool acquired;
+public:
+    explicit NVRMDdcTransaction(bool *busy) : flag(busy), acquired(!__atomic_exchange_n(flag, true, __ATOMIC_ACQUIRE)) {}
+    ~NVRMDdcTransaction() { if (acquired) __atomic_store_n(flag, false, __ATOMIC_RELEASE); }
+    bool held() const { return acquired; }
+};
+
+// Some displays start answering DDC/CI after the framebuffer publishes the bus.
+// Allow about 26 seconds of scheduled waits before giving up on this display attachment.
+static constexpr unsigned kNVRMDdcProbeFirstDelayMs = 350;
+static constexpr unsigned kNVRMDdcProbeMaxDelayMs = 2000;
+static constexpr unsigned kNVRMDdcProbeMaxRetries = 12;
+static constexpr unsigned kNVRMDdcProbeFirstReplyMs = 40;
+static constexpr unsigned kNVRMDdcProbeReplyMs = 80;
+static constexpr unsigned kNVRMDdcProbeMaxReplyMs = 500;
+
+class NVRMExternalBrightness : public IODisplayParameterHandler {
+    OSDeclareDefaultStructors(NVRMExternalBrightness)
+    NVRMNVDAFramebuffer *fFramebuffer = nullptr;
+    OSDictionary *fParameters = nullptr;
+    UInt32 fGeneration = 0;
+    UInt32 fMaximum = 0;
+    const OSSymbol *fVolumeKey = nullptr;
+    UInt32 fVolumeGeneration = 0;
+    UInt32 fVolumeMaximum = 0;
+    bool fVolumeUnsupported = false;
+    IODisplay *fRetryDisplay = nullptr;
+    UInt32 fRetryGeneration = 0;
+    unsigned fRetriesLeft = 0;
+    unsigned fRetryDelayMs = 0;
+    bool publishParameters(IODisplay *display, bool probeVolume, bool &retry);
+public:
+    void retryProbe();
+    void cancelProbe() { OSSafeReleaseNULL(fRetryDisplay); }
+    void setFramebuffer(NVRMNVDAFramebuffer *framebuffer);
+    void free() override;
+    bool setDisplay(IODisplay *display) override;
+    bool doIntegerSet(OSDictionary *params, const OSSymbol *key, UInt32 value) override;
+    bool doDataSet(const OSSymbol *, OSData *) override { return false; }
+    bool doUpdate() override { return true; }
+};
+OSDefineMetaClassAndStructors(NVRMExternalBrightness, IODisplayParameterHandler)
+
 class NVRMNVDAFramebuffer : public IOFramebuffer {
+    friend class NVRMExternalBrightness;
     OSDeclareDefaultStructors(NVRMNVDAFramebuffer)
     struct NvKmsKapiFunctionsTable *fKms = nullptr; NvU32 fGpuId = 0; nvrm_phys_for_va_t fPhysForVa = nullptr;
     struct NvKmsKapiDevice *fDev = nullptr;
@@ -608,6 +664,11 @@ class NVRMNVDAFramebuffer : public IOFramebuffer {
     // This instance exists because a display appeared after boot (see gNDpyBoot), and its connect handler has already
     // been fired once -- see connectNotifyFire and enableController.
     bool fHotplugBorn = false, fConnectFired = false;
+    bool fHotplugStarted = false;
+    bool fStandby = false;
+    bool selectInitialMode(NvKmsKapiDisplay display, NvU64 bytes, unsigned alignment,
+                           struct NvKmsKapiDisplayMode &mode);
+    bool activateStandby();
     volatile SInt32 fConnectOwed = 0;
     bool fEdidSwapped = false;
     void adoptSwappedDisplay();
@@ -651,6 +712,32 @@ class NVRMNVDAFramebuffer : public IOFramebuffer {
     IOSimpleLock *fFlipCacheLock = nullptr;
     unsigned    fFlipCacheN = 0, fFlipCount = 0, fFlipRejects = 0, fFlipEvict = 0;
     struct NvKmsKapiSurface *fFrontSurf = nullptr;
+    struct CopyScanout {
+        struct NvKmsKapiMemory *memory;
+        struct NvKmsKapiSurface *surface;
+        void *kva;
+        NvU32 width, height, pitch;
+        NvU64 barBytes;
+        struct NvKmsKapiMemory *quarantinedSource;
+    };
+    CopyScanout fCopyScanout[3] = {};
+    struct NvKmsKapiSurface *fCopyRetiring = nullptr;
+    CopyScanout *fCopyQueued = nullptr;
+    uint64_t fCopyQueuedDeadline = 0;
+    thread_call_t fCopyPresentCall = nullptr;
+    bool fCopyPresent = false, fCopyAwaitingLatch = false;
+    unsigned fCopyPresents = 0;
+    bool prepareCopyScanout(CopyScanout &slot);
+    void teardownCopyScanout(CopyScanout &slot);
+    bool copyFlipPending();
+    bool copyPresentSupported() const;
+    bool copyPresentReady();
+    IOReturn copyVramToScanout(CopyScanout &back, struct NvKmsKapiMemory *source, UInt64 length);
+    void copyPixelsToScanout(CopyScanout &back, const NVRMCopyPresentRequest &request);
+    IOReturn submitCopiedScanout(CopyScanout &back);
+    static void copyPresentFire(thread_call_param_t, thread_call_param_t);
+    IOReturn presentCopiedFrame(const NVRMCopyPresentRequest &request,
+                               struct NvKmsKapiMemory *source = nullptr, UInt64 cookie = 0);
     NVRMHeadGateState fPrimaryGate;
     NVRMHeadGateState &primaryGate();
     static void surroundCheck();
@@ -694,7 +781,7 @@ class NVRMNVDAFramebuffer : public IOFramebuffer {
     uint64_t fEnableAbs = 0;    // when enableController ran, for the first-primary-flip timing line
     bool fFirstPrimaryLogged = false;   // a login screen that never gets one is the black-screen-with-cursor signature
     NvBool submitConfig(struct NvKmsKapiRequestedModeSetConfig *cfg, struct NvKmsKapiModeSetReplyConfig *rep, NvBool commit,
-                        bool bootstrap = false, bool cursorOnly = false, bool frame = false, int hdrMode = -1);
+                        bool bootstrap = false, bool cursorOnly = false, bool frame = false, int hdrMode = -1, bool deferLatch = false);
     thread_call_t fReflip = nullptr;
     unsigned fReflips = 0; int fReflipRc = -99;
     unsigned fVblReg = 0;
@@ -729,8 +816,8 @@ class NVRMNVDAFramebuffer : public IOFramebuffer {
     volatile SInt32 fWillSleepOff = 0;
     static IOReturn sleepTap(OSObject *self, void *, IOFramebuffer *, IOIndex event, void *info);
     bool fDpyLost = false;   // the connector is disconnected; re-sense after its EDID is restored
-    // macOS pushes an all-black output LUT right after a display comes back; only that window is ignored so a
-    // deliberate fade or blackout still applies.
+    // macOS can send an all-black output LUT while a connector is coming online.
+    // After the connection settles, deliberate fades and blackouts work normally.
     UInt64 fBlackLutDeadline = 0;
     bool fRelightAudioValid = false;   // the reconnect carried a readable EDID, so cached audio may be republished
     static void eventCallback(const struct NvKmsKapiEvent *event) {
@@ -832,13 +919,38 @@ public:
     IOReturn setAttributeForConnection(IOIndex connectIndex, IOSelect attribute, uintptr_t value) override;
     IOItemCount getConnectionCount() override { return 1; }
     bool hasDDCConnect(IOIndex) override { return !fDpyLost && !fHidden && fEdidSize >= 128; }
+    IOReturn getDDCBlock(IOIndex connectIndex, UInt32 blockNumber, IOSelect blockType, IOOptionBits options, UInt8 *data, IOByteCount *length) override;
+    // DDC/CI (boot-arg nvrmfbddc=1): one I2C bus per external display, transfers run by NVRM (nvrm_ddc.cpp).
     IOReturn doI2CRequest(UInt32 bus, struct IOI2CBusTiming *timing, struct IOI2CRequest *request) override;
     bool fDdcOn = false;
+    NVRMExternalBrightness *fDdcBrightness = nullptr;
+    IOCommandGate *fDdcBrightnessGate = nullptr;
+    thread_call_t fDdcBrightnessCall = nullptr;
+    thread_call_t fDdcProbeCall = nullptr;
+    IORecursiveLock *fDdcSinkLock = nullptr; // native DDC writes and changes to the sink; never taken by flips
+    bool fDdcInFlight = false;
+    bool fDdcPowered = false;
+    bool fDdcSinkHasAudio = false;
+    UInt32 fDdcSinkGeneration = 1;
+    UInt32 fDdcFastReadGeneration = 0;
+    UInt64 fDdcPending = 0; // generation in high word, requested VCP value + 1 in low word
+    UInt64 fDdcPendingAt = 0; // paired with fDdcPending under fFlipCacheLock
+    UInt64 fDdcVolumePending = 0;
+    UInt64 fDdcVolumePendingAt = 0;
+    UInt64 fDdcWriteAfter = 0; // accessed while holding fDdcInFlight
+    UInt32 fDdcBusyRetries = 0; // accessed only by the serial brightness callback
     void publishDdcBus();
+    void publishDdcBrightness();
+    static void ddcBrightnessFire(thread_call_param_t, thread_call_param_t);
+    IOReturn writeDdcBrightness();
+    static void ddcProbeFire(thread_call_param_t, thread_call_param_t);
+    IOReturn ddcProbeGated(void *, void *, void *, void *);
+    void scheduleDdcProbe(unsigned delayMs);
+    NVRMVcpReply readDdcControl(uint8_t code, UInt32 &value, UInt32 &maximum, UInt32 &generation, unsigned delayMs);
+    bool queueDdcControl(uint8_t code, UInt32 value, UInt32 generation);
     IOReturn ddcTransfer(unsigned op, unsigned addr7, unsigned char *data, unsigned len);
     IOReturn ddcPowerGated(void *on, void *, void *, void *);
     void ddcSetPowered(bool on);
-    IOReturn getDDCBlock(IOIndex connectIndex, UInt32 blockNumber, IOSelect blockType, IOOptionBits options, UInt8 *data, IOByteCount *length) override;
     IOReturn registerForInterruptType(IOSelect type, IOFBInterruptProc proc, OSObject *target, void *ref, void **interruptRef) override;
     IOReturn unregisterInterrupt(void *interruptRef) override { return kIOReturnSuccess; }
     IOReturn setInterruptState(void *interruptRef, UInt32 state) override { return kIOReturnSuccess; }
@@ -1288,11 +1400,21 @@ bool NVRMNVDAFramebuffer::kapiInit()
     // boot) has fIndex >= gNDpyBoot, which is how it knows it is the new one.
     if (gNDpyBoot < 0) gNDpyBoot = gNDpy;
     if (gNDpy <= 0 || fIndex >= (unsigned)gNDpy) {
-        FBLOG("index %u: only %d display(s) connected -- nothing to drive, not starting", fIndex, gNDpy);
+        // Keep one offline framebuffer in the boot controller on Tahoe.
+        // WindowServer must open it before that controller handles hot-plug.
+        fStandby = version_major >= 25 && gNDpy > 0 && gNDpy == gNDpyBoot &&
+                   fIndex == (unsigned)gNDpy && fIndex < fNumHeads;
         fSpareIndex = gNDpy > 0;
-        return false;
-    }
-    {
+        if (!fStandby) return false;
+        fDpyLost = true;
+        // IOGraphics can map this aperture while it is offline. This timing
+        // only sizes the allocation and is never submitted to a connector.
+        auto &t = fMode.timings;
+        t.hVisible = 3840; t.hSyncStart = 4016; t.hSyncEnd = 4104; t.hTotal = 4400;
+        t.vVisible = 2160; t.vSyncStart = 2168; t.vSyncEnd = 2178; t.vTotal = 2250;
+        t.refreshRate = 60000; t.pixelClockHz = 594000000;
+    } else {
+        fHotplugBorn = (int)fIndex >= gNDpyBoot;
         struct nvrm_dpy_rec *r = &gDpy[fIndex];
         fDisplay = r->handle; fConnector = r->connector; fInternal = r->internal;
         fVrrSupported = r->vrr && vrrAllowed();
@@ -1317,37 +1439,13 @@ bool NVRMNVDAFramebuffer::kapiInit()
               fIndex, fDisplay, (unsigned)fConnector, (unsigned)r->headMask, fHead,
               (unsigned)gHeadsTaken);
     }
-    // This mode becomes the head's boot raster (fBootW/fBootH below), which decides the scaler and
-    // raster ceilings and which refresh rates addKmsRefreshModes() can publish. A NVKMS-preferred mode
-    // is the EDID native timing and wins outright. When no mode is flagged preferred -- common on a
-    // second monitor, whose head never runs the firmware's console detection -- the largest validated
-    // raster is the panel's native resolution. Taking the first validated mode instead made the boot
-    // raster depend on NVKMS enumeration order: a small raster landing first capped fRasterMaxW below
-    // the native resolution (so its high-refresh modes were never offered) and let the intermediate
-    // rasters flood the mode table, which is why a second high-refresh display came up at 60/75 Hz or
-    // black on some boots and correctly on others. Ties keep the higher pixel clock so the boot mode is
-    // the native raster's top rate.
-    bool have = false; NvU64 bestArea = 0; NvU32 bestClock = 0;
-    for (NvU32 i = 0; i < 256; i++) {
-        struct NvKmsKapiDisplayMode m = {}; NvBool valid = NV_FALSE, preferred = NV_FALSE;
-        int r = fKms->getDisplayMode(fDev, fDisplay, i, &m, &valid, &preferred);
-        if (r < 0) break;
-        if (r == 0 || !valid) continue;
-        if (!nvrmKmsRasterValid(m.timings.hVisible, m.timings.vVisible)) {
-            FBLOG("skip mode %u with raster %ux%u outside NVKMS layer range", i,
-                  m.timings.hVisible, m.timings.vVisible);
-            continue;
-        }
-        if (preferred) { fMode = m; have = true; break; }
-        const NvU64 area = (NvU64)m.timings.hVisible * m.timings.vVisible;
-        if (!have || area > bestArea || (area == bestArea && m.timings.pixelClockHz > bestClock)) {
-            fMode = m; bestArea = area; bestClock = m.timings.pixelClockHz; have = true;
-        }
+    if (!fStandby && !selectInitialMode(fDisplay, 0, pitchAlign, fMode)) {
+        FBLOG("no valid mode");
+        return false;
     }
-    if (!have) { FBLOG("no valid mode"); return false; }
     if (gBootHead < 0 && fIndex == 0) fBootConsole = true;
-    fKmsMode = fMode; fHaveKmsMode = true;
-    if (gBootHead >= 0 && fDisplay == gBootDpy && (int)fHead == gBootHead &&
+    fKmsMode = fMode; fHaveKmsMode = !fStandby;
+    if (!fStandby && gBootHead >= 0 && fDisplay == gBootDpy && (int)fHead == gBootHead &&
         nvrmKmsRasterValid(gBootMode.timings.hVisible, gBootMode.timings.vVisible)) {
         // the fallback for a refused firmware timing must be the same raster (it scans out the same surface): the
         // validated mode at the boot size whose refresh is closest to the firmware's
@@ -1368,13 +1466,13 @@ bool NVRMNVDAFramebuffer::kapiInit()
         fBootConsole = true;
         FBLOG("boot pair: display 0x%x keeps the firmware's mode %ux%u @%u on head %u", fDisplay,
               fMode.timings.hVisible, fMode.timings.vVisible, fMode.timings.refreshRate, fHead);
-    } else if (gBootHead >= 0 && fDisplay == gBootDpy && (int)fHead == gBootHead) {
+    } else if (!fStandby && gBootHead >= 0 && fDisplay == gBootDpy && (int)fHead == gBootHead) {
         fBootConsole = true;
         FBLOG("firmware boot raster %ux%u is outside the NVKMS layer range; using selected mode %ux%u",
               gBootMode.timings.hVisible, gBootMode.timings.vVisible,
               fMode.timings.hVisible, fMode.timings.vVisible);
     }
-    validateInitialDviMode();
+    if (!fStandby) validateInitialDviMode();
     fW = fMode.timings.hVisible; fH = fMode.timings.vVisible;
     {
         const struct NvKmsKapiDisplayModeTimings &k5t = fMode.timings;
@@ -1388,7 +1486,13 @@ bool NVRMNVDAFramebuffer::kapiInit()
     fSize = ((NvU64)fPitch * fH + 0xffff) & ~0xffffull;
     {
         fBootMode = fMode; fBootW = fW; fBootH = fH; fBootPitch = fPitch; fRasterW = fW; fRasterH = fH; fPitchAlign = pitchAlign;
-        computeScanoutCaps(pitchAlign);
+        if (fStandby) {
+            fScalerMaxW = fRasterMaxW = fW;
+            fScalerMaxH = fH;
+            fModesAllocSize = fAllocSize = fSize;
+        } else {
+            computeScanoutCaps(pitchAlign);
+        }
         FBLOG("fbmodes: boot raster %ux%u pitch %u; scanout allocation sized for %ux%u (%llu KB, boot needs %llu KB)",
               fW, fH, fPitch, fScalerMaxW, fScalerMaxH, fAllocSize / 1024, fSize / 1024);
     }
@@ -1417,7 +1521,7 @@ bool NVRMNVDAFramebuffer::kapiInit()
     int apertureRounds = 0;
     bool haveAperture = false;
     struct { struct NvKmsKapiMemory *m; void *k; void *u; } parked[8]; int nParked = 0;
-    for (int round = 0; round < 10 && !haveAperture; round++) {
+    for (int round = 0; round < (fStandby ? 1 : 10) && !haveAperture; round++) {
      apertureRounds = round;
      if (round) {
         FBLOG("aperture retry round %d: BAR1 not CPU-writable yet -- waiting 5 s, then rolling again", round);
@@ -1515,8 +1619,10 @@ bool NVRMNVDAFramebuffer::kapiInit()
         if (consoleSilenced && !consolePaused && getPlatform()) getPlatform()->setConsoleInfo(0, kPEEnableScreen);
         return false;
     }
-    publishTimingCaps();
-    publishStartupTiming();
+    if (!fStandby) {
+        publishTimingCaps();
+        publishStartupTiming();
+    }
     struct NvKmsKapiCreateSurfaceParams sp = {};
     sp.planes[0].memory = fMem; sp.planes[0].offset = 0; sp.planes[0].pitch = fPitch;
     sp.width = fW; sp.height = fH; sp.format = NvKmsSurfaceMemoryFormatX8R8G8B8;
@@ -1659,6 +1765,32 @@ void NVRMNVDAFramebuffer::finishBootConsole()
     if (gSurroundMask) { gSurroundRecheck = true; hotplugKick(); }
 }
 
+bool NVRMNVDAFramebuffer::selectInitialMode(NvKmsKapiDisplay display, NvU64 bytes, unsigned alignment,
+                                           struct NvKmsKapiDisplayMode &mode)
+{
+    // Prefer the native timing, then the largest validated raster and rate.
+    bool have = false; NvU64 bestArea = 0; NvU32 bestClock = 0;
+    for (NvU32 i = 0; i < 256; i++) {
+        struct NvKmsKapiDisplayMode m = {}; NvBool valid = NV_FALSE, preferred = NV_FALSE;
+        int r = fKms->getDisplayMode(fDev, display, i, &m, &valid, &preferred);
+        if (r < 0) break;
+        if (r == 0 || !valid) continue;
+        if (!nvrmKmsRasterValid(m.timings.hVisible, m.timings.vVisible)) {
+            FBLOG("skip mode %u with raster %ux%u outside NVKMS layer range", i,
+                  m.timings.hVisible, m.timings.vVisible);
+            continue;
+        }
+        if (bytes && !nvrmfb_scanout_fits(m.timings.hVisible, m.timings.vVisible, alignment, bytes))
+            continue;
+        if (preferred) { mode = m; have = true; break; }
+        const NvU64 area = (NvU64)m.timings.hVisible * m.timings.vVisible;
+        if (!have || area > bestArea || (area == bestArea && m.timings.pixelClockHz > bestClock)) {
+            mode = m; bestArea = area; bestClock = m.timings.pixelClockHz; have = true;
+        }
+    }
+    return have;
+}
+
 static NVRMNVDAFramebuffer *gFB = nullptr;
 // Every started framebuffer, so hot-plug can find the one driving a display that went away and came back.
 static NVRMNVDAFramebuffer *gFBs[16];
@@ -1689,6 +1821,32 @@ void NVRMNVDAFramebuffer::connectNotifyFire(thread_call_param_t p0, thread_call_
     if (!me) return;
     NVRMCallReference callReference(me);
     if (OSAddAtomic(0, &me->fStopping)) return;
+    if (!me->fConnect.proc && me->fHotplugBorn && !me->fEnableAbs &&
+        __atomic_load_n(&me->fHotplugStarted, __ATOMIC_ACQUIRE) && !me->fDpyLost &&
+        me->getProperty("IOAccelIndex") && me->getProperty("IOAccelTypes")) {
+        // Running WindowServer may not open a new framebuffer. Initialize
+        // the graphics family after its accelerator publishes the binding.
+        // The server still creates and owns its normal user client.
+        const IOReturn result = me->IOFramebuffer::open();
+        FBLOG("fb%u: opening late framebuffer through IOGraphics -> 0x%x", me->fIndex, result);
+        if (result == kIOReturnSuccess && me->fConnect.proc) {
+            NVRMNVDAFramebuffer *primary = nullptr;
+            {
+                NVRMDisplayGate gate;
+                if (gate.valid() && gFBs[0] && gFBs[0] != me) {
+                    primary = gFBs[0];
+                    primary->retain();
+                }
+            }
+            if (primary) {
+                primary->notifyConnectionChanged(100);
+                primary->release();
+            }
+            // enableController scheduled this framebuffer's notification
+            // before open() installed the connect handler.
+            return;
+        }
+    }
     if (!me->fConnect.proc) {
         // IOFramebuffer::open registers the connect handler after enableController, and on a display plugged in after
         // boot the open can take longer than the 1.5 s delay. Dropping the notification here left such a display dark
@@ -1810,6 +1968,26 @@ void NVRMNVDAFramebuffer::takeEdid(const NvU8 *src, NvU32 size)
 {
     fEdidSize = (NvU16)(size > sizeof fEdid ? sizeof fEdid : size);
     nvu_copy(fEdid, src, fEdidSize);
+    char name[14];
+    if (nvrm_edid_product_name(fEdid, fEdidSize, &name)) setProperty("NVRMDisplayProductName", name);
+    else removeProperty("NVRMDisplayProductName");
+    // The physical sink is identifiable before IOGraphics opens an
+    // AppleDisplay and independently of an AppleHDA association.
+    const NvU8 header[] = {0x00, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x00};
+    if (fEdidSize >= 128 && memcmp(fEdid, header, sizeof header) == 0) {
+        const NvU32 vendor = (NvU32(fEdid[8]) << 8) | fEdid[9];
+        const NvU32 product = (NvU32(fEdid[11]) << 8) | fEdid[10];
+        setProperty("NVRMDisplayEDIDIdentity", (unsigned long long)((vendor << 16) | product), 32);
+    } else {
+        removeProperty("NVRMDisplayEDIDIdentity");
+    }
+    nvrm_cea_scan audio;
+    nvrm_scan_cea(fEdid, fEdidSize, &audio);
+    __atomic_store_n(&fDdcSinkHasAudio, audio.has_audio != 0, __ATOMIC_RELEASE);
+    const bool fastBrightness = fIndex < (unsigned)gNDpy &&
+        nvrmDdcFastBrightnessRead(fEdid, fEdidSize, gDpy[fIndex].hdaConnectorType);
+    const UInt32 generation = fastBrightness ? __atomic_load_n(&fDdcSinkGeneration, __ATOMIC_RELAXED) : 0;
+    __atomic_store_n(&fDdcFastReadGeneration, generation, __ATOMIC_RELEASE);
     nvrmEdidPanelSizeMm(fEdid, fEdidSize, &fEdidMmW, &fEdidMmH);
     fHdrCapable = fHdrEnabled && nvrmEdidHdrPq(fEdid, fEdidSize);
     fVrrMinHz = fVrrMaxHz = 0;
@@ -1946,8 +2124,14 @@ void NVRMNVDAFramebuffer::hotplugFire(thread_call_param_t, thread_call_param_t)
                 if (!dd->connected) {
                     if (!fb->fDpyLost) {
                         FBLOG("hot-plug: display 0x%x went away (fb %u)", handles[i], fb->fIndex);
-                        fb->fDpyLost = true;
+                        {
+                            NVRMDisplayGate sink(fb->fDdcSinkLock);
+                            fb->fDpyLost = true;
+                            __atomic_add_fetch(&fb->fDdcSinkGeneration, 1u, __ATOMIC_RELAXED);
+                        }
                         fb->fEdidSize = 0;
+                        fb->removeProperty("NVRMDisplayProductName");
+                        fb->removeProperty("NVRMDisplayEDIDIdentity");
                         fb->clearDisplayAudioProperties();
                         if (nnotify < sizeof notify / sizeof notify[0]) { fb->retain(); notify[nnotify++] = fb; }
                     }
@@ -1955,12 +2139,16 @@ void NVRMNVDAFramebuffer::hotplugFire(thread_call_param_t, thread_call_param_t)
                     if (fb->fDpyLost && kdpy >= 0) {
                         const struct nvrm_dpy_rec *r = &gDpy[kdpy];
                         fb->takeEdid(r->edid, r->edidSize);
-                        fb->fDpyLost = false;
+                        { NVRMDisplayGate sink(fb->fDdcSinkLock); fb->fDpyLost = false; }
                         fb->fRelightAudioValid = dd->edid.bufferSize >= 128;
                         fb->fBlackLutDeadline = 0;
                         clock_interval_to_deadline(15000, kMillisecondScale, &fb->fBlackLutDeadline);
                     }
-                    if (swapped) fb->fEdidSwapped = true;
+                    if (swapped) {
+                        NVRMDisplayGate sink(fb->fDdcSinkLock);
+                        fb->fEdidSwapped = true;
+                        __atomic_add_fetch(&fb->fDdcSinkGeneration, 1u, __ATOMIC_RELAXED);
+                    }
                     if (nrelight < sizeof relight / sizeof relight[0]) {
                         fb->retain(); relight[nrelight++] = fb;
                     }
@@ -1994,15 +2182,31 @@ void NVRMNVDAFramebuffer::hotplugFire(thread_call_param_t, thread_call_param_t)
             if (!fb || fb->fDisplay != gDpy[k].handle || fb->fDpyLost) continue;
             FBLOG("hot-plug: known display 0x%x omitted from NVKMS list and confirmed disconnected (fb %u)",
                   gDpy[k].handle, fb->fIndex);
-            fb->fDpyLost = true;
+            {
+                NVRMDisplayGate sink(fb->fDdcSinkLock);
+                fb->fDpyLost = true;
+                __atomic_add_fetch(&fb->fDdcSinkGeneration, 1u, __ATOMIC_RELAXED);
+            }
             fb->fEdidSize = 0;
+            fb->removeProperty("NVRMDisplayProductName");
+            fb->removeProperty("NVRMDisplayEDIDIdentity");
             fb->clearDisplayAudioProperties();
             if (nnotify < sizeof notify / sizeof notify[0]) { fb->retain(); notify[nnotify++] = fb; }
         }
     }
-    if (added || nnotify || nrelight)
-        for (unsigned i = 0; i < sizeof gFBs / sizeof gFBs[0]; ++i)
-            if (gFBs[i] && !gFBs[i]->fDpyLost) gFBs[i]->publishDisplayAudioProperties();
+    NVRMNVDAFramebuffer *standby = nullptr;
+    for (unsigned i = 0; i < sizeof gFBs / sizeof gFBs[0]; ++i) {
+        auto *fb = gFBs[i];
+        if (!fb) continue;
+        if (!fb->fDpyLost) {
+            if (added || nnotify || nrelight) fb->publishDisplayAudioProperties();
+        }
+        else if (fb->fStandby && i < (unsigned)gNDpy && gDpy[i].connected &&
+                 __atomic_load_n(&fb->fHotplugStarted, __ATOMIC_ACQUIRE)) {
+            standby = fb;
+            standby->retain();
+        }
+    }
     const unsigned displayCount = (unsigned)gNDpy;
     const unsigned retryDelay = displayCount ? 0 : nvrmBootRetryDelayMs(gBootRetry);
     if (retryDelay) ++gBootRetry;
@@ -2011,6 +2215,10 @@ void NVRMNVDAFramebuffer::hotplugFire(thread_call_param_t, thread_call_param_t)
     IORecursiveLockUnlock(sl);
     IOFree(dd, sizeof *dd);
     if (surroundChanged) surroundCheck();
+    if (standby) {
+        if (standby->activateStandby()) standby->notifyConnectionChanged(100);
+        standby->release();
+    }
     for (unsigned f = 0; f < nnotify; f++) {
         notify[f]->notifyConnectionChanged(500);
         notify[f]->release();
@@ -2022,8 +2230,11 @@ void NVRMNVDAFramebuffer::hotplugFire(thread_call_param_t, thread_call_param_t)
               fb->fDisplay, fb->fIndex, fb->fHead, (unsigned)ok, fb->fReflipRc);
         if (!OSAddAtomic(0, &fb->fStopping) && !fb->fDpyLost) {
             const bool swapped = fb->fEdidSwapped;
-            fb->fEdidSwapped = false;
-            if (swapped) fb->adoptSwappedDisplay();
+            if (swapped) {
+                fb->adoptSwappedDisplay();
+                NVRMDisplayGate sink(fb->fDdcSinkLock);
+                fb->fEdidSwapped = false;
+            }
             else if (fb->fRelightAudioValid) fb->publishDisplayAudioProperties();
             else {
                 fb->clearDisplayAudioProperties();
@@ -2057,6 +2268,67 @@ void NVRMNVDAFramebuffer::hotplugFire(thread_call_param_t, thread_call_param_t)
     }
     FBLOG("hot-plug: %d display(s) added, %u idle nub(s) matched again", added, matched);
 }
+bool NVRMNVDAFramebuffer::activateStandby()
+{
+    NVRMDisplayGate gate;
+    if (!gate.valid() || !fStandby || fSubmissionFaulted || OSAddAtomic(0, &fStopping) ||
+        fIndex >= (unsigned)gNDpy || !rmGpuReady()) return false;
+    const auto &sink = gDpy[fIndex];
+    if (!sink.connected) return false;
+    const NvU32 available = sink.headMask & ~gHeadsTaken;
+    NvKmsKapiDisplayMode mode = {};
+    if (!available || !selectInitialMode(sink.handle, fMemBytes, fPitchAlign, mode)) {
+        FBLOG("fb%u: standby has no compatible head or scanout mode", fIndex);
+        return false;
+    }
+
+    fHead = (NvU32)__builtin_ctz(available);
+    gHeadsTaken |= 1u << fHead;
+    fOwnsHead = true;
+    fDisplay = sink.handle;
+    fConnector = sink.connector;
+    const IOReturn result = switchMode(kModeId, mode, mode.timings.hVisible, mode.timings.vVisible, 0);
+    if (result != kIOReturnSuccess) {
+        // A rejected transaction hasn't bound the head. An accepted
+        // transaction with a lost completion keeps its surfaces pinned.
+        if (!fSubmissionFaulted) {
+            gHeadsTaken &= ~(1u << fHead);
+            fOwnsHead = false;
+            fDisplay = 0;
+            fConnector = 0;
+        }
+        FBLOG("fb%u: standby modeset failed (0x%x)", fIndex, result);
+        return false;
+    }
+
+    fBootMode = fMode;
+    fBootW = fW; fBootH = fH; fBootPitch = fPitch;
+    fKmsMode = fMode; fHaveKmsMode = true;
+    fBootInDT = false; fNDT = 0;
+    fInternal = sink.internal;
+    const NvU64 reserved = fAllocSize;
+    computeScanoutCaps(fPitchAlign);
+    fAllocSize = reserved;
+    if (!nvrmfb_scanout_fits(fScalerMaxW, fScalerMaxH, fPitchAlign, fMemBytes)) {
+        fRasterMaxW = fScalerMaxW = fW;
+        fScalerMaxH = fH;
+        fModesAllocSize = reserved;
+    }
+    // The standby framebuffer is about to become visible to WindowServer.
+    clock_interval_to_deadline(15000, kMillisecondScale, &fBlackLutDeadline);
+    takeEdid(sink.edid, sink.edidSize);
+    {
+        NVRMDisplayGate sinkGate(fDdcSinkLock);
+        fDpyLost = false;
+    }
+    fStandby = false;
+    publishTimingCaps();
+    publishStartupTiming();
+    publishDisplayAudioProperties();
+    FBLOG("fb%u: standby online: display 0x%x, head %u, %ux%u", fIndex, fDisplay, fHead, fW, fH);
+    return true;
+}
+
 static char gTrace[32768]; static volatile SInt32 gTraceLen = 0, gTraceN = 0, gTraceFull = 0;
 // The trace was published as the registry property "NVRMTrace" on every log line. Registry properties
 // carry no privilege, so `ioreg` handed any process the whole 32 KB - including the pointers logged in
@@ -2242,7 +2514,7 @@ void NVRMNVDAFramebuffer::flipFaultLog(const char *why)
 }
 NvBool NVRMNVDAFramebuffer::submitConfig(struct NvKmsKapiRequestedModeSetConfig *cfg,
                                             struct NvKmsKapiModeSetReplyConfig *rep, NvBool commit, bool bootstrap,
-                                            bool cursorOnly, bool frame, int hdrMode)
+                                            bool cursorOnly, bool frame, int hdrMode, bool deferLatch)
 {
     if (!fKms || !fDev || !cfg || !rep || fHead >= 8 || fSubmissionFaulted || fHidden) return NV_FALSE;
     const bool surround = fSurActive || fSurBuilding;
@@ -2285,6 +2557,8 @@ NvBool NVRMNVDAFramebuffer::submitConfig(struct NvKmsKapiRequestedModeSetConfig 
         const NvBool ok = fKms->applyModeSetConfig(fDev, cfg, rep, NV_TRUE);
         return ok && rep->flipResult == NV_KMS_FLIP_RESULT_SUCCESS;
     }
+    // A primary mode change supersedes work prepared for the old scanout.
+    if (!deferLatch) fCopyQueued = nullptr;
     if (fSubmissionSeen) {
         // Initial console acceptance is asynchronous. A still-pending prior flip gets the same one-period wait as a
         // newly committed flip. On the frame path a flip that is merely late costs this present (IN_PROGRESS: the
@@ -2301,6 +2575,7 @@ NvBool NVRMNVDAFramebuffer::submitConfig(struct NvKmsKapiRequestedModeSetConfig 
             rep->flipResult = NV_KMS_FLIP_RESULT_IN_PROGRESS; return NV_FALSE;
         }
     }
+    if (!deferLatch && fCopyAwaitingLatch) (void)copyFlipPending();
     NvU32 submissionHeads = 0;
     if (surround) {
         for (unsigned k = 0; k < fSurN; ++k) {
@@ -2364,6 +2639,8 @@ NvBool NVRMNVDAFramebuffer::submitConfig(struct NvKmsKapiRequestedModeSetConfig 
     }
     fSubmissionSeen = true;
     fFlipSubmitAbs = submit0;
+    // A buffered copy owns both scanouts until a subsequent poll confirms the latch.
+    if (deferLatch) return NV_TRUE;
     // Initial acceptance permits console handoff, never surface retirement. The owned boot surface remains pinned.
     if (bootstrap || (!gFlipLatch && !surround)) return NV_TRUE;
     if (gFlipLatch == 2 && !surround) { OSIncrementAtomic((volatile SInt32 *)&gFlipLatchDeferred); return NV_TRUE; }
@@ -2543,12 +2820,11 @@ IOReturn NVRMNVDAFramebuffer::nvrmSetGamma(UInt32 channels, UInt32 count, UInt32
     NVRMDisplayGate gate; if (!gate.valid()) return kIOReturnNoMemory;
     NVRMHeadGate primary(startLock(), primaryGate(), true);
     if (!primary.valid() || OSAddAtomic(0, &fStopping)) return kIOReturnNotReady;
-    if (nvrmLutIsBlack(channels, count, width, data) && fBlackLutDeadline &&
-        mach_absolute_time() < fBlackLutDeadline) {
-        FBLOG("gamma: all-black table ignored after a reconnect (previous LUT kept)");
+    const bool black = nvrmLutIsBlack(channels, count, width, data);
+    if (black && (fStandby || (fBlackLutDeadline && mach_absolute_time() < fBlackLutDeadline))) {
+        FBLOG("fb%u: gamma: all-black table ignored while connecting (standby %u)", fIndex, (unsigned)fStandby);
         return kIOReturnSuccess;
     }
-    fBlackLutDeadline = 0;
     if (!fGamma) {
         fGamma = (struct NvKmsLutRamps *)IOMalloc(sizeof *fGamma);
         if (!fGamma) return kIOReturnNoMemory;
@@ -2591,8 +2867,9 @@ IOReturn NVRMNVDAFramebuffer::nvrmSetGamma(UInt32 channels, UInt32 count, UInt32
     const NvBool ok = submitConfig(cfg, rep, NV_TRUE, false, true);
     if (ok) fGammaCommits++; else fGammaFails++;
     if (fGammaCommits + fGammaFails <= 3 || !ok)
-        FBLOG("gamma: %u-channel %u x %u-bit table on head %u -> %s (flipResult %d; %u applied, %u failed)", channels, count,
-              width, fHead, ok ? "applied" : "NOT applied, previous LUT kept", (int)rep->flipResult, fGammaCommits, fGammaFails);
+        FBLOG("gamma: %u-channel %u x %u-bit %s table on head %u -> %s (flipResult %d; %u applied, %u failed)", channels, count,
+              width, black ? "all-black" : "nonblack", fHead, ok ? "applied" : "NOT applied, previous LUT kept",
+              (int)rep->flipResult, fGammaCommits, fGammaFails);
     IOFree(cfg, sizeof *cfg); IOFree(rep, sizeof *rep);
     return kIOReturnSuccess;
 }
@@ -2975,7 +3252,10 @@ void NVRMNVDAFramebuffer::vblFire(thread_call_param_t p0, thread_call_param_t)
     // A new mode set starts the tries over.
     me->fVblTicks++;
     if (me->fModeSetTicks == 0) me->fHwVblTries = 0;
-    if (me->fHwVblWanted && !me->fHwVblCb && (sFlipLatched[me->fHead] > 0 || me->fModeSetTicks >= 60) &&
+    // A published standby starts with head 0 as an unbound placeholder.
+    // Require its own committed mode before using another head's latch count.
+    if (!me->fStandby && me->fOwnsHead && me->fModeSet && !me->fDpyLost &&
+        me->fHwVblWanted && !me->fHwVblCb && (sFlipLatched[me->fHead] > 0 || me->fModeSetTicks >= 60) &&
         (me->fHwVblTries == 0 || hwVblRetryDue(me->fHwVblTries, me->fVblTicks - me->fHwVblTickAtTry))) {
         me->fHwVblTries++; me->fHwVblTickAtTry = me->fVblTicks;
         me->fHwVblCb = me->fKms->registerVblankIntrCallback(me->fDev, me->fHead, hwVblIntr, (NvU64)(uintptr_t)me);
@@ -3072,6 +3352,7 @@ void NVRMNVDAFramebuffer::validateInitialDviMode()
 
 bool NVRMNVDAFramebuffer::applyMode()
 {
+    if (fStandby) return false;
     NVRMDisplayGate gate; if (!gate.valid()) return false;
     NVRMHeadGate primary(startLock(), primaryGate(), true);
     if (!primary.valid() || OSAddAtomic(0, &fStopping)) return false;
@@ -3185,6 +3466,7 @@ bool NVRMNVDAFramebuffer::start(IOService *provider)
     }
     fFlipCacheLock = IOSimpleLockAlloc();
     if (!fFlipCacheLock) return false;
+    fDdcSinkLock = IORecursiveLockAlloc();
     struct NVRMDisplayPointers displayPtrs = {};
     displayPtrs.version = NVRM_DISPLAY_PTRS_ABI_VERSION;
     {
@@ -3209,10 +3491,6 @@ bool NVRMNVDAFramebuffer::start(IOService *provider)
     fRotationAttributesLock = IOLockAlloc();
     if (!fRotationAttributesLock) return false;
     configureRotation(); // Must precede kapiInit's first mode/scaler publication.
-    if (!configureControllerIdentity(provider)) {
-        FBLOG("fb%u: controller identity publication failed -- refusing to start", fIndex);
-        return false;
-    }
     fConnectNotify = nvrmfbCall(connectNotifyFire, this);
     if (!fConnectNotify) { FBLOG("fb%u: connect notification allocation failed -- refusing to start", fIndex); return false; }
     nvrmDiscoverBar1(provider, &fBarLen, &fBar1Base);
@@ -3268,7 +3546,7 @@ bool NVRMNVDAFramebuffer::start(IOService *provider)
     // A late framebuffer owes a connect interrupt when its mode is ready.
     fHotplugBorn = (gNDpyBoot >= 0 && (int)fIndex >= gNDpyBoot);
     if (fHotplugBorn) FBLOG("fb%u: late display; notifying after the first modeset", fIndex);
-    bool kapiOk = kapiInit();
+    const bool kapiOk = kapiInit() && configureControllerIdentity(provider);
     if (!kapiOk && fOwnsHead) { gHeadsTaken &= ~(1u << fHead); fOwnsHead = false; }
     IORecursiveLockUnlock(sl);
     if (!kapiOk) {
@@ -3289,10 +3567,17 @@ bool NVRMNVDAFramebuffer::start(IOService *provider)
         return false;
     }
     setName("NVRMFramebuffer");
+    int copyPresent = 0;
+    if (!fConsoleAperture && PE_parse_boot_argn("nvrmfbcopyflip", &copyPresent, sizeof copyPresent) && copyPresent == 1)
+        fCopyPresent = setProperty(NVRM_COPY_PRESENT_PROPERTY, kOSBooleanTrue);
     if (fInternal) publishBacklight();   // before super::start(): IOFramebuffer::open looks for "backlight"
     publishDdcBus();
+    if (fDdcOn) publishDdcBrightness();
     if (!super::start(provider)) {
         finishBootConsole();
+        if (fDdcBrightness) { fDdcBrightness->detach(this); OSSafeReleaseNULL(fDdcBrightness); }
+        if (fDdcBrightnessCall) { thread_call_free(fDdcBrightnessCall); fDdcBrightnessCall = nullptr; }
+        if (fDdcProbeCall) { thread_call_free(fDdcProbeCall); fDdcProbeCall = nullptr; }
         if (fBacklight) { fBacklight->detach(this); OSSafeReleaseNULL(fBacklight); }
         {
             NVRMDisplayGate gate;
@@ -3302,6 +3587,10 @@ bool NVRMNVDAFramebuffer::start(IOService *provider)
         FBLOG("super::start failed after kapiInit succeeded"); return false;
     }
     if (fBacklight) publishDiskBacklight(fBacklight);
+    if (fCopyPresent) {
+        fCopyPresentCall = nvrmfbCall(copyPresentFire, this);
+        if (NVRM_COPY_GPU_DEFAULT) setProperty(NVRM_COPY_PRESENT_VRAM_PROPERTY, kOSBooleanTrue);
+    }
     fSleepTap = addFramebufferNotification(&NVRMNVDAFramebuffer::sleepTap, this, nullptr);
     if (!fSleepTap) FBLOG("sleep/wake notification tap not registered - a wake after dark wakes may leave the accelerator off");
     fVblTimer = nvrmfbCall(vblFire, this);
@@ -3348,6 +3637,15 @@ bool NVRMNVDAFramebuffer::start(IOService *provider)
     FBLOG("registerPowerDriver(2 states) done");
     FBLOG("started on %s", provider->getName());
     fbGuardCleared("the framebuffer has its scanout memory and a display mode");
+    if (fStandby || fHotplugBorn) {
+        __atomic_store_n(&fHotplugStarted, true, __ATOMIC_RELEASE);
+        if (fStandby) {
+            FBLOG("fb%u: published as an offline boot framebuffer", fIndex);
+            hotplugKick();
+        } else {
+            notifyConnectionChanged(100);
+        }
+    }
     return true;
 }
 void NVRMNVDAFramebuffer::scheduleCall(thread_call_t call, uint64_t deadline)
@@ -3381,7 +3679,17 @@ void NVRMNVDAFramebuffer::stop(IOService *provider)
     // Drop both guards before draining workers that can enter this same head.
     {
         NVRMDisplayGate gate;
-        if (gate.valid()) { NVRMHeadGate primary(startLock(), primaryGate(), true); }
+        if (gate.valid()) {
+            NVRMHeadGate primary(startLock(), primaryGate(), true);
+            fCopyQueued = nullptr;
+            if (primary.valid() && fCopyPresent &&
+                rmGpuReady() && (!fSubmissionSeen || waitFlipDone(0))) {
+                for (auto &slot : fCopyScanout) {
+                    // This head may still be scanning the accepted front after IOService stops.
+                    if (slot.surface != fFrontSurf && !slot.quarantinedSource) teardownCopyScanout(slot);
+                }
+            }
+        }
     }
     if (gSurroundMask && fIndex < 4 && (gSurroundMask & (1u << fIndex))) surroundCheck();
     if (fHwVblCb && fKms && fDev) {
@@ -3406,7 +3714,7 @@ void NVRMNVDAFramebuffer::stop(IOService *provider)
         thread_call_free(fCursorCall);
         fCursorCall = nullptr;
     }
-    thread_call_t *calls[] = {&fHwVblCall, &fReflip, &fGpuWake, &fBars, &fVblTimer, &fSampler, &fHeadProbe, &fConnectNotify, &fAudioCall};
+    thread_call_t *calls[] = {&fCopyPresentCall, &fHwVblCall, &fReflip, &fGpuWake, &fBars, &fVblTimer, &fSampler, &fHeadProbe, &fConnectNotify, &fAudioCall, &fDdcBrightnessCall, &fDdcProbeCall};
     for (unsigned i = 0; i < sizeof calls / sizeof calls[0]; ++i) {
         thread_call_t call = *calls[i];
         if (!call) continue;
@@ -3421,6 +3729,15 @@ void NVRMNVDAFramebuffer::stop(IOService *provider)
     // after the unregister above. The timer is drained now, so a callback registered that way is removed here.
     if (fHwVblCb && fKms && fDev) {
         fKms->unregisterVblankIntrCallback(fDev, fHead, fHwVblCb); fHwVblCb = nullptr;
+    }
+    if (fDdcBrightness) {
+        fDdcBrightness->cancelProbe();
+        fDdcBrightness->detach(this);
+        OSSafeReleaseNULL(fDdcBrightness);
+    }
+    if (fDdcBrightnessGate) {
+        if (IOWorkLoop *loop = getWorkLoop()) loop->removeEventSource(fDdcBrightnessGate);
+        OSSafeReleaseNULL(fDdcBrightnessGate);
     }
     if (fBacklight) {
         clearDiskBacklight(fBacklight);
@@ -3484,6 +3801,7 @@ void NVRMNVDAFramebuffer::free()
     if (fConnectNotify && thread_call_free(fConnectNotify)) fConnectNotify = nullptr;
     if (fFlipCacheLock) { IOSimpleLockFree(fFlipCacheLock); fFlipCacheLock = nullptr; }
     if (fCurStateLock) { IOSimpleLockFree(fCurStateLock); fCurStateLock = nullptr; }
+    if (fDdcSinkLock) { IORecursiveLockFree(fDdcSinkLock); fDdcSinkLock = nullptr; }
     fConsKva = nullptr; OSSafeReleaseNULL(fConsMap); OSSafeReleaseNULL(fConsMem);
     OSSafeReleaseNULL(fRotationPublishedSizes);
     if (fRotationAttributesLock) { IOLockFree(fRotationAttributesLock); fRotationAttributesLock = nullptr; }
@@ -3493,7 +3811,20 @@ void NVRMNVDAFramebuffer::free()
 IOReturn NVRMNVDAFramebuffer::enableController()
 {
     FBLOG("enableController");
+    if (fDdcBrightness && !fDdcBrightnessGate) {
+        if (IOWorkLoop *loop = getWorkLoop()) {
+            IOCommandGate *gate = IOCommandGate::commandGate(this);
+            if (gate && loop->addEventSource(gate) == kIOReturnSuccess) {
+                fDdcBrightnessGate = gate;
+                // An early display match may have queued a probe before this gate was ready.
+                scheduleDdcProbe(kNVRMDdcProbeFirstDelayMs);
+            } else {
+                OSSafeReleaseNULL(gate);
+            }
+        }
+    }
     fEnableAbs = mach_absolute_time();
+    if (fDpyLost) return kIOReturnSuccess;
     const bool ok = applyMode();
     if (ok) refreshDisplayAudioProperties();
     // A display that appeared after boot: tell the framework, through the connect handler it registered (fConnect),
@@ -3516,7 +3847,11 @@ bool NVRMNVDAFramebuffer::configureControllerIdentity(IOService *provider)
 {
     int requested = getProperty("NVRMIndependentControllers") == kOSBooleanTrue ? 1 : 0;
     PE_parse_boot_argn("nvfbcontrollers", &requested, sizeof requested);
-    const bool independent = fRotationEnabled && requested == 1;
+    // A secondary framebuffer created after boot cannot join the controller
+    // that IOGraphics already opened. Give it a new controller from its first
+    // publication while keeping its original accelerator slot.
+    const bool independent = (fHotplugBorn && fIndex != 0) ||
+                             (!fStandby && fRotationEnabled && requested == 1);
     // Keep head zero's existing group for the optional NMIntelFB panel. Other
     // NVIDIA heads get their own group before IOFramebuffer caches a controller.
     const unsigned long long group = independent && fIndex != 0
@@ -3548,6 +3883,10 @@ void NVRMNVDAFramebuffer::configureRotation()
 bool NVRMNVDAFramebuffer::setProperty(const OSSymbol *key, OSObject *value)
 {
     const bool accepted = IOFramebuffer::setProperty(key, value);
+    if (accepted && fHotplugBorn && key &&
+        (key->isEqualTo("IOAccelIndex") || key->isEqualTo("IOAccelTypes"))) {
+        notifyConnectionChanged(100);
+    }
     if (accepted && fRotationEnabled && key && key->isEqualTo("IOFBTransform")) {
         OSNumber *number = OSDynamicCast(OSNumber, value);
         const UInt32 raw = number ? number->unsigned32BitValue() : 0;
@@ -3600,6 +3939,7 @@ void NVRMNVDAFramebuffer::publishCursorGeometry(const IODetailedTimingInformatio
 }
 IOReturn NVRMNVDAFramebuffer::setDisplayMode(IODisplayModeID mode, IOIndex depth)
 {
+    if (fStandby) return kIOReturnOffline;
     FBLOG("fb%u setDisplayMode 0x%x depth %d (current 0x%x)", fIndex, (unsigned)mode, (int)depth, (unsigned)fCurId);
     if (depth != 0) return kIOReturnUnsupportedMode;
     if (mode != fCurId && fConsoleCopied) finishBootConsole();
@@ -4032,7 +4372,7 @@ IOReturn NVRMNVDAFramebuffer::switchMode(IODisplayModeID id, const struct NvKmsK
         lr->config.compParams.compMode = NVKMS_COMPOSITION_BLENDING_MODE_OPAQUE; lr->config.minPresentInterval = 1;
         lr->flags.surfaceChanged = lr->flags.srcXYChanged = lr->flags.srcWHChanged = lr->flags.dstXYChanged = lr->flags.dstWHChanged = NV_TRUE;
         nvrmUnownedHeadsOff(cfg);
-        ok = submitConfig(cfg, rep, commit ? NV_TRUE : NV_FALSE, false, false, false, hdr ? 1 : 0);
+        ok = submitConfig(cfg, rep, commit ? NV_TRUE : NV_FALSE, false, false, hdr ? 1 : 0);
         FBLOG("switchMode 0x%x: %s %ux%u -> raster %ux%u @%u mHz pclk %u rotation 0x%x -> %u (flipResult %d)", (unsigned)id,
               commit ? "COMMIT" : "test", w, h, m.timings.hVisible, m.timings.vVisible, m.timings.refreshRate,
               m.timings.pixelClockHz, (unsigned)transform, (unsigned)ok, (int)rep->flipResult);
@@ -4449,6 +4789,22 @@ static struct { struct NvKmsKapiMemory *m; void *k; NvU64 n; } gParkedForever[64
 static int      gNParkedForever   = 0;
 static volatile SInt64 gVramParkedBytes = 0;
 static volatile SInt64 gCntGrant, gCntGrantBytes, gCntRelease, gCntReleaseBytes;
+static SInt64 gCopyPresentLatched, gCopyPresentBusy, gCopyPresentFailed;
+static SInt64 gCopyPresentQueued, gCopyPresentDeferred;
+static SInt64 gCopyPresentLatchedHead[8];
+// This path is independently selectable for a same-boot comparison.
+static int gCopyPresentGpu = NVRM_COPY_GPU_DEFAULT;
+static bool gCopyPresentGpuFaulted;
+static SInt64 gCopyPresentGpuCompleted, gCopyPresentGpuQuarantined;
+static SInt64 gCopyPresentGpuUsec, gCopyPresentGpuHead[8];
+SYSCTL_INT(_debug, OID_AUTO, nvrmfb_copy_present_gpu, CTLFLAG_RW | CTLFLAG_LOCKED,
+           &gCopyPresentGpu, 0, "copy pitch-matched compositor frames directly into the private scanout");
+SYSCTL_QUAD(_debug, OID_AUTO, nvrmfb_copy_present_gpu_completed, CTLFLAG_RD | CTLFLAG_LOCKED,
+            &gCopyPresentGpuCompleted, "direct compositor copies completed by the copy engine");
+SYSCTL_QUAD(_debug, OID_AUTO, nvrmfb_copy_present_gpu_quarantined, CTLFLAG_RD | CTLFLAG_LOCKED,
+            &gCopyPresentGpuQuarantined, "direct copies with uncertain completion; buffers remain pinned");
+SYSCTL_QUAD(_debug, OID_AUTO, nvrmfb_copy_present_gpu_us, CTLFLAG_RD | CTLFLAG_LOCKED,
+            &gCopyPresentGpuUsec, "microseconds spent on successful direct compositor copies");
 SYSCTL_QUAD(_debug, OID_AUTO, nvrmfb_vram_grants,        CTLFLAG_RD | CTLFLAG_LOCKED, (SInt64 *)&gCntGrant,        "vramGrant successes");
 SYSCTL_QUAD(_debug, OID_AUTO, nvrmfb_vram_grant_bytes,   CTLFLAG_RD | CTLFLAG_LOCKED, (SInt64 *)&gCntGrantBytes,   "bytes granted");
 SYSCTL_QUAD(_debug, OID_AUTO, nvrmfb_vram_releases,      CTLFLAG_RD | CTLFLAG_LOCKED, (SInt64 *)&gCntRelease,      "vramRelease calls");
@@ -4456,7 +4812,25 @@ SYSCTL_QUAD(_debug, OID_AUTO, nvrmfb_vram_release_bytes, CTLFLAG_RD | CTLFLAG_LO
 static volatile SInt64 gVramBudgetBytes = 0;
 SYSCTL_QUAD(_debug, OID_AUTO, nvrmfb_vram_budget_bytes, CTLFLAG_RD | CTLFLAG_LOCKED, (SInt64 *)&gVramBudgetBytes, "the BAR1 grant budget in force");
 SYSCTL_QUAD(_debug, OID_AUTO, nvrmfb_vram_mapped_bytes,  CTLFLAG_RD | CTLFLAG_LOCKED, (SInt64 *)&gVramMappedBytes,  "the BAR1 budget counter, live");
-SYSCTL_QUAD(_debug, OID_AUTO, nvrmfb_vram_display_bytes, CTLFLAG_RD | CTLFLAG_LOCKED, (SInt64 *)&gVramDisplayBytes, "scanout+cursor the framebuffer itself maps into BAR1");
+SYSCTL_QUAD(_debug, OID_AUTO, nvrmfb_vram_display_bytes, CTLFLAG_RD | CTLFLAG_LOCKED, (SInt64 *)&gVramDisplayBytes, "display memory the framebuffer itself maps into BAR1");
+SYSCTL_QUAD(_debug, OID_AUTO, nvrmfb_copy_present_latched, CTLFLAG_RD | CTLFLAG_LOCKED, &gCopyPresentLatched,
+            "buffered copy flips with hardware completion observed");
+SYSCTL_QUAD(_debug, OID_AUTO, nvrmfb_copy_present_busy, CTLFLAG_RD | CTLFLAG_LOCKED, &gCopyPresentBusy,
+            "buffered copies skipped because a prior flip was pending or could not be verified");
+SYSCTL_QUAD(_debug, OID_AUTO, nvrmfb_copy_present_failed, CTLFLAG_RD | CTLFLAG_LOCKED, &gCopyPresentFailed,
+            "buffered copies refused for invalid geometry, unavailable buffers, or a failed commit");
+SYSCTL_QUAD(_debug, OID_AUTO, nvrmfb_copy_present_queued, CTLFLAG_RD | CTLFLAG_LOCKED, &gCopyPresentQueued,
+            "frames copied while the previous scanout was still pending");
+SYSCTL_QUAD(_debug, OID_AUTO, nvrmfb_copy_present_deferred, CTLFLAG_RD | CTLFLAG_LOCKED, &gCopyPresentDeferred,
+            "buffered frames submitted by the retry after the previous scanout latched");
+#define COPY_HEAD_COUNTERS(n) \
+    SYSCTL_QUAD(_debug, OID_AUTO, nvrmfb_copy_present_latched_h##n, CTLFLAG_RD | CTLFLAG_LOCKED, \
+                &gCopyPresentLatchedHead[n], "buffered copy flips proven complete on this head"); \
+    SYSCTL_QUAD(_debug, OID_AUTO, nvrmfb_copy_present_gpu_h##n, CTLFLAG_RD | CTLFLAG_LOCKED, \
+                &gCopyPresentGpuHead[n], "direct compositor copies completed for this head")
+COPY_HEAD_COUNTERS(0); COPY_HEAD_COUNTERS(1); COPY_HEAD_COUNTERS(2); COPY_HEAD_COUNTERS(3);
+COPY_HEAD_COUNTERS(4); COPY_HEAD_COUNTERS(5); COPY_HEAD_COUNTERS(6); COPY_HEAD_COUNTERS(7);
+#undef COPY_HEAD_COUNTERS
 SYSCTL_INT(_debug, OID_AUTO, nvrmfb_vram_display_aware, CTLFLAG_RW | CTLFLAG_LOCKED, &gVramDisplayAware, 0, "1 = the accel budget reserves the BAR1 the display holds; 0 = the old fixed fraction");
 static struct NVRMVramRequest gVramTest[256]; static int gVramTestN; static int gVramTestMode;
 static int nvrmfb_vramtest_sysctl SYSCTL_HANDLER_ARGS
@@ -4522,6 +4896,22 @@ static void nvrmfbInstallSysctl(void)
     sysctl_register_oid(&sysctl__debug_nvrmfb_flip_latch); sysctl_register_oid(&sysctl__debug_nvrmfb_flip_latch_waits);
     sysctl_register_oid(&sysctl__debug_nvrmfb_flip_latch_timeouts); sysctl_register_oid(&sysctl__debug_nvrmfb_flip_latch_max_us);
     sysctl_register_oid(&sysctl__debug_nvrmfb_flip_latch_late); sysctl_register_oid(&sysctl__debug_nvrmfb_flip_latch_deferred);
+    sysctl_register_oid(&sysctl__debug_nvrmfb_copy_present_latched);
+    sysctl_register_oid(&sysctl__debug_nvrmfb_copy_present_busy);
+    sysctl_register_oid(&sysctl__debug_nvrmfb_copy_present_failed);
+    sysctl_register_oid(&sysctl__debug_nvrmfb_copy_present_queued);
+    sysctl_register_oid(&sysctl__debug_nvrmfb_copy_present_deferred);
+    sysctl_register_oid(&sysctl__debug_nvrmfb_copy_present_gpu);
+    sysctl_register_oid(&sysctl__debug_nvrmfb_copy_present_gpu_completed);
+    sysctl_register_oid(&sysctl__debug_nvrmfb_copy_present_gpu_quarantined);
+    sysctl_register_oid(&sysctl__debug_nvrmfb_copy_present_gpu_us);
+#define COPY_HEAD_OIDS(n) &sysctl__debug_nvrmfb_copy_present_latched_h##n, &sysctl__debug_nvrmfb_copy_present_gpu_h##n
+    struct sysctl_oid *headCounters[] = {
+        COPY_HEAD_OIDS(0), COPY_HEAD_OIDS(1), COPY_HEAD_OIDS(2), COPY_HEAD_OIDS(3),
+        COPY_HEAD_OIDS(4), COPY_HEAD_OIDS(5), COPY_HEAD_OIDS(6), COPY_HEAD_OIDS(7),
+    };
+#undef COPY_HEAD_OIDS
+    for (auto *oid : headCounters) sysctl_register_oid(oid);
 }
 
 bool NVRMNVDAFramebuffer::vramGrant(struct NVRMVramRequest *r)
@@ -4717,6 +5107,20 @@ IOReturn NVRMNVDAFramebuffer::callPlatformFunction(const OSSymbol *functionName,
 {
     bool isAlloc = functionName && functionName->isEqualTo(NVRM_VRAM_FN_ALLOC);
     bool isFree  = functionName && functionName->isEqualTo(NVRM_VRAM_FN_FREE);
+    if (functionName && functionName->isEqualTo(NVRM_COPY_PRESENT_FN)) {
+        const auto *request = static_cast<const NVRMCopyPresentRequest *>(param1);
+        if (!request || request->version != NVRM_COPY_PRESENT_ABI_VERSION) return kIOReturnBadArgument;
+        return presentCopiedFrame(*request);
+    }
+    if (functionName && functionName->isEqualTo(NVRM_COPY_PRESENT_VRAM_FN)) {
+        const auto *vram = static_cast<const NVRMCopyVramPresentRequest *>(param1);
+        if (!vram || vram->version != NVRM_COPY_PRESENT_ABI_VERSION || !vram->sourceMemory)
+            return kIOReturnBadArgument;
+        const NVRMCopyPresentRequest request = {vram->version, NV_IOP_FMT_BGRA, vram->width,
+                                               vram->height, vram->pitch, nullptr};
+        return presentCopiedFrame(request, static_cast<struct NvKmsKapiMemory *>(vram->sourceMemory),
+                                  vram->allocationCookie);
+    }
     if (functionName && functionName->isEqualTo("NVRMGpuPower")) {   // from NVRM: 0 standby, 1 resumed, 2 lost
         const uintptr_t st = (uintptr_t)param1;
         if (st == 0) {
@@ -4795,9 +5199,290 @@ IOReturn NVRMNVDAFramebuffer::callPlatformFunction(const OSSymbol *functionName,
     return              vramRelease(r) ? kIOReturnSuccess : kIOReturnBadArgument;
 }
 
+void NVRMNVDAFramebuffer::teardownCopyScanout(CopyScanout &slot)
+{
+    if (!slot.memory) return;
+    fKms->destroySurface(fDev, slot.surface);
+    fKms->unmapMemory(fDev, slot.memory, NVKMS_KAPI_MAPPING_TYPE_KERNEL, slot.kva);
+    fKms->freeMemory(fDev, slot.memory);
+    if (slot.barBytes) OSAddAtomic64(-(SInt64)slot.barBytes, &gVramDisplayBytes);
+    slot = {};
+}
+
+bool NVRMNVDAFramebuffer::prepareCopyScanout(CopyScanout &slot)
+{
+    if (slot.surface && slot.width == fW && slot.height == fH && slot.pitch == fPitch) return true;
+    teardownCopyScanout(slot);
+    const NvU64 size = ((NvU64)fPitch * fH + 0xffffull) & ~0xffffull;
+    if (!size || size > (128ull << 20)) return false;
+    for (unsigned attempt = 0; attempt < 2; ++attempt) {
+        const bool video = attempt == 0;
+        // Do not use aperture space already committed to compositor surfaces.
+        if (video && fBarLen && gVramMappedBytes + gVramParkedBytes >
+            (SInt64)nvrmSurfaceBudget(fBarLen, gVramDisplayBytes + (SInt64)size))
+            continue;
+        NvU8 compressible = 0;
+        struct NvKmsKapiAllocateMemoryParams allocation = {};
+        allocation.layout = NvKmsSurfaceMemoryLayoutPitch;
+        allocation.type = NVKMS_KAPI_ALLOCATION_TYPE_SCANOUT;
+        allocation.size = size;
+        allocation.useVideoMemory = video ? NV_TRUE : NV_FALSE;
+        allocation.compressible = &compressible;
+        auto *memory = fKms->allocateMemory(fDev, &allocation);
+        if (!memory) continue;
+        void *kva = nullptr;
+        if (fKms->mapMemory(fDev, memory, NVKMS_KAPI_MAPPING_TYPE_KERNEL, &kva) && kva) {
+            struct NvKmsKapiCreateSurfaceParams params = {};
+            params.planes[0].memory = memory;
+            params.planes[0].pitch = fPitch;
+            params.width = fW;
+            params.height = fH;
+            params.format = NvKmsSurfaceMemoryFormatX8R8G8B8;
+            if (auto *surface = fKms->createSurface(fDev, &params)) {
+                slot = {memory, surface, kva, fW, fH, fPitch, video ? size : 0, nullptr};
+                if (slot.barBytes) OSAddAtomic64((SInt64)slot.barBytes, &gVramDisplayBytes);
+                FBLOG("buffered copy head %u: %ux%u pitch %u scanout allocated in %s memory",
+                      fHead, fW, fH, fPitch, video ? "video" : "system");
+                return true;
+            }
+            fKms->unmapMemory(fDev, memory, NVKMS_KAPI_MAPPING_TYPE_KERNEL, kva);
+        }
+        fKms->freeMemory(fDev, memory);
+    }
+    return false;
+}
+
+bool NVRMNVDAFramebuffer::copyPresentSupported() const
+{
+    // The buffered scanouts are X8R8G8B8 surfaces for one ordinary display head.
+    return fCopyPresent && !fHidden && !fSurActive && !fSurBuilding &&
+        !fSurQuarantined && !fHdrActive && !fScan30;
+}
+
+bool NVRMNVDAFramebuffer::copyPresentReady()
+{
+    return copyPresentSupported() && !OSAddAtomic(0, &fStopping) && !fSubmissionFaulted &&
+        fKms && fDev && fSurf && fModeSet && !fConsoleAperture && fPowerOn &&
+        !fHeadSlept && !fDpyLost && fHead < 8 && rmGpuReady();
+}
+
+bool NVRMNVDAFramebuffer::copyFlipPending()
+{
+    if (fSubmissionSeen && !waitFlipDone(0)) return true;
+    if (fCopyAwaitingLatch) {
+        OSAddAtomic64(1, &gCopyPresentLatched);
+        OSAddAtomic64(1, &gCopyPresentLatchedHead[fHead]);
+        fCopyAwaitingLatch = false;
+    }
+    fCopyRetiring = nullptr;
+    return false;
+}
+
+IOReturn NVRMNVDAFramebuffer::submitCopiedScanout(CopyScanout &back)
+{
+    auto *cfg = static_cast<struct NvKmsKapiRequestedModeSetConfig *>(IOMalloc(sizeof(NvKmsKapiRequestedModeSetConfig)));
+    auto *rep = static_cast<struct NvKmsKapiModeSetReplyConfig *>(IOMalloc(sizeof(NvKmsKapiModeSetReplyConfig)));
+    if (!cfg || !rep) {
+        if (cfg) IOFree(cfg, sizeof *cfg);
+        if (rep) IOFree(rep, sizeof *rep);
+        OSAddAtomic64(1, &gCopyPresentFailed);
+        return kIOReturnNoMemory;
+    }
+    nvu_zero(cfg, sizeof *cfg);
+    nvu_zero(rep, sizeof *rep);
+    cfg->headsMask = 1u << fHead;
+    auto &head = cfg->headRequestedConfig[fHead];
+    head.modeSetConfig.bActive = NV_TRUE;
+    head.modeSetConfig.numDisplays = 1;
+    head.modeSetConfig.displays[0] = fDisplay;
+    head.modeSetConfig.mode = fMode;
+    auto &layer = head.layerRequestedConfig[NVKMS_KAPI_LAYER_PRIMARY_IDX];
+    layer.config.surface = back.surface;
+    layer.config.srcWidth = (NvU16)fW;
+    layer.config.srcHeight = (NvU16)fH;
+    layer.config.dstWidth = (NvU16)fRasterW;
+    layer.config.dstHeight = (NvU16)fRasterH;
+    layer.config.compParams.compMode = NVKMS_COMPOSITION_BLENDING_MODE_OPAQUE;
+    layer.config.minPresentInterval = 1;
+    layer.config.tearing = NV_FALSE;
+    layer.flags.surfaceChanged = NV_TRUE;
+    const bool accepted = submitConfig(cfg, rep, NV_TRUE, false, false, true, -1, true);
+    const bool busy = rep->flipResult == NV_KMS_FLIP_RESULT_IN_PROGRESS;
+    IOFree(cfg, sizeof *cfg);
+    IOFree(rep, sizeof *rep);
+    if (!accepted) {
+        OSAddAtomic64(1, busy ? &gCopyPresentBusy : &gCopyPresentFailed);
+        return busy ? kIOReturnBusy : kIOReturnIOError;
+    }
+
+    fCopyRetiring = fFrontSurf;
+    fFrontSurf = back.surface;
+    fCopyAwaitingLatch = true;
+    if (++fCopyPresents == 1)
+        FBLOG("buffered copy head %u (fb%u): first vblank-synchronized flip accepted", fHead, fIndex);
+    if (OSCompareAndSwap(1, 0, &fServerFresh) && (fTransform || fCurTransform) && fConnect.proc)
+        notifyConnectionChanged(1);
+    return kIOReturnSuccess;
+}
+
+void NVRMNVDAFramebuffer::copyPresentFire(thread_call_param_t p0, thread_call_param_t)
+{
+    auto *me = static_cast<NVRMNVDAFramebuffer *>(p0);
+    NVRMCallReference reference(me);
+    NVRMDisplayGate gate;
+    if (!gate.valid()) return;
+    NVRMHeadGate primary(startLock(), me->primaryGate(), false);
+    if (!primary.valid() || !me->fCopyQueued) return;
+    CopyScanout &back = *me->fCopyQueued;
+    if (!me->copyPresentReady() ||
+        back.width != me->fW || back.height != me->fH || back.pitch != me->fPitch) {
+        me->fCopyQueued = nullptr;
+        OSAddAtomic64(1, &gCopyPresentBusy);
+        return;
+    }
+    // Poll without holding up WindowServer or keeping the head reserved over vblank.
+    if (me->copyFlipPending()) {
+        if (mach_absolute_time() >= me->fCopyQueuedDeadline) {
+            me->fCopyQueued = nullptr;
+            OSAddAtomic64(1, &gCopyPresentBusy);
+            return;
+        }
+        uint64_t next;
+        clock_interval_to_deadline(500, kMicrosecondScale, &next);
+        me->scheduleCall(me->fCopyPresentCall, next);
+        return;
+    }
+    me->fCopyQueued = nullptr;
+    if (me->submitCopiedScanout(back) == kIOReturnSuccess)
+        OSAddAtomic64(1, &gCopyPresentDeferred);
+}
+
+IOReturn NVRMNVDAFramebuffer::copyVramToScanout(CopyScanout &back, struct NvKmsKapiMemory *source, UInt64 length)
+{
+    const uint64_t begin = mach_absolute_time();
+    IOService *rm = getProvider();
+    while (rm && strcmp(rm->getMetaClass()->getClassName(), "NVRM") != 0) rm = rm->getProvider();
+    const OSSymbol *fn = OSSymbol::withCStringNoCopy(NVRM_SS_FN_COPY_MEMORY);
+    if (!rm || !fn) { OSSafeReleaseNULL(fn); return kIOReturnUnsupported; }
+    // The source cookie was checked under the same gate that serializes its
+    // release. Keep a separate RM reference if completion is uncertain.
+    auto *pin = fKms->dupMemory(fDev, fDev, source);
+    if (!pin) { OSSafeReleaseNULL(fn); return kIOReturnUnsupported; }
+    NVRMSurfCopyMemory request = {NVRM_SS_RM_VERSION, NVRM_SS_COPY_UNAVAILABLE, fDev, pin, back.memory, length};
+    const IOReturn status = rm->callPlatformFunction(fn, false, &request, nullptr, nullptr, nullptr);
+    OSSafeReleaseNULL(fn);
+    if (request.result == NVRM_SS_COPY_UNCERTAIN) {
+        // No CPU fallback or scanout may touch this destination. Keep both
+        // references through reboot and stop attempting further engine copies.
+        back.quarantinedSource = pin;
+        gCopyPresentGpuFaulted = true;
+        OSAddAtomic64(1, &gCopyPresentGpuQuarantined);
+        FBLOG("direct present copy completion unknown on head %u; source and scanout retained", fHead);
+        return kIOReturnIOError;
+    }
+    fKms->freeMemory(fDev, pin);
+    if (request.result != NVRM_SS_COPY_COMPLETE)
+        return status == kIOReturnNotReady ? status : kIOReturnUnsupported;
+    uint64_t elapsed = 0;
+    absolutetime_to_nanoseconds(mach_absolute_time() - begin, &elapsed);
+    OSAddAtomic64(static_cast<SInt64>(elapsed / 1000), &gCopyPresentGpuUsec);
+    OSAddAtomic64(1, &gCopyPresentGpuHead[fHead]);
+    OSAddAtomic64(1, &gCopyPresentGpuCompleted);
+    return kIOReturnSuccess;
+}
+
+IOReturn NVRMNVDAFramebuffer::presentCopiedFrame(const NVRMCopyPresentRequest &request,
+                                                struct NvKmsKapiMemory *source, UInt64 cookie)
+{
+    if (!fCopyPresent) return kIOReturnUnsupported;
+    NVRMDisplayGate gate;
+    if (!gate.valid()) return kIOReturnNotReady;
+    NVRMHeadGate primary(startLock(), primaryGate(), false);
+    if (!primary.valid()) return kIOReturnNotReady;
+    if (!copyPresentSupported()) return kIOReturnUnsupported;
+    if (!copyPresentReady()) return kIOReturnNotReady;
+    nvrmfbInstallSysctl();
+    if ((!source && (!request.pixels || (reinterpret_cast<uintptr_t>(request.pixels) & 3))) ||
+        (request.format != NV_IOP_FMT_BGRA && request.format != NV_IOP_FMT_L10R) ||
+        !request.width || !request.height || request.width != fW || request.height != fH ||
+        fW > 16384 || fH > 16384 || !fRasterW || !fRasterH ||
+        request.pitch < fW * 4 || request.pitch > 16384u * 8 || (request.pitch & 3) ||
+        fPitch < fW * 4 || (fPitch & 3)) {
+        OSAddAtomic64(1, &gCopyPresentFailed);
+        return kIOReturnBadArgument;
+    }
+    const UInt64 length = (UInt64)request.pitch * request.height;
+    if (source && (!__atomic_load_n(&gCopyPresentGpu, __ATOMIC_RELAXED) || gCopyPresentGpuFaulted ||
+                   request.pitch != fPitch || length > gAllocations.size(source, cookie)))
+        return kIOReturnUnsupported;
+    const bool pending = copyFlipPending();
+    if (pending && (!fCopyPresentCall || !fCopyAwaitingLatch)) {
+        OSAddAtomic64(1, &gCopyPresentBusy);
+        return kIOReturnBusy;
+    }
+    // Keep both surfaces named by the pending primary flip pinned. A third,
+    // private slot is allocated only when neither of the usual slots is free.
+    CopyScanout *back = fCopyQueued;
+    if (!back) {
+        for (auto &slot : fCopyScanout) {
+            if (slot.quarantinedSource) continue;
+            if (slot.surface && (slot.surface == fFrontSurf || slot.surface == fCopyRetiring)) continue;
+            back = &slot;
+            break;
+        }
+    }
+    if (!back || !prepareCopyScanout(*back)) {
+        if (back == fCopyQueued) fCopyQueued = nullptr;
+        OSAddAtomic64(1, &gCopyPresentFailed);
+        return kIOReturnNoMemory;
+    }
+    if (source) {
+        const IOReturn copied = copyVramToScanout(*back, source, length);
+        if (copied != kIOReturnSuccess || !copyPresentReady()) {
+            if (back == fCopyQueued && (back->quarantinedSource || copied == kIOReturnSuccess))
+                fCopyQueued = nullptr;
+            return copied == kIOReturnSuccess ? kIOReturnNotReady : copied;
+        }
+    } else {
+        copyPixelsToScanout(*back, request);
+    }
+    if (fCopyQueued) OSAddAtomic64(1, &gCopyPresentBusy);
+    if (pending && copyFlipPending()) {
+        // Only the private scanout is retained after the caller returns.
+        fCopyQueued = back;
+        fCopyQueuedDeadline = mach_absolute_time() + vblPeriodAbs();
+        scheduleCall(fCopyPresentCall, 0);
+        OSAddAtomic64(1, &gCopyPresentQueued);
+        return kIOReturnBusy;
+    }
+    fCopyQueued = nullptr;
+    return submitCopiedScanout(*back);
+}
+
+void NVRMNVDAFramebuffer::copyPixelsToScanout(CopyScanout &back, const NVRMCopyPresentRequest &request)
+{
+    auto *destination = static_cast<volatile unsigned *>(back.kva);
+    const size_t rowBytes = (size_t)request.width * sizeof(unsigned);
+    if (request.format == NV_IOP_FMT_BGRA && request.pitch == rowBytes && back.pitch == rowBytes) {
+        nvu_copy(const_cast<unsigned *>(destination), const_cast<const unsigned *>(request.pixels),
+                 rowBytes * request.height);
+    } else {
+        for (unsigned y = 0; y < request.height; ++y) {
+            auto *dst = destination + (size_t)y * (back.pitch / 4);
+            const auto *src = request.pixels + (size_t)y * (request.pitch / 4);
+            if (request.format == NV_IOP_FMT_BGRA)
+                nvu_copy(const_cast<unsigned *>(dst), const_cast<const unsigned *>(src), rowBytes);
+            else
+                nv_iop_convert_row(dst, src, request.width, request.format, 0);
+        }
+    }
+    __asm__ __volatile__("sfence" ::: "memory");
+}
+
 bool NVRMNVDAFramebuffer::flipToMemory(struct NvKmsKapiMemory *mem, unsigned w, unsigned h,
                                    unsigned pitch, int *rcOut, bool pure, UInt64 cookie)
 {
+    if (fStandby) return false;
     NVRMDisplayGate gate; if (!gate.valid() || fSubmissionFaulted) return false;
     retain();
     NVRMCallReference callReference(this);
@@ -5182,8 +5867,8 @@ bool NVRMNVDAFramebuffer::setHeadPower(bool awake)
 }
 IOReturn NVRMNVDAFramebuffer::setPowerState(unsigned long ordinal, IOService *device)
 {
-    ddcSetPowered(ordinal != 0);
     FBLOG("setPowerState %lu", (unsigned long)ordinal);
+    ddcSetPowered(ordinal != 0);
     if (ordinal) {
         fPowerOn = true;
         // a failed wake stays retryable (fHeadSlept kept) but WindowServer is still told the display is on, as 1.14.7 did:
@@ -5336,12 +6021,15 @@ void NVRMNVDAFramebuffer::publishDdcBus()
     fDdcOn = false;
     if (fInternal || !PE_parse_boot_argn("nvrmfbddc", &on, sizeof on) || on != 1) return;
     OSArray *buses = OSArray::withCapacity(1);
-    OSDictionary *bus = OSDictionary::withCapacity(3);
+    OSDictionary *bus = OSDictionary::withCapacity(4);
+    // IOGraphics requires a bus ID to start the interface. It scopes bus 0 to this framebuffer.
+    OSNumber *id = OSNumber::withNumber((UInt64)0, 32);
     OSNumber *type = OSNumber::withNumber((UInt64)kIOI2CBusTypeI2C, 32);
     OSNumber *tx = OSNumber::withNumber((UInt64)((1u << kIOI2CNoTransactionType) | (1u << kIOI2CSimpleTransactionType) |
                                                  (1u << kIOI2CDDCciReplyTransactionType)), 32);
     OSNumber *flags = OSNumber::withNumber((UInt64)0, 32);
-    if (buses && bus && type && tx && flags) {
+    if (buses && bus && id && type && tx && flags) {
+        bus->setObject(kIOI2CInterfaceIDKey, id);
         bus->setObject(kIOI2CBusTypeKey, type); bus->setObject(kIOI2CTransactionTypesKey, tx);
         bus->setObject(kIOI2CSupportedCommFlagsKey, flags);
         buses->setObject(bus);
@@ -5349,15 +6037,325 @@ void NVRMNVDAFramebuffer::publishDdcBus()
         fDdcOn = true;
         FBLOG("fb%u: DDC/CI bus published (nvrmfbddc=1)", fIndex);
     }
-    OSSafeReleaseNULL(flags); OSSafeReleaseNULL(tx); OSSafeReleaseNULL(type); OSSafeReleaseNULL(bus); OSSafeReleaseNULL(buses);
+    OSSafeReleaseNULL(flags); OSSafeReleaseNULL(tx); OSSafeReleaseNULL(type); OSSafeReleaseNULL(id);
+    OSSafeReleaseNULL(bus); OSSafeReleaseNULL(buses);
 }
+void NVRMExternalBrightness::setFramebuffer(NVRMNVDAFramebuffer *framebuffer)
+{
+    fFramebuffer = framebuffer;
+    fFramebuffer->retain();
+    fVolumeKey = OSSymbol::withCStringNoCopy(kIODisplaySpeakerVolumeKey);
+}
+
+void NVRMExternalBrightness::free()
+{
+    OSSafeReleaseNULL(fRetryDisplay);
+    OSSafeReleaseNULL(fParameters);
+    OSSafeReleaseNULL(fVolumeKey);
+    OSSafeReleaseNULL(fFramebuffer);
+    IODisplayParameterHandler::free();
+}
+
+bool NVRMExternalBrightness::setDisplay(IODisplay *display)
+{
+    OSSafeReleaseNULL(fRetryDisplay);
+    OSSafeReleaseNULL(fParameters);
+    fGeneration = fVolumeGeneration = 0;
+    fVolumeUnsupported = false;
+    if (!display || OSDynamicCast(IOBacklightDisplay, display) || OSAddAtomic(0, &fFramebuffer->fStopping)) return false;
+    bool retry = false;
+    const bool published = publishParameters(display, false, retry);
+    if (!retry) return published;
+    fRetryDisplay = display;
+    fRetryDisplay->retain();
+    fRetryGeneration = __atomic_load_n(&fFramebuffer->fDdcSinkGeneration, __ATOMIC_RELAXED);
+    fRetriesLeft = kNVRMDdcProbeMaxRetries;
+    fRetryDelayMs = kNVRMDdcProbeFirstDelayMs;
+    fFramebuffer->scheduleDdcProbe(fRetryDelayMs);
+    return true;
+}
+
+void NVRMExternalBrightness::retryProbe()
+{
+    if (!fRetryDisplay) return;
+    if (fRetryDisplay->isInactive() || !fRetryDisplay->getConnection() ||
+        fRetryGeneration != __atomic_load_n(&fFramebuffer->fDdcSinkGeneration, __ATOMIC_RELAXED)) {
+        OSSafeReleaseNULL(fRetryDisplay);
+        return;
+    }
+    bool retry = true;
+    IODisplay *display = fRetryDisplay;
+    display->retain();
+    if (publishParameters(display, true, retry))
+        display->messageClients(kIOMessageServicePropertyChange);
+    const bool sameDisplay = fRetryDisplay == display;
+    display->release();
+    if (!sameDisplay) return;
+    if (!retry || !--fRetriesLeft) { OSSafeReleaseNULL(fRetryDisplay); return; }
+    // Back off so a slow sink gets progressively more time without hammering the bus early on.
+    if (fRetryDelayMs < kNVRMDdcProbeMaxDelayMs) {
+        fRetryDelayMs *= 2;
+        if (fRetryDelayMs > kNVRMDdcProbeMaxDelayMs) fRetryDelayMs = kNVRMDdcProbeMaxDelayMs;
+    }
+    fFramebuffer->scheduleDdcProbe(fRetryDelayMs);
+}
+
+bool NVRMExternalBrightness::publishParameters(IODisplay *display, bool probeVolume, bool &retry)
+{
+    retry = false;
+    OSObject *old = display->copyProperty(gIODisplayParametersKey);
+    OSDictionary *current = OSDynamicCast(OSDictionary, old);
+    OSDictionary *params = current ? OSDictionary::withDictionary(current) : OSDictionary::withCapacity(4);
+    OSSafeReleaseNULL(old);
+    if (!params) return false;
+    if (fParameters && params->getObject(gIODisplayBrightnessKey) != fParameters->getObject(gIODisplayBrightnessKey))
+        fGeneration = 0;
+    if (fParameters && fVolumeKey && params->getObject(fVolumeKey) != fParameters->getObject(fVolumeKey))
+        fVolumeGeneration = 0;
+    // A sink that is still coming up answers late, so the retry window grows with the retry delay.
+    unsigned replyMs = kNVRMDdcProbeFirstReplyMs;
+    if (fRetryDisplay) {
+        replyMs = fRetryDelayMs > kNVRMDdcProbeReplyMs ? fRetryDelayMs : kNVRMDdcProbeReplyMs;
+        if (replyMs > kNVRMDdcProbeMaxReplyMs) replyMs = kNVRMDdcProbeMaxReplyMs;
+    }
+    UInt32 brightness = 0, brightnessMax = 0, brightnessGeneration = 0;
+    const bool missingBrightness = !params->getObject(gIODisplayBrightnessKey);
+    const bool addBrightness = missingBrightness &&
+        fFramebuffer->readDdcControl(kNvrmVcpBrightness, brightness, brightnessMax, brightnessGeneration, replyMs) ==
+            NVRMVcpReply::valid &&
+        IODisplay::addParameter(params, gIODisplayBrightnessKey, 0, static_cast<SInt32>(brightnessMax)) &&
+        IODisplay::setParameter(params, gIODisplayBrightnessKey, static_cast<SInt32>(brightness));
+    retry = missingBrightness && !addBrightness;
+    if (retry) params->removeObject(gIODisplayBrightnessKey);
+
+    // Use the external display brightness route with the verified VCP range.
+    // Leave capabilities already published by an Apple or MCCS handler in place.
+    OSData *capability = nullptr;
+    if (addBrightness && !display->getProperty(kIODisplayCapabilityStringKey)) {
+        static constexpr char externalModel[] = "model(EDM)";
+        capability = OSData::withBytes(externalModel, sizeof(externalModel) - 1);
+        if (!capability || !display->setProperty(kIODisplayCapabilityStringKey, capability)) {
+            OSSafeReleaseNULL(capability);
+            params->release();
+            return false;
+        }
+    }
+
+    UInt32 volume = 0, volumeMax = 0, volumeGeneration = 0;
+    bool addVolume = false;
+    if (fVolumeKey && !fVolumeUnsupported && !params->getObject(fVolumeKey) &&
+        __atomic_load_n(&fFramebuffer->fDdcSinkHasAudio, __ATOMIC_ACQUIRE)) {
+        const auto result = probeVolume
+            ? fFramebuffer->readDdcControl(kNvrmVcpSpeakerVolume, volume, volumeMax, volumeGeneration, replyMs)
+            : NVRMVcpReply::retry;
+        fVolumeUnsupported = result == NVRMVcpReply::unsupported;
+        addVolume = (result == NVRMVcpReply::valid || result == NVRMVcpReply::muted) &&
+            IODisplay::addParameter(params, fVolumeKey, 1, static_cast<SInt32>(volumeMax)) &&
+            IODisplay::setParameter(params, fVolumeKey, static_cast<SInt32>(volume));
+        if (!addVolume) params->removeObject(fVolumeKey);
+        retry |= !addVolume && !fVolumeUnsupported;
+    }
+    if ((addBrightness || addVolume) && display->setProperty(gIODisplayParametersKey, params)) {
+        OSSafeReleaseNULL(capability);
+        OSSafeReleaseNULL(fParameters);
+        fParameters = params;
+        if (addBrightness) {
+            fMaximum = brightnessMax;
+            fGeneration = brightnessGeneration;
+            BLLOG("external brightness: published for %s at %u/%u", display->getName(), brightness, brightnessMax);
+        }
+        if (addVolume) {
+            fVolumeMaximum = volumeMax;
+            fVolumeGeneration = volumeGeneration;
+            fFramebuffer->setProperty("NVRMExternalSpeakerVolumeMaximum", volumeMax, 32);
+            BLLOG("external speaker volume: published for %s at %u/%u", display->getName(), volume, volumeMax);
+        }
+        return true;
+    }
+    if (capability && display->getProperty(kIODisplayCapabilityStringKey) == capability)
+        display->removeProperty(kIODisplayCapabilityStringKey);
+    OSSafeReleaseNULL(capability);
+    params->release();
+    retry |= addVolume || addBrightness;
+    return false;
+}
+
+bool NVRMExternalBrightness::doIntegerSet(OSDictionary *params, const OSSymbol *key, UInt32 value)
+{
+    const bool volume = key && key == fVolumeKey;
+    const UInt32 generation = volume ? fVolumeGeneration : fGeneration;
+    if ((!volume && key != gIODisplayBrightnessKey) || !params || !fParameters ||
+        !generation || (volume && !value) || value > (volume ? fVolumeMaximum : fMaximum)) return false;
+    OSObject *range = fParameters->getObject(key);
+    if (!range || (params != range && params->getObject(key) != range)) return false;
+    return fFramebuffer->queueDdcControl(volume ? kNvrmVcpSpeakerVolume : kNvrmVcpBrightness,
+                                         value, generation);
+}
+
+void NVRMNVDAFramebuffer::publishDdcBrightness()
+{
+    if (!fDdcSinkLock) return;
+    fDdcBrightness = OSTypeAlloc(NVRMExternalBrightness);
+    if (!fDdcBrightness) return;
+    if (!fDdcBrightness->init() || !fDdcBrightness->attach(this)) {
+        OSSafeReleaseNULL(fDdcBrightness);
+        return;
+    }
+    fDdcBrightness->setFramebuffer(this);
+    fDdcBrightnessCall = nvrmfbCall(ddcBrightnessFire, this);
+    fDdcProbeCall = nvrmfbCall(ddcProbeFire, this);
+    if (!fDdcBrightnessCall || !fDdcProbeCall) {
+        if (fDdcBrightnessCall) { thread_call_free(fDdcBrightnessCall); fDdcBrightnessCall = nullptr; }
+        if (fDdcProbeCall) { thread_call_free(fDdcProbeCall); fDdcProbeCall = nullptr; }
+        fDdcBrightness->detach(this);
+        OSSafeReleaseNULL(fDdcBrightness);
+        return;
+    }
+    fDdcBrightness->registerService(kIOServiceSynchronous);
+}
+
+void NVRMNVDAFramebuffer::scheduleDdcProbe(unsigned delayMs)
+{
+    uint64_t deadline;
+    clock_interval_to_deadline(delayMs, kMillisecondScale, &deadline);
+    scheduleCall(fDdcProbeCall, deadline);
+}
+
+void NVRMNVDAFramebuffer::ddcProbeFire(thread_call_param_t p0, thread_call_param_t)
+{
+    auto *fb = static_cast<NVRMNVDAFramebuffer *>(p0);
+    NVRMCallReference callReference(fb);
+    if (OSAddAtomic(0, &fb->fStopping) || !fb->fDdcBrightnessGate) return;
+    const IOReturn r = fb->fDdcBrightnessGate->attemptAction(
+        OSMemberFunctionCast(IOCommandGate::Action, fb, &NVRMNVDAFramebuffer::ddcProbeGated));
+    if (r == kIOReturnCannotLock) fb->scheduleDdcProbe(kNVRMDdcProbeFirstDelayMs);
+}
+
+IOReturn NVRMNVDAFramebuffer::ddcProbeGated(void *, void *, void *, void *)
+{
+    if (OSAddAtomic(0, &fStopping)) return kIOReturnOffline;
+    fDdcBrightness->retryProbe();
+    return kIOReturnSuccess;
+}
+
+NVRMVcpReply NVRMNVDAFramebuffer::readDdcControl(uint8_t code, UInt32 &value, UInt32 &maximum,
+                                                UInt32 &generation, unsigned delayMs)
+{
+    if (!fDdcBrightnessGate || OSAddAtomic(0, &fStopping)) return NVRMVcpReply::retry;
+    generation = __atomic_load_n(&fDdcSinkGeneration, __ATOMIC_RELAXED);
+    unsigned char query[5];
+    nvrmVcpGet(code, query);
+    unsigned char reply[11] = {};
+    IOI2CRequest rq = {};
+    rq.sendAddress = 0x6e;
+    rq.sendTransactionType = kIOI2CSimpleTransactionType;
+    rq.sendBytes = sizeof query;
+    rq.sendBuffer = (uintptr_t)query;
+    rq.replyAddress = 0x6f;
+    rq.replyTransactionType = kIOI2CDDCciReplyTransactionType;
+    rq.replyBytes = sizeof reply;
+    rq.replyBuffer = (uintptr_t)reply;
+    nanoseconds_to_absolutetime(uint64_t(delayMs) * 1000000, &rq.minReplyDelay);
+    const IOReturn result = doI2CRequest(0, nullptr, &rq);
+    if (result != kIOReturnSuccess ||
+        generation != __atomic_load_n(&fDdcSinkGeneration, __ATOMIC_RELAXED))
+        return NVRMVcpReply::retry;
+    return nvrmVcpParse(code, reply, rq.replyBytes, value, maximum);
+}
+
+bool NVRMNVDAFramebuffer::queueDdcControl(uint8_t code, UInt32 value, UInt32 generation)
+{
+    if (!fFlipCacheLock || OSAddAtomic(0, &fStopping) ||
+        generation != __atomic_load_n(&fDdcSinkGeneration, __ATOMIC_RELAXED))
+        return false;
+    const bool volume = code == kNvrmVcpSpeakerVolume;
+    const UInt64 request = (UInt64(generation) << 32) | (UInt64(value) + 1);
+    IOInterruptState state = IOSimpleLockLockDisableInterrupt(fFlipCacheLock);
+    (volume ? fDdcVolumePendingAt : fDdcPendingAt) = mach_absolute_time();
+    __atomic_store_n(volume ? &fDdcVolumePending : &fDdcPending, request, __ATOMIC_RELEASE);
+    IOSimpleLockUnlockEnableInterrupt(fFlipCacheLock, state);
+    setProperty(volume ? "NVRMExternalSpeakerVolumeRequested" : "NVRMExternalBrightnessRequested", value, 32);
+    scheduleCall(fDdcBrightnessCall, 0);
+    return true;
+}
+
+void NVRMNVDAFramebuffer::ddcBrightnessFire(thread_call_param_t p0, thread_call_param_t)
+{
+    auto *fb = static_cast<NVRMNVDAFramebuffer *>(p0);
+    NVRMCallReference callReference(fb);
+    if (OSAddAtomic(0, &fb->fStopping) ||
+        (!__atomic_load_n(&fb->fDdcPending, __ATOMIC_ACQUIRE) &&
+         !__atomic_load_n(&fb->fDdcVolumePending, __ATOMIC_ACQUIRE)))
+        return;
+    const IOReturn r = fb->writeDdcBrightness();
+    if (r == kIOReturnCannotLock) {
+        uint64_t deadline;
+        clock_interval_to_deadline(20, kMillisecondScale, &deadline);
+        fb->scheduleCall(fb->fDdcBrightnessCall, deadline);
+    }
+}
+
+IOReturn NVRMNVDAFramebuffer::writeDdcBrightness()
+{
+    NVRMDdcTransaction transaction(&fDdcInFlight);
+    if (!transaction.held()) {
+        ++fDdcBusyRetries;
+        return kIOReturnCannotLock;
+    }
+    if (OSAddAtomic(0, &fStopping)) return kIOReturnOffline;
+    if (mach_absolute_time() < fDdcWriteAfter) {
+        scheduleCall(fDdcBrightnessCall, fDdcWriteAfter);
+        return kIOReturnSuccess;
+    }
+
+    // RM serializes AUX/I2C itself. Only exclude changes to this sink, so a continuous
+    // stream of flips on either head cannot starve a pending brightness write.
+    NVRMDisplayGate sink(fDdcSinkLock);
+    IOInterruptState state = IOSimpleLockLockDisableInterrupt(fFlipCacheLock);
+    const bool brightnessPending = __atomic_load_n(&fDdcPending, __ATOMIC_ACQUIRE) != 0;
+    const bool volumePending = __atomic_load_n(&fDdcVolumePending, __ATOMIC_ACQUIRE) != 0;
+    const bool volume = volumePending && (!brightnessPending || fDdcVolumePendingAt < fDdcPendingAt);
+    const UInt64 request = __atomic_exchange_n(volume ? &fDdcVolumePending : &fDdcPending, 0, __ATOMIC_ACQ_REL);
+    const UInt64 queuedAt = volume ? fDdcVolumePendingAt : fDdcPendingAt;
+    IOSimpleLockUnlockEnableInterrupt(fFlipCacheLock, state);
+    if (brightnessPending && volumePending) scheduleCall(fDdcBrightnessCall, 0);
+    const UInt32 busyRetries = fDdcBusyRetries;
+    fDdcBusyRetries = 0;
+    if (!sink.valid() || !request || OSAddAtomic(0, &fStopping) ||
+        (request >> 32) != __atomic_load_n(&fDdcSinkGeneration, __ATOMIC_RELAXED) ||
+        fDpyLost || fEdidSwapped || !__atomic_load_n(&fDdcPowered, __ATOMIC_ACQUIRE) || !rmGpuReady())
+        return kIOReturnOffline;
+
+    const UInt32 value = static_cast<UInt32>(request) - 1;
+    unsigned char msg[7];
+    nvrmVcpSet(volume ? kNvrmVcpSpeakerVolume : kNvrmVcpBrightness, static_cast<uint16_t>(value), msg);
+    const UInt64 started = mach_absolute_time();
+    const IOReturn r = ddcTransfer(kNvrmDdcWrite, 0x37, msg, sizeof msg);
+    const UInt64 finished = mach_absolute_time();
+    UInt64 queueNs, transferNs, settleNs;
+    absolutetime_to_nanoseconds(started - queuedAt, &queueNs);
+    absolutetime_to_nanoseconds(finished - started, &transferNs);
+    absolutetime_to_nanoseconds(fDdcWriteAfter > queuedAt ? fDdcWriteAfter - queuedAt : 0, &settleNs);
+    // Queue, transfer and settle time in microseconds, I2C retries, and the retired display-lock retry slot.
+    UInt32 timing[] = { (UInt32)(queueNs / 1000), (UInt32)(transferNs / 1000),
+                       (UInt32)(settleNs / 1000), busyRetries, 0 };
+    if (!volume) setProperty("NVRMExternalBrightnessWriteTiming", timing, sizeof timing);
+    setProperty(volume ? "NVRMExternalSpeakerVolumeWriteStatus" : "NVRMExternalBrightnessWriteStatus", (UInt32)r, 32);
+    if (r == kIOReturnSuccess)
+        setProperty(volume ? "NVRMExternalSpeakerVolumeWritten" : "NVRMExternalBrightnessWritten", value, 32);
+    clock_interval_to_deadline(40, kMillisecondScale, &fDdcWriteAfter);
+    return r;
+}
+
 // IOFramebufferI2CInterface::startIO refuses a request while !isPowered() (pendingPowerState == 0). This class replaces
 // setPowerState, which is what sets it in the family, so it stayed 0 and every request was answered "offline" before it
 // reached doI2CRequest. Set it from the framebuffer's own gate: 1 = on, 0 = off, never 2 (restoreFramebuffer's branch),
 // and pendingPowerChange is left alone so no power work starts.
 IOReturn NVRMNVDAFramebuffer::ddcPowerGated(void *on, void *, void *, void *)
 {
+    NVRMDisplayGate sink(fDdcSinkLock);
     pendingPowerState = on ? 1 : 0;
+    __atomic_store_n(&fDdcPowered, on != nullptr, __ATOMIC_RELEASE);
     return kIOReturnSuccess;
 }
 void NVRMNVDAFramebuffer::ddcSetPowered(bool on)
@@ -5394,35 +6392,51 @@ IOReturn NVRMNVDAFramebuffer::doI2CRequest(UInt32 bus, struct IOI2CBusTiming *, 
 {
     if (!rq) return kIOReturnBadArgument;
     IOReturn res = kIOReturnSuccess;
-    {
-        NVRMDisplayGate display;
-        if (!display.valid() || OSAddAtomic(0, &fStopping) || !rmGpuReady()) res = kIOReturnNotReady;
-        else if (!fDdcOn || fInternal || bus != 0 || fDpyLost || !fKms) res = kIOReturnUnsupported;
-        else if (rq->commFlags & kIOI2CUseSubAddressCommFlag) res = kIOReturnUnsupportedMode;
+    if (OSAddAtomic(0, &fStopping) || !rmGpuReady()) res = kIOReturnNotReady;
+    else if (!fDdcOn || fInternal || bus != 0 || fDpyLost || !fKms) res = kIOReturnUnsupported;
+    else if (rq->commFlags & kIOI2CUseSubAddressCommFlag) res = kIOReturnUnsupportedMode;
+    else {
+        NVRMDdcTransaction transaction(&fDdcInFlight);
+        if (!transaction.held()) {
+            rq->result = kIOReturnBusy;
+            if (rq->completion) (*rq->completion)(rq);
+            return kIOReturnBusy;
+        }
+        const UInt32 generation = __atomic_load_n(&fDdcSinkGeneration, __ATOMIC_RELAXED);
+        const bool send = rq->sendTransactionType != kIOI2CNoTransactionType && rq->sendBytes;
+        const bool reply = rq->replyTransactionType != kIOI2CNoTransactionType && rq->replyBytes;
+        const bool simpleSend = rq->sendTransactionType == kIOI2CSimpleTransactionType;
+        const bool okReply = rq->replyTransactionType == kIOI2CSimpleTransactionType || rq->replyTransactionType == kIOI2CDDCciReplyTransactionType;
+        if ((send && !simpleSend) || (reply && !okReply) || (!send && !reply)) res = kIOReturnUnsupportedMode;
+        else if ((send && (rq->sendBytes > kNvrmDdcMax || !rq->sendBuffer)) || (reply && !rq->replyBuffer)) res = kIOReturnBadArgument;
         else {
-            const bool send = rq->sendTransactionType != kIOI2CNoTransactionType && rq->sendBytes;
-            const bool reply = rq->replyTransactionType != kIOI2CNoTransactionType && rq->replyBytes;
-            const bool simpleSend = rq->sendTransactionType == kIOI2CSimpleTransactionType;
-            const bool okReply = rq->replyTransactionType == kIOI2CSimpleTransactionType || rq->replyTransactionType == kIOI2CDDCciReplyTransactionType;
-            if ((send && !simpleSend) || (reply && !okReply) || (!send && !reply)) res = kIOReturnUnsupportedMode;
-            else if ((send && (rq->sendBytes > kNvrmDdcMax || !rq->sendBuffer)) || (reply && !rq->replyBuffer)) res = kIOReturnBadArgument;
-            else {
-                if (send) {
-                    const unsigned a = nvrmDdcAddr7(rq->sendAddress, false);
-                    res = (a && nvrmDdcWriteLenAllowed(a, rq->sendBytes)) ? ddcTransfer(kNvrmDdcWrite, a, (unsigned char *)(uintptr_t)rq->sendBuffer, rq->sendBytes) : kIOReturnBadArgument;
-                    if (res != kIOReturnSuccess && res != kIOReturnBadArgument) res = kIOReturnNoDevice;
-                }
-                if (res == kIOReturnSuccess && reply) {
-                    const unsigned a = nvrmDdcAddr7(rq->replyAddress ? rq->replyAddress : rq->sendAddress | 1, true);
-                    uint64_t ns = 0; absolutetime_to_nanoseconds(rq->minReplyDelay, &ns);
-                    if (send) IOSleep(nvrmDdcReplyDelayMs(ns));
-                    unsigned want = rq->replyBytes > kNvrmDdcMax ? kNvrmDdcMax : rq->replyBytes;
-                    res = a ? ddcTransfer(kNvrmDdcRead, a, (unsigned char *)(uintptr_t)rq->replyBuffer, want) : kIOReturnBadArgument;
-                    if (res == kIOReturnSuccess)
-                        rq->replyBytes = rq->replyTransactionType == kIOI2CDDCciReplyTransactionType
-                            ? nvrmDdcReplyLength((const unsigned char *)(uintptr_t)rq->replyBuffer, want) : want;
-                    else if (res != kIOReturnBadArgument) res = kIOReturnNoDevice;
-                }
+            if (send) {
+                const unsigned a = nvrmDdcAddr7(rq->sendAddress, false);
+                res = a && nvrmDdcWriteLenAllowed(a, rq->sendBytes)
+                    ? ddcTransfer(kNvrmDdcWrite, a, (unsigned char *)(uintptr_t)rq->sendBuffer, rq->sendBytes)
+                    : kIOReturnBadArgument;
+                if (res != kIOReturnSuccess && res != kIOReturnBadArgument) res = kIOReturnNoDevice;
+            }
+            if (res == kIOReturnSuccess && reply) {
+                const unsigned a = nvrmDdcAddr7(rq->replyAddress ? rq->replyAddress : rq->sendAddress | 1, true);
+                uint64_t ns = 0; absolutetime_to_nanoseconds(rq->minReplyDelay, &ns);
+                if (send) IOSleep(nvrmDdcReplyDelayMs(ns));
+                unsigned want = rq->replyBytes > kNvrmDdcMax ? kNvrmDdcMax : rq->replyBytes;
+                res = a ? ddcTransfer(kNvrmDdcRead, a, (unsigned char *)(uintptr_t)rq->replyBuffer, want) : kIOReturnBadArgument;
+                if (res == kIOReturnSuccess) {
+                    rq->replyBytes = rq->replyTransactionType == kIOI2CDDCciReplyTransactionType
+                        ? nvrmDdcReplyLength((const unsigned char *)(uintptr_t)rq->replyBuffer, want) : want;
+                    if (a == 0x37) {
+                        static const unsigned char getBrightness[] = {0x51, 0x82, 0x01, 0x10, 0xac};
+                        const bool fast = generation == __atomic_load_n(&fDdcFastReadGeneration, __ATOMIC_ACQUIRE) &&
+                            generation == __atomic_load_n(&fDdcSinkGeneration, __ATOMIC_RELAXED) &&
+                            send && rq->sendAddress == 0x6e && rq->sendBytes == sizeof getBrightness &&
+                            memcmp((const void *)(uintptr_t)rq->sendBuffer, getBrightness, sizeof getBrightness) == 0;
+                        UInt64 deadline;
+                        clock_interval_to_deadline(fast ? 40 : 140, kMillisecondScale, &deadline);
+                        if (deadline > fDdcWriteAfter) fDdcWriteAfter = deadline;
+                    }
+                } else if (res != kIOReturnBadArgument) res = kIOReturnNoDevice;
             }
         }
     }

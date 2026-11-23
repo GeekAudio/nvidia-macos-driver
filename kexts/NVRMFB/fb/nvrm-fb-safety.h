@@ -36,7 +36,6 @@ static inline unsigned long long nvrmApertureBytes(unsigned pitch, unsigned heig
     const unsigned long long spare = owned - need;
     return need + (spare < 128 ? spare : 128);
 }
-
 // ---- Variable refresh rate (adaptive sync) ----
 // IOGraphics' model, from its public types: a display's IODisplayTimingRange carries kIORangeSupportsVRR, each detailed timing
 // carries verticalBlankingExtension (the most blanking lines the display can stretch a frame by; 0 = none), and the
@@ -146,4 +145,11 @@ static inline NvrmSurAction nvrmSurroundNext(bool formed, bool degraded, unsigne
     if (formed && up < total) return kSurDegrade;
     if (degraded && total >= 2 && up == total) return kSurReform;
     return kSurNone;
+}
+
+// The T2751U accepts a native brightness update after the DDC/CI reply's minimum settle time.
+static inline bool nvrmDdcFastBrightnessRead(const unsigned char *edid, unsigned size, unsigned connectorType)
+{
+    return connectorType == 0x400 && size >= 128 &&
+           edid[8] == 0x21 && edid[9] == 0x63 && edid[10] == 0x51 && edid[11] == 0x27;
 }

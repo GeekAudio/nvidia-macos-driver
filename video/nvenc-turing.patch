@@ -182,7 +182,7 @@ index 5df4ea0..b23b966 100644
      if (!s.bitstream_restriction_flag) s.max_dec_frame_buffering = s.max_num_reorder_frames = 16;
      s.valid = true;
 diff --git a/src/hevcdec.c b/src/hevcdec.c
-index 7dc999d..0cef2e1 100644
+index 7dc999d..8fa5dd4 100644
 --- a/src/hevcdec.c
 +++ b/src/hevcdec.c
 @@ -1,5 +1,6 @@
@@ -192,26 +192,40 @@ index 7dc999d..0cef2e1 100644
  #include "blocklinear.h"
  #include <stdio.h>
  #include <stdlib.h>
-@@ -90,11 +91,17 @@ static unsigned sample(const uint8_t *p, size_t x, size_t y, size_t pitch, int b
+@@ -90,14 +91,22 @@ static unsigned sample(const uint8_t *p, size_t x, size_t y, size_t pitch, int b
      return (unsigned)(p[o] | p[o + 1] << 8) >> shift;
  }
  
 -void hevcdec_read_nv12(HevcDec *d, int surf, uint8_t *y, size_t ystride, uint8_t *uv, size_t uvstride, unsigned w, unsigned h, unsigned x0, unsigned y0)
-+void hevcdec_read_nv12(HevcDec *d, int surf, uint8_t *y, size_t ystride, uint8_t *uv, size_t uvstride, unsigned w, unsigned h, unsigned x0, unsigned y0, bool parallel)
++unsigned hevcdec_read_nv12(HevcDec *d, int surf, uint8_t *y, size_t ystride, uint8_t *uv, size_t uvstride, unsigned w, unsigned h, unsigned x0, unsigned y0, bool parallel)
  {
      const size_t b = (size_t)d->bps, cp = d->chroma_format == 3 ? 2 * d->pitch : d->pitch;
      const unsigned cw = d->chroma_format == 3 ? w : (w + 1) / 2, ch = d->chroma_format == 3 ? h : (h + 1) / 2;
      if (!x0 && !y0) {
 +        if (d->bit_depth == 10 && d->chroma_format == 1 && w == 3840 && h == 2160 &&
-+            __builtin_cpu_supports("avx2")) {
++            __builtin_cpu_supports("avx2") &&
++            !(((uintptr_t)d->luma[surf].cpu | (uintptr_t)d->chroma[surf].cpu) & 15)) {
++            const double start = now_ms();
 +            nvenc_in_untile_420(y, ystride, d->luma[surf].cpu, uv, uvstride,
 +                                d->chroma[surf].cpu, w * b, h, d->pitch, parallel);
-+            return;
++            return (unsigned)((now_ms() - start) * 1000);
 +        }
          nvenc_in_untile_plane(y, ystride, d->luma[surf].cpu, w * b, h, d->pitch);
          nvenc_in_untile_plane(uv, uvstride, d->chroma[surf].cpu, 2 * cw * b, ch, cp);
-         return;
-@@ -173,18 +180,23 @@ static int apply_rps(HevcDec *d, const HevcSps *sps, const HevcSlice *s, int poc
+-        return;
++        return 0;
+     }
+     // a conformance window that crops the left / top: sample by sample (rare)
+     const unsigned cx0 = d->chroma_format == 3 ? x0 : x0 / 2, cy0 = d->chroma_format == 3 ? y0 : y0 / 2;
+@@ -105,6 +114,7 @@ void hevcdec_read_nv12(HevcDec *d, int surf, uint8_t *y, size_t ystride, uint8_t
+         y[r * ystride + x * b + k] = ((const uint8_t *)d->luma[surf].cpu)[nvenc_in_offset((x0 + x) * b + k, y0 + r, d->pitch)];
+     for (unsigned r = 0; r < ch; r++) for (unsigned x = 0; x < 2 * cw; x++) for (size_t k = 0; k < b; k++)
+         uv[r * uvstride + x * b + k] = ((const uint8_t *)d->chroma[surf].cpu)[nvenc_in_offset((2 * cx0 + x) * b + k, cy0 + r, cp)];
++    return 0;
+ }
+ 
+ void hevcdec_read_yuv(HevcDec *d, int surf, uint8_t *dst, const int crop[4], unsigned w, unsigned h)
+@@ -173,18 +183,23 @@ static int apply_rps(HevcDec *d, const HevcSps *sps, const HevcSlice *s, int poc
      bool keep[HEVC_SURFACES] = { false }; bool lt[HEVC_SURFACES] = { false };
      int missing = 0;
      // long-term first (they may also match a short-term POC)
@@ -238,7 +252,7 @@ index 7dc999d..0cef2e1 100644
          if (k < 0 || lt[k]) { if (s->st_rps.used[i]) missing++; continue; }
          keep[k] = true;
          if (!s->st_rps.used[i]) o->foll[o->nfoll++] = k;
-@@ -212,7 +224,9 @@ static int decode_pending(HevcDec *d)
+@@ -212,7 +227,9 @@ static int decode_pending(HevcDec *d)
      d->first_pic = false; d->after_eos = false;
      if ((t == 8 || t == 9) && d->skip_rasl) { d->auN = 0; return 0; }   // RASL after a CRA that starts decoding: not decodable (8.1.3)
      const int poc = hevc_poc(&d->pocst, sps, sl, nro);
@@ -248,7 +262,7 @@ index 7dc999d..0cef2e1 100644
      if (missing && d->verbose) printf("  hevcdec: POC %d: %d reference pictures missing\n", poc, missing);
      // a free surface: not held by the caller, not a reference
      int surf = -1;
-@@ -275,7 +289,8 @@ static int decode_pending(HevcDec *d)
+@@ -275,7 +292,8 @@ static int decode_pending(HevcDec *d)
      int nref = 0;
      for (int i = 0; i < HEVC_SURFACES; i++) if (d->ref[i]) {
          nref++;
@@ -258,7 +272,7 @@ index 7dc999d..0cef2e1 100644
          ps->RefDiffPicOrderCnts[i] = (short)diff;
          if (d->ref[i] == 2) ps->longtermflag |= (unsigned short)(1u << (15 - i));
      }
-@@ -359,7 +374,10 @@ static int decode_pending(HevcDec *d)
+@@ -359,7 +377,10 @@ static int decode_pending(HevcDec *d)
      const double t0 = now_ms();
      memset(d->status.cpu, 0, sizeof(nvdec_status_s));
      chan_submit(c);
@@ -690,7 +704,7 @@ index 8b25172..77be430 100644
  
  // System-wide settings for apps that do not get our environment variables (started from the Dock / Finder):
 diff --git a/vt/nvencvt_dec.c b/vt/nvencvt_dec.c
-index 55063ca..0fa5e19 100644
+index 55063ca..91edabf 100644
 --- a/vt/nvencvt_dec.c
 +++ b/vt/nvencvt_dec.c
 @@ -7,6 +7,7 @@
@@ -810,6 +824,15 @@ index 55063ca..0fa5e19 100644
      Av1Dec *av1;                    // AV1: likewise (with vrm)
      HevcDec *hevc;                  // HEVC (with rm)
      Mpeg2Dec *m2;                   // MPEG-1/2 (with rm)
+@@ -85,7 +162,7 @@ typedef struct {
+     double tIn, tEngine, tPool, tCopy, tEmit, tOut, tLast;   // ms: inside decodeFrame, engine wait, pool, untile, emit; between calls
+     uint8_t *tmp; size_t tmpCap;    // a non-contiguous sample, flattened
+     // asynchronous output (T8.09): pictures waiting for the output thread (copy, emit, release), in decode order
+-    struct OutJob { VTVideoDecoderFrame frame; OSStatus res; VTDecodeInfoFlags fl; CVPixelBufferRef pb; int surf, rel; unsigned w, h, cx, cy, usCopy, usEmit; } q[4];
++    struct OutJob { VTVideoDecoderFrame frame; OSStatus res; VTDecodeInfoFlags fl; CVPixelBufferRef pb; int surf, rel; unsigned w, h, cx, cy, usCopy, usUntile, usEmit; } q[4];
+     unsigned qh, qt; bool async, thrOn, stop; pthread_t thr; pthread_cond_t cv;
+ } DState;
+ typedef struct OutJob OutJob;
 @@ -183,12 +260,14 @@ static OSStatus b_invalidate(CMBaseObjectRef o)
      }
      if (s->opened) {
@@ -935,7 +958,7 @@ index 55063ca..0fa5e19 100644
  {
      if (!j->pb || j->surf < 0 || j->res) return;
      const double tc = nowms();
-@@ -547,9 +661,10 @@ static void out_copy(DState *s, OutJob *j)
+@@ -547,9 +661,11 @@ static void out_copy(DState *s, OutJob *j)
      CVPixelBufferLockBaseAddress(pb, 0);
      uint8_t *y = CVPixelBufferGetBaseAddressOfPlane(pb, 0), *uv = CVPixelBufferGetBaseAddressOfPlane(pb, 1);
      const size_t ys = CVPixelBufferGetBytesPerRowOfPlane(pb, 0), uvs = CVPixelBufferGetBytesPerRowOfPlane(pb, 1);
@@ -944,11 +967,12 @@ index 55063ca..0fa5e19 100644
 +    else if (s->codec == CODEC_VP9) vp9dec_read_nv12(s->vp9, j->surf, y, ys, uv, uvs, j->w, j->h);
      else if (s->codec == CODEC_AV1) av1dec_read_nv12(s->av1, j->surf, y, ys, uv, uvs, j->w, j->h);
 -    else if (s->codec == kCMVideoCodecType_HEVC) hevcdec_read_nv12(s->hevc, j->surf, y, ys, uv, uvs, j->w, j->h, j->cx, j->cy);
-+    else if (s->codec == kCMVideoCodecType_HEVC) hevcdec_read_nv12(s->hevc, j->surf, y, ys, uv, uvs, j->w, j->h, j->cx, j->cy, parallel);
++    else if (s->codec == kCMVideoCodecType_HEVC)
++        j->usUntile = hevcdec_read_nv12(s->hevc, j->surf, y, ys, uv, uvs, j->w, j->h, j->cx, j->cy, parallel);
      else if (is_mpeg12(s->codec)) mpeg2dec_read_nv12(s->m2, j->surf, y, ys, uv, uvs, j->w, j->h);
      else if (s->codec == kCMVideoCodecType_MPEG4Video) mpeg4dec_read_nv12(s->m4, j->surf, y, ys, uv, uvs, j->w, j->h);
      else h264dec_read_nv12(&s->dec, j->surf, y, ys, uv, uvs, j->w, j->h);
-@@ -561,7 +676,8 @@ static void out_copy(DState *s, OutJob *j)
+@@ -561,7 +677,8 @@ static void out_copy(DState *s, OutJob *j)
  static void out_release(DState *s, const OutJob *j)   // lock held
  {
      if (j->rel < 0) return;
@@ -958,30 +982,60 @@ index 55063ca..0fa5e19 100644
      else if (s->codec == CODEC_AV1) av1dec_release(s->av1, j->rel);
      else if (s->codec == kCMVideoCodecType_HEVC) hevcdec_release(s->hevc, j->rel);
      else if (is_mpeg12(s->codec)) mpeg2dec_release(s->m2, j->rel);
-@@ -581,13 +697,21 @@ static void *out_thread(void *arg)
+@@ -577,18 +694,41 @@ static void out_emit(DState *s, OutJob *j)
+     j->pb = NULL; j->usEmit = (unsigned)((nowms() - te) * 1000);
+ }
+ 
++// Nearly the whole frame interval at 240 fps. Only a measured serial untile can trigger a retry.
++enum { MAIN10_UNTILE_BUDGET_US = 4000, MAIN10_PARALLEL_RETRY_FRAMES = 8 };
++
+ static void *out_thread(void *arg)
  {
      DState *s = arg;
      pthread_mutex_lock(&s->lock);
 +    unsigned parallelFrames = 0;
++    unsigned serialCount = 0, parallelCount = 0, prefetchedCount = 0, retryCount = 0;
++    unsigned serialMaxUs = 0;
      for (;;) {
          while (s->qh == s->qt && !s->stop) pthread_cond_wait(&s->cv, &s->lock);
          if (s->qh == s->qt) break;
          OutJob j = s->q[s->qh % 4];
-+        const bool parallel = s->qt - s->qh > 1 || parallelFrames != 0;
++        const bool parallel = parallelFrames != 0;
++        const bool prefetched = gDLog && s->qt - s->qh > 1;
          pthread_mutex_unlock(&s->lock);
          const bool copied = j.pb && j.surf >= 0 && !j.res;
 -        out_copy(s, &j); out_emit(s, &j);
 +        out_copy(s, &j, parallel);
-+        // A slow 4K Main10 copy or queued output calls for parallel copies during the next few frames.
-+        if (parallelFrames != 0) parallelFrames--;
-+        if (s->codec == kCMVideoCodecType_HEVC && j.w == 3840 && j.h == 2160 &&
-+            copied && j.usCopy > 4000)
-+            parallelFrames = 8;
 +        out_emit(s, &j);
          pthread_mutex_lock(&s->lock);
++        // The queue includes this frame until release. A second entry is ordinary prefetch.
++        // Use two workers briefly only if serial untile exceeded its budget and a successor is waiting.
++        const bool retry = !parallel && j.usUntile > MAIN10_UNTILE_BUDGET_US && s->qt - s->qh > 1;
++        if (parallel)
++            parallelFrames--;
++        else if (retry)
++            parallelFrames = MAIN10_PARALLEL_RETRY_FRAMES;
++        if (gDLog && j.usUntile) {
++            serialCount += !parallel;
++            parallelCount += parallel;
++            prefetchedCount += prefetched;
++            retryCount += retry;
++            if (!parallel && j.usUntile > serialMaxUs) serialMaxUs = j.usUntile;
++        }
          out_release(s, &j);
          if (copied) s->tCopy += j.usCopy / 1000.0;
-@@ -615,7 +739,7 @@ static void out_deliver(DState *s, OutJob *j)
+         s->tEmit += j.usEmit / 1000.0;
+@@ -596,6 +736,9 @@ static void *out_thread(void *arg)
+         pthread_cond_broadcast(&s->cv);
+     }
+     pthread_mutex_unlock(&s->lock);
++    if (serialCount || parallelCount)
++        DLOG("Main10 untile session %p: serial=%u parallel=%u prefetched=%u retries=%u serial_max_us=%u",
++             (void *)s, serialCount, parallelCount, prefetchedCount, retryCount, serialMaxUs);
+     return NULL;
+ }
+ 
+@@ -615,7 +758,7 @@ static void out_deliver(DState *s, OutJob *j)
      }
      out_drain(s);
      const bool copied = j->pb && j->surf >= 0 && !j->res;
@@ -990,7 +1044,7 @@ index 55063ca..0fa5e19 100644
      if (copied) s->tCopy += j->usCopy / 1000.0;
      s->tEmit += j->usEmit / 1000.0;
  }
-@@ -624,7 +748,7 @@ static void out_deliver(DState *s, OutJob *j)
+@@ -624,7 +767,7 @@ static void out_deliver(DState *s, OutJob *j)
  static bool out_async_ok(DState *s)
  {
      if (s->codec == kCMVideoCodecType_HEVC) return s->hevc && s->hevc->max_dec_pic <= HEVC_SURFACES - 2;
@@ -999,7 +1053,7 @@ index 55063ca..0fa5e19 100644
      int refs = 0;
      for (int i = 0; i < 32; i++) if (s->dec.params.sps[i].max_num_ref_frames > refs) refs = s->dec.params.sps[i].max_num_ref_frames;
      return refs <= DEC_SURFACES - 3;
-@@ -774,6 +898,27 @@ static OSStatus decode_mpeg4(DState *s, VTVideoDecoderFrame frame, const uint8_t
+@@ -774,6 +917,27 @@ static OSStatus decode_mpeg4(DState *s, VTVideoDecoderFrame frame, const uint8_t
      return res;
  }
  
@@ -1027,7 +1081,7 @@ index 55063ca..0fa5e19 100644
  static OSStatus d_decodeFrame(VTVideoDecoderRef o, VTVideoDecoderFrame frame, CMSampleBufferRef sb, VTDecodeFrameFlags flags, VTDecodeInfoFlags *info)
  {
      DState *s = dstate(o);
-@@ -792,8 +937,9 @@ static OSStatus d_decodeFrame(VTVideoDecoderRef o, VTVideoDecoderFrame frame, CM
+@@ -792,8 +956,9 @@ static OSStatus d_decodeFrame(VTVideoDecoderRef o, VTVideoDecoderFrame frame, CM
          if (s->tmpCap < len) { free(s->tmp); s->tmp = malloc(len); s->tmpCap = s->tmp ? len : 0; }
          if (!s->tmp || CMBlockBufferCopyDataBytes(bb, 0, len, s->tmp)) res = kVTVideoDecoderBadDataErr; else p = (char *)s->tmp;
      }
@@ -1039,7 +1093,7 @@ index 55063ca..0fa5e19 100644
                            is_mpeg12(s->codec) ? decode_mpeg2(s, frame, (const uint8_t *)p, len) :
                            s->codec == kCMVideoCodecType_MPEG4Video ? decode_mpeg4(s, frame, (const uint8_t *)p, len) :
                            s->codec == kCMVideoCodecType_HEVC ? decode_hevc(s, frame, (const uint8_t *)p, len) : decode_vp9(s, frame, (const uint8_t *)p, len);
-@@ -864,10 +1010,14 @@ static OSStatus d_copySupported(VTVideoDecoderRef o, CFDictionaryRef *out)
+@@ -864,10 +1029,14 @@ static OSStatus d_copySupported(VTVideoDecoderRef o, CFDictionaryRef *out)
      const void *pk[] = { kVTPropertyTypeKey, kVTPropertyReadWriteStatusKey };
      const void *pv[] = { kVTPropertyType_Boolean, kVTPropertyReadWriteStatus_ReadOnly };
      CFDictionaryRef ro = CFDictionaryCreate(NULL, pk, pv, 2, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
@@ -1057,7 +1111,7 @@ index 55063ca..0fa5e19 100644
      return noErr;
  }
  static OSStatus d_setProperties(VTVideoDecoderRef o, CFDictionaryRef d) { (void)o; DLOG("setProperties %p", d); return noErr; }
-@@ -897,16 +1047,17 @@ __attribute__((visibility("default"))) OSStatus NVDecVT_CreateInstance(FourCharC
+@@ -897,16 +1066,17 @@ __attribute__((visibility("default"))) OSStatus NVDecVT_CreateInstance(FourCharC
  {
      const FourCharCode entry = codec;   // 'hev1' / 'avc3' (parameter sets may also come in band) decode as HEVC / H.264
      if (codec == CODEC_HEV1) codec = kCMVideoCodecType_HEVC; else if (codec == CODEC_AVC3) codec = kCMVideoCodecType_H264;
@@ -1077,7 +1131,7 @@ index 55063ca..0fa5e19 100644
           codec == kCMVideoCodecType_MPEG2Video ? "mp2v" : codec == kCMVideoCodecType_MPEG1Video ? "mp1v" :
           codec == kCMVideoCodecType_MPEG4Video ? "mp4v" : "avc1");
      return noErr;
-@@ -925,13 +1076,10 @@ static NvU32 nvdec_class(void)
+@@ -925,13 +1095,10 @@ static NvU32 nvdec_class(void)
      return (NvU32)gNvdecClass;
  }
  
@@ -1095,7 +1149,7 @@ index 55063ca..0fa5e19 100644
  OSStatus NVDecVT_Register(int rating)
  {
      gDLog = getenv("NVENCVT_LOG") != NULL;
-@@ -939,7 +1087,18 @@ OSStatus NVDecVT_Register(int rating)
+@@ -939,7 +1106,18 @@ OSStatus NVDecVT_Register(int rating)
      if (getenv("NVENCVT_NO_DEC")) return kVTCouldNotFindVideoDecoderErr;
      extern int gNvencvtGpu;   // vt/nvencvt.c: 1 Ada, 2 TU117 (GTX 1650: NVDEC 0xc4b0 has no AV1), 3 GA10x (RTX 30)
      const bool ampere = gNvencvtGpu == 3;
@@ -1115,7 +1169,7 @@ index 55063ca..0fa5e19 100644
      typedef OSStatus (*RegFn)(FourCharCode, CFDictionaryRef, void *);
      RegFn reg = (RegFn)dlsym(RTLD_DEFAULT, "VTRegisterVideoDecoderWithInfo");
      if (!reg) { DLOG("VTRegisterVideoDecoderWithInfo not found"); return kVTCouldNotFindVideoDecoderErr; }
-@@ -947,17 +1106,17 @@ OSStatus NVDecVT_Register(int rating)
+@@ -947,17 +1125,17 @@ OSStatus NVDecVT_Register(int rating)
      const void *k[] = { CFSTR("CMClassImplementationID"), CFSTR("CMClassImplementationName"), CFSTR("VTRating"), CFSTR("VTIsHardwareAccelerated") };
      const void *v[] = { CFSTR(DECODER_ID), CFSTR("NVDEC - H.264 - mickys/nvenc"), nr, kCFBooleanTrue };
      CFDictionaryRef info = CFDictionaryCreate(NULL, k, v, 4, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
@@ -1137,7 +1191,7 @@ index 55063ca..0fa5e19 100644
          CFRelease(ih);
          DLOG("registered %s -> %d (rating %d)", DECODER_ID_HEVC, (int)sh, rating);
      }
-@@ -966,6 +1125,7 @@ OSStatus NVDecVT_Register(int rating)
+@@ -966,6 +1144,7 @@ OSStatus NVDecVT_Register(int rating)
          CFDictionaryRef i9 = CFDictionaryCreate(NULL, k, v9, 4, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
          OSStatus s9 = reg(CODEC_VP9, i9, (void *)NVDecVT_CreateInstance);
          CFRelease(i9);
@@ -1145,7 +1199,7 @@ index 55063ca..0fa5e19 100644
          DLOG("registered %s -> %d (rating %d)", DECODER_ID_VP9, (int)s9, rating);
          // VideoToolbox offers VP9 decoders only to a process that opted in (public API, macOS 11+; WebKit and ffmpeg call
          // it themselves). Opting in for the process lets AVFoundation apps decode VP9 too; on Macs without Apple's own
-@@ -974,11 +1134,18 @@ OSStatus NVDecVT_Register(int rating)
+@@ -974,11 +1153,18 @@ OSStatus NVDecVT_Register(int rating)
          SuppFn supp = (SuppFn)dlsym(RTLD_DEFAULT, "VTRegisterSupplementalVideoDecoderIfAvailable");
          if (supp && !getenv("NVENCVT_NO_VP9SUPP")) { supp(CODEC_VP9); DLOG("opted in to VP9 decoding for this process"); }
      }
@@ -1165,7 +1219,7 @@ index 55063ca..0fa5e19 100644
      const bool hasAv1 = nvcls == 0xc7b0 || nvcls == 0xc9b0;
      DLOG("NVDEC class 0x%x%s", nvcls, hasAv1 ? " (AV1)" : " (no AV1)");
      if (!getenv("NVENCVT_NO_AV1DEC") && hasAv1) {   // AV1 likewise (NVENCVT_NO_AV1DEC=1 leaves it out)
-@@ -991,7 +1158,7 @@ OSStatus NVDecVT_Register(int rating)
+@@ -991,7 +1177,7 @@ OSStatus NVDecVT_Register(int rating)
          SuppFn supp = (SuppFn)dlsym(RTLD_DEFAULT, "VTRegisterSupplementalVideoDecoderIfAvailable");
          if (supp && !getenv("NVENCVT_NO_VP9SUPP")) { supp(CODEC_AV1); DLOG("opted in to AV1 decoding for this process"); }
      }
@@ -1251,12 +1305,13 @@ index 072a49d..332331b 100644
  // 16-row band in a cache-sized buffer, bands over two threads. dst_luma / dst_chroma: the two planes (pitch bytes per row).
  void nvenc_in_tile_bgra(uint8_t *dst_luma, uint8_t *dst_chroma, const uint8_t *src, size_t src_stride, size_t width, size_t rows, size_t pitch);
 diff --git a/src/hevcdec.h b/src/hevcdec.h
-index 6d8f516..e343887 100644
+index 6d8f516..d8a6380 100644
 --- a/src/hevcdec.h
 +++ b/src/hevcdec.h
-@@ -49,4 +49,4 @@ void hevcdec_release(HevcDec *d, int surf);
+@@ -49,4 +49,5 @@ void hevcdec_release(HevcDec *d, int surf);
  // Copy a decoded surface out: I420 / I444 cropped (16-bit little-endian samples above 8 bits), or biplanar (NV12 / P010,
  // 4:4:4 like NV24) w x h from (x0, y0) (the conformance window's left / top crop).
  void hevcdec_read_yuv(HevcDec *d, int surf, uint8_t *dst, const int crop[4], unsigned w, unsigned h);
 -void hevcdec_read_nv12(HevcDec *d, int surf, uint8_t *y, size_t ystride, uint8_t *uv, size_t uvstride, unsigned w, unsigned h, unsigned x0, unsigned y0);
-+void hevcdec_read_nv12(HevcDec *d, int surf, uint8_t *y, size_t ystride, uint8_t *uv, size_t uvstride, unsigned w, unsigned h, unsigned x0, unsigned y0, bool parallel);
++// Returns the measured two-plane Main10 untile time in microseconds, or zero for other paths.
++unsigned hevcdec_read_nv12(HevcDec *d, int surf, uint8_t *y, size_t ystride, uint8_t *uv, size_t uvstride, unsigned w, unsigned h, unsigned x0, unsigned y0, bool parallel);

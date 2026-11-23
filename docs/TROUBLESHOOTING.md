@@ -56,6 +56,17 @@ stick made by an old 1401 keeps the old problem until you make it again.
 | Kernel panic as the login screen appears (WindowServer, `IOFramebuffer::postOpen`, page fault in `memcpy`), with WhateverGreen installed | WhateverGreen copies the boot screen on the first framebuffer start from an address it saved at boot. macOS can free that mapping before the NVIDIA display opens (seen on a laptop whose boot screen is on the Intel GPU). | Add `gfxrst=4` to boot-args. It turns that copy off; the driver draws its own start-up screen. |
 | The app edits the wrong OpenCore partition | Two OpenCore partitions on the macOS disk. | Fixed in 1.14 (the boot arguments decide which one started the Mac). |
 
+### System Settings sidebar is slow on the first visit to a pane
+
+**Status: open.** After quitting and reopening System Settings, selecting an item in the sidebar can take about a second
+to update the right-hand pane. Returning to a pane in the same session is faster. On macOS 26.7.4 with an RTX 3080, the
+Sound pane took 826 ms from sidebar selection to hosting completion on its first visit and 188 ms on a repeat visit.
+
+In a scoped software fallback test, with NVK absent from the Settings host and the two tested pane extensions, the first
+Sound visit still took 645 ms. The timing shows both graphics startup and cold extension hosting contribute to the delay.
+Reduce Motion did not show a consistent improvement. No driver fix has been validated. To keep panes already opened in
+the current session available, hide System Settings with Command-H and reopen it from the Dock.
+
 ### Several NVIDIA cards
 
 If several NVIDIA cards attempt startup, or a custom kernel collection loads none of

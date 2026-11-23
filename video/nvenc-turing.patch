@@ -1111,3 +1111,20 @@ index 55063ca..a78e1c3 100644
          const struct { FourCharCode c; const char *id, *name; } m[] = {
              { kCMVideoCodecType_MPEG2Video, DECODER_ID_MPEG2, "NVDEC - MPEG-2 - mickys/nvenc" },
              { kCMVideoCodecType_MPEG1Video, DECODER_ID_MPEG1, "NVDEC - MPEG-1 - mickys/nvenc" },
+diff --git a/src/blocklinear.c b/src/blocklinear.c
+--- a/src/blocklinear.c
++++ b/src/blocklinear.c
+@@ -75,8 +75,11 @@
+     size_t bands = (rows + 15) / 16;
+     if ((uintptr_t)src & 15) { untile_band_slow(dst, dst_stride, src, 0, width, 0, rows, pitch); return; }
+     if (bands >= 32) {
+-        // memory-bound: 4K NV12 into a VideoToolbox pool buffer took 6.7 ms with 1 thread, 4.7 with 2, 3.4 with 4, 3.8 with 6-8 (T11.05)
+-        const size_t chunks = 4, per = (bands + chunks - 1) / chunks;
++        // Use two workers to reduce CPU time on AVX2-capable hosts for planes up to 4K P010.
++        const bool useTwoWorkers = width <= 3840 * 2 && rows <= 2160 &&
++                                   __builtin_cpu_supports("avx2");
++        const size_t chunks = useTwoWorkers ? 2 : 4;
++        const size_t per = (bands + chunks - 1) / chunks;
+         dispatch_apply(chunks, dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE, 0), ^(size_t k) {
+             for (size_t b = k * per; b < (k + 1) * per && b < bands; b++) untile_band(dst, dst_stride, src, width, b, rows, pitch); });
+     } else

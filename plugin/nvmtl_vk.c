@@ -9640,6 +9640,8 @@ int nvmtl_vk_image_write_host_pair(nvk_queue *q, const nvmtl_host_plane planes[2
 {
     if (!base || !g_host_align || (g_host_align & (g_host_align - 1)) ||
         ((uintptr_t)base & (g_host_align - 1)) || bytes > UINTPTR_MAX - (uintptr_t)base) return -1;
+    const size_t component_bytes = planes[0].image ? planes[0].image->bpp : 0;
+    if (component_bytes != 1 && component_bytes != 2) return -1;
     size_t offsets[2];
     for (unsigned i = 0; i < 2; ++i) {
         const nvmtl_host_plane *plane = &planes[i];
@@ -9647,7 +9649,7 @@ int nvmtl_vk_image_write_host_pair(nvk_queue *q, const nvmtl_host_plane planes[2
         if (address < (uintptr_t)base || address - (uintptr_t)base >= bytes) return -1;
         const size_t offset = address - (uintptr_t)base;
         nvk_image *image = plane->image;
-        if (!image || image->bpp != i + 1 || image->samples > 1 || image->bw > 1 || image->bh > 1 ||
+        if (!image || image->bpp != component_bytes * (i + 1) || image->samples > 1 || image->bw > 1 || image->bh > 1 ||
             image->mips != 1 || image->layers != 1 || (offset & 3)) return -1;
         size_t span = bytes - offset, relative;
         void *start = plane->plane;
@@ -9665,7 +9667,7 @@ int nvmtl_vk_image_write_host_pair(nvk_queue *q, const nvmtl_host_plane planes[2
             nvk_image *image = planes[i].image;
             nvmtl_record_host_upload(&cmd, image, host, offsets[i], (uint32_t)(planes[i].row_bytes / image->bpp));
         }
-        rc = nvmtl_vk_submit_wait_at(&cmd, "NV12 upload (imported pages)");
+        rc = nvmtl_vk_submit_wait_at(&cmd, "NV12/P010 upload (imported pages)");
     }
     nvmtl_host_pages_done(cache, host);
     return rc;

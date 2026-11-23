@@ -32,6 +32,7 @@ typedef int nvk_buffer;
 typedef int nvk_queue;
 typedef struct { nvk_image *image; void *plane; size_t row_bytes; } nvmtl_host_plane;
 static unsigned imports, begins, copies, waits, releases;
+static unsigned component_bytes = 1;
 static int refuse_import, refuse_begin, refuse_wait;
 static nvk_buffer *nvmtl_host_pages(nvk_buffer *cache, void *base, size_t bytes, nvk_buffer *tmp) {
     assert(base == (void *)0x10000 && bytes == 8192);
@@ -45,7 +46,7 @@ static int nvmtl_vk_cmd_begin(nvk_queue *q, nvk_cmdbuf *cmd) {
 }
 static void nvmtl_record_host_upload(nvk_cmdbuf *cmd, nvk_image *image, const nvk_buffer *host,
                                     size_t offset, uint32_t row_length) {
-    assert(cmd->begun && *host == 7 && image->bpp == copies + 1);
+    assert(cmd->begun && *host == 7 && image->bpp == component_bytes * (copies + 1));
     assert(offset == (copies ? 4096 : 0) && row_length == (copies ? 64 : 128));
     copies++;
 }
@@ -120,7 +121,19 @@ int main(void) {
     refuse_wait = 0; copies = 0;
     assert(!nvmtl_vk_image_write_host_pair(NULL, planes, (void *)0x10000, 8192, &cache));
     assert(imports == 4 && begins == 3 && copies == 2 && waits == 2 && releases == 3);
-    puts("PASS: host-import allocation bounds and paired NV12 copy with one import and one fence");
+    component_bytes = 2;
+    y.bpp = 2;
+    planes[0].row_bytes = 256;
+    planes[1].row_bytes = 256;
+    y.h = 16;
+    uv.h = 8;
+    copies = 0;
+    assert(nvmtl_vk_image_write_host_pair(NULL, planes, (void *)0x10000, 8192, &cache));
+    assert(imports == 4 && !copies);
+    uv.bpp = 4;
+    assert(!nvmtl_vk_image_write_host_pair(NULL, planes, (void *)0x10000, 8192, &cache));
+    assert(imports == 5 && begins == 4 && copies == 2 && waits == 3 && releases == 4);
+    puts("PASS: host-import bounds and paired NV12/P010 copies with one import and one fence per pair");
 }
 '''
 with tempfile.TemporaryDirectory(prefix='nvmtl-host-span-') as tmp:

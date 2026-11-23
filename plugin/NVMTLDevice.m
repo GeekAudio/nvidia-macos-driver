@@ -1873,25 +1873,39 @@ static NSUInteger nvmtl_surface_usage(NSUInteger usage, BOOL fbo, BOOL storage) 
 }
 
 static char nvmtl_surface_cache_key;
-static void nvmtl_pair_nv12_textures(NVMTLTexture *t, NSMapTable *cache) {
+static void nvmtl_pair_biplanar_textures(NVMTLTexture *t, NSMapTable *cache) {
     if (!t->_surf || t->_fbo || t->_usage != MTLTextureUsageShaderRead ||
         IOSurfaceGetPlaneCount(t->_surf) != 2 || t->_plane > 1) return;
     const uint32_t format = IOSurfaceGetPixelFormat(t->_surf);
-    if (format != 0x34323076u && format != 0x34323066u) return; // '420v' / '420f'
+    MTLPixelFormat lumaFormat, chromaFormat;
+    switch (format) {
+    case 0x34323076u: // '420v'
+    case 0x34323066u: // '420f'
+        lumaFormat = MTLPixelFormatR8Unorm;
+        chromaFormat = MTLPixelFormatRG8Unorm;
+        break;
+    case 0x78343230u: // 'x420'
+    case 0x78663230u: // 'xf20'
+        lumaFormat = MTLPixelFormatR16Unorm;
+        chromaFormat = MTLPixelFormatRG16Unorm;
+        break;
+    default:
+        return;
+    }
     const bool luma = t->_plane == 0;
-    if (t->_fmt != (luma ? MTLPixelFormatR8Unorm : MTLPixelFormatRG8Unorm) ||
+    if (t->_fmt != (luma ? lumaFormat : chromaFormat) ||
         t->_i.w != IOSurfaceGetWidthOfPlane(t->_surf, t->_plane) ||
         t->_i.h != IOSurfaceGetHeightOfPlane(t->_surf, t->_plane)) return;
     const NSUInteger plane = luma ? 1 : 0;
     const uint64_t key[] = {
         IOSurfaceGetID(t->_surf), plane, IOSurfaceGetWidthOfPlane(t->_surf, plane),
         IOSurfaceGetHeightOfPlane(t->_surf, plane),
-        luma ? MTLPixelFormatRG8Unorm : MTLPixelFormatR8Unorm, t->_ropt, 0
+        luma ? chromaFormat : lumaFormat, t->_ropt, 0
     };
     NVMTLTexture *sibling = [cache objectForKey:[NSData dataWithBytes:key length:sizeof key]];
     if (!sibling || sibling->_usage != MTLTextureUsageShaderRead || sibling->_surf != t->_surf) return;
-    t->_nv12Companion = sibling;
-    sibling->_nv12Companion = t;
+    t->_biplanarCompanion = sibling;
+    sibling->_biplanarCompanion = t;
 }
 - (id<MTLTexture>)newTextureWithDescriptor:(MTLTextureDescriptor *)d iosurface:(IOSurfaceRef)surf plane:(NSUInteger)plane {
     @synchronized(self) {
@@ -1954,7 +1968,7 @@ static void nvmtl_pair_nv12_textures(NVMTLTexture *t, NSMapTable *cache) {
     if (key && (!t->_vramOn || t->_surfaceLinear.img)) {
         [cache setObject:t forKey:key];
         // WindowServer keeps the original ShaderRead descriptor for video planes.
-        if (!nvmtl_surface_widen_usage(NO)) nvmtl_pair_nv12_textures(t, cache);
+        if (!nvmtl_surface_widen_usage(NO)) nvmtl_pair_biplanar_textures(t, cache);
     }
     nvlog("newTextureWithDescriptor:iosurface:%p plane:%lu -> %p (%zux%zu fmt %lu)",
           (void *)surf, (unsigned long)plane, (__bridge void *)t, w, h, (unsigned long)d.pixelFormat);

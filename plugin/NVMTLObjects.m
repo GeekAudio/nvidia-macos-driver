@@ -1341,7 +1341,7 @@ static void nvmtl_surface_overwrite_recorded(NVMTLCommandBuffer *cb, NVMTLTextur
     [cb->_surfOverwrites addObject:r];
 }
 static BOOL nvmtl_surface_pending_write(NVMTLCommandBuffer *cb, NVMTLTexture *t);
-static BOOL nvmtl_upload_nv12_pair(NVMTLCommandBuffer *cb, NVMTLTexture *t);
+static BOOL nvmtl_upload_biplanar_pair(NVMTLCommandBuffer *cb, NVMTLTexture *t);
 static void nvmtl_surface_in_for_cb(NVMTLCommandBuffer *cb, NVMTLTexture *t) {
     if (!t) return;
     NVMTLTexture *r = t->_parent ? t->_parent : t;
@@ -1356,7 +1356,7 @@ static void nvmtl_surface_in_for_cb(NVMTLCommandBuffer *cb, NVMTLTexture *t) {
     // Importing the old CPU surface here would run ahead of this buffer and
     // overwrite that earlier GPU write. Queue order or the application's event supplies the dependency.
     if (nvmtl_surface_pending_write(cb, r)) return;
-    if (cb && t->_usage == MTLTextureUsageShaderRead && r->_nv12Companion && nvmtl_upload_nv12_pair(cb, r)) return;
+    if (cb && t->_usage == MTLTextureUsageShaderRead && r->_biplanarCompanion && nvmtl_upload_biplanar_pair(cb, r)) return;
     [t nvmtlSurfaceIn];
 }
 static unsigned nvmtl_surf_id(NVMTLTexture *t) { NVMTLTexture *r = (t && t->_parent) ? t->_parent : t; return (r && r->_surf) ? (unsigned)IOSurfaceGetID(r->_surf) : 0u; }
@@ -2129,8 +2129,8 @@ static uint32_t nvmtl_tex_attach_vkfmt(NVMTLTexture *t, int *a8) {
 
 // CoreAnimation binds both planes of a decoded frame for the same draw.
 // Hold the IOSurface through the copy and publish both seeds after one fence.
-static BOOL nvmtl_upload_nv12_pair(NVMTLCommandBuffer *cb, NVMTLTexture *t) {
-    NVMTLTexture *companion = t->_nv12Companion;
+static BOOL nvmtl_upload_biplanar_pair(NVMTLCommandBuffer *cb, NVMTLTexture *t) {
+    NVMTLTexture *companion = t->_biplanarCompanion;
     if (!companion || !nvmtl_surfin_import() || [cb->_surfOverwrites containsObject:companion] ||
         nvmtl_surface_pending_write(cb, companion)) return NO;
     NVMTLTexture *y = t->_plane == 0 ? t : companion;
@@ -2166,8 +2166,10 @@ static BOOL nvmtl_upload_nv12_pair(NVMTLCommandBuffer *cb, NVMTLTexture *t) {
             __atomic_store_n(&y->_surfSynced, YES, __ATOMIC_RELEASE);
             __atomic_store_n(&uv->_surfSynced, YES, __ATOMIC_RELEASE);
             g_surfin_copy += 2;
-            static dispatch_once_t reported;
-            dispatch_once(&reported, ^{ nvlog("surface-in: paired NV12 upload %ux%u", y->_i.w, y->_i.h); });
+            static dispatch_once_t reported[2];
+            dispatch_once(&reported[y->_i.bpp == 2], ^{
+                nvlog("surface-in: paired video upload %ux%u, %u bytes per component", y->_i.w, y->_i.h, y->_i.bpp);
+            });
             return YES;
         }
     }

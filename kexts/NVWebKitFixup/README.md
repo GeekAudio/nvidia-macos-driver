@@ -92,6 +92,9 @@ OpenCore installation. Multiple compatible installations require a choice;
 `--efi-target` overrides detection. Lilu, vault, backup and rollback checks apply
 to both detected and explicit targets.
 It is never installed in the system kext repositories or activated by default.
+On profiles that load WhateverXe, keep NVWebKitFixup disabled so the Intel
+Metal compiler adapter can initialize. Use a separate profile for the Safari
+helper. Automatic setup declines overlapping WhateverXe kernel ranges.
 
 Version 0.2.1 passed the hook and permission tests. On RTX 2060 SUPER with Tahoe
 26.7.1, Safari used NVIDIA hardware VP9 decoding after reboot. Sequoia validation

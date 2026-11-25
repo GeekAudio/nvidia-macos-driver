@@ -197,6 +197,30 @@ class EfiTests(unittest.TestCase):
                 self.assertEqual(plistlib.loads((self.oc/'config.plist').read_bytes()),config)
                 self.assertFalse((self.oc/'Kexts'/efi.NAME).exists())
 
+    def test_enabled_whateverxe_conflict_leaves_existing_efi_intact(self):
+        self.old_helper()
+        self.bundle(self.oc/'Kexts/IntelGPU.kext', 'org.b00t0x.WhateverXe', '0.8.5', b'keep Intel')
+        self.config['Kernel']['Add'].append({'BundlePath': 'IntelGPU.kext', 'Enabled': True,
+                                             'Arch': 'Any', 'MinKernel': '25.0.0'})
+        self.save()
+        before_helper = efi.tree(self.oc/'Kexts'/efi.NAME)
+        with self.assertRaisesRegex(ValueError, 'WhateverXe and NVWebKitFixup conflict'):
+            efi.install(self.oc, self.payload)
+        self.assertEqual((self.oc/'config.plist').read_bytes(), self.before)
+        self.assertEqual(efi.tree(self.oc/'Kexts'/efi.NAME), before_helper)
+        self.assertFalse((self.oc/'NVWebKitFixup-backups').exists())
+
+    def test_whateverxe_outside_helper_range_does_not_block_preflight(self):
+        self.bundle(self.oc/'Kexts/WhateverXe.kext', 'org.b00t0x.WhateverXe', '0.8.5', b'keep Intel')
+        entry = {'BundlePath': 'WhateverXe.kext', 'Enabled': True, 'Arch': 'x86_64'}
+        self.config['Kernel']['Add'].append(entry)
+        for settings in ({'Enabled': False}, {'MinKernel': '26.0.0'}, {'MaxKernel': '23.99.99'}):
+            with self.subTest(settings=settings):
+                self.config['Kernel']['Add'][-1] = {**entry, **settings}
+                self.save()
+                _, updated = efi.prepare(self.oc, self.payload)
+                self.assertIn(self.config['Kernel']['Add'][-1], plistlib.loads(updated)['Kernel']['Add'])
+
     def test_symlink_and_concurrent_lock_refused(self):
         target=self.oc/'Kexts'/efi.NAME;target.symlink_to(self.payload/efi.NAME)
         with self.assertRaises(ValueError):efi.install(self.oc,self.payload)

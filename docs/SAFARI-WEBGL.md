@@ -22,6 +22,14 @@ Intel panel, audio and DLSS. Manual is the default, including without interactiv
 input. It prints the paths below and setup instructions without changing EFI.
 Skip keeps any existing helper configuration.
 
+Use separate boot profiles for WhateverXe and NVWebKitFixup. When both load,
+WhateverXe's Intel Metal compiler adapter can fail to initialize. A cold
+pipeline compile may then crash the compiler service and restart an app's GPU
+process. With WhateverXe enabled, set NVWebKitFixup's Kernel/Add entry to
+`Enabled=False` and reboot. The helper's Safari features are inactive in that
+profile. Automatic setup declines configurations whose enabled WhateverXe
+entry overlaps the helper's x86-64 kernel range and leaves the EFI as-is.
+
 The extracted package contains `pkgroot/Optional/NVWebKitFixup/` with
 `NVWebKitFixup.kext`, `Kernel-Add.plist`, `efi.py`, this guide, and licenses.
 

@@ -16,6 +16,8 @@ import uuid
 
 NAME = 'NVWebKitFixup.kext'
 IDENTITY = 'com.highdelay.NVWebKitFixup'
+MIN_KERNEL = '24.0.0'
+MAX_KERNEL = '25.99.99'
 EFI_GUID = 'C12A7328-F81F-11D2-BA4B-00A0C93EC93B'
 
 
@@ -194,10 +196,17 @@ def prepare(oc, payload):
                 and '..' not in Path(bundle_path).parts, 'Unsafe Kernel/Add bundle path')
         bundle = oc/'Kexts'/bundle_path
         no_links(bundle)
-        # Match the actual bundle identifier, including renamed Lilu bundles.
+        # Read identifiers from the bundles so renamed kexts are still recognized.
         plain(bundle/'Contents/Info.plist')
         info = plistlib.loads((bundle/'Contents/Info.plist').read_bytes())
-        if info.get('CFBundleIdentifier') == 'as.vit9696.Lilu':
+        identifier = info.get('CFBundleIdentifier')
+        if identifier == 'org.b00t0x.WhateverXe' and entry.get('Arch', 'Any') in ('Any', 'x86_64'):
+            overlaps = ((not entry.get('MinKernel') or version(entry['MinKernel']) <= version(MAX_KERNEL))
+                        and (not entry.get('MaxKernel') or version(entry['MaxKernel']) >= version(MIN_KERNEL)))
+            require(not overlaps,
+                    'WhateverXe and NVWebKitFixup conflict in this boot profile. Keep the WebKit helper disabled '
+                    'or use separate boot profiles. 此启动配置的 WhateverXe 与 NVWebKitFixup 冲突，请停用后者或分开配置。')
+        if identifier == 'as.vit9696.Lilu':
             require(entry.get('Arch', 'Any') in ('Any', 'x86_64'), 'Lilu is not enabled for x86_64')
             require(version(info['CFBundleVersion']) >= (1, 7, 2), 'Lilu 1.7.2 or later is required')
             require(not entry.get('MinKernel') or version(entry['MinKernel']) <= (24, 0, 0),
@@ -208,7 +217,7 @@ def prepare(oc, payload):
             # Check the existing dependency without re-signing/replacing it.
             verify_bundle(bundle, 'as.vit9696.Lilu', signature=False)
             lilu.append(index)
-        if info.get('CFBundleIdentifier') == IDENTITY:
+        if identifier == IDENTITY:
             require(bundle_path == NAME, 'Existing helper uses another path; use manual setup')
     require(len(lilu) == 1, 'Exactly one enabled Lilu entry is required; Lilu is never installed or replaced here')
     matches = [e for e in entries if e.get('BundlePath') == NAME]
@@ -220,7 +229,7 @@ def prepare(oc, payload):
     addition = plistlib.loads((payload/'Kernel-Add.plist').read_bytes())
     expected = {'Arch':'x86_64', 'BundlePath':NAME, 'Enabled':True,
                 'ExecutablePath':'Contents/MacOS/NVWebKitFixup', 'PlistPath':'Contents/Info.plist',
-                'MinKernel':'24.0.0', 'MaxKernel':'25.99.99'}
+                'MinKernel':MIN_KERNEL, 'MaxKernel':MAX_KERNEL}
     require(set(addition) == set(expected) | {'Comment'} and
             all(addition.get(k) == v for k, v in expected.items()), 'Unrecognized helper Kernel/Add fragment')
     # Retain every other entry and setting, inserting immediately after Lilu.

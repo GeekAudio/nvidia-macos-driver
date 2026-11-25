@@ -991,6 +991,7 @@ fi
 # This runs after the driver transaction. EFI failures retain the working driver.
 webkit_manual() {
   echo "   Safari WebGL 辅助组件手动安装说明："
+  echo "   若此启动配置加载 WhateverXe，请停用 NVWebKitFixup，并为 Safari 辅助组件使用单独的启动配置。"
   printf '   kext 路径：%s/Optional/NVWebKitFixup/NVWebKitFixup.kext\n' "$SOURCE_PACKAGE"
   echo "   挂载 OpenCore EFI，并将该 kext 复制到 EFI/OC/Kexts/。保留已安装的 Lilu。"
   echo "   在 Kernel > Add 中紧接 Lilu 添加并启用 NVWebKitFixup："

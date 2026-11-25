@@ -713,8 +713,8 @@ class NVRMNVDAFramebuffer : public IOFramebuffer {
     bool fHeadSlept = false;
     // System sleep: NVRM puts the GPU in standby (NVKMS turns every head off) and resumes it on wake, telling each
     // framebuffer through callPlatformFunction("NVRMGpuPower"). The head is lit again only once the GPU is back.
-    bool fPowerOn = true;                 // this framebuffer's own power state (display sleep / system sleep)
-    bool fSysSlept = false;               // NVRM put the GPU in standby since this framebuffer last powered on
+    bool fPowerOn = true;                 // published to the wake worker after power-on notifications
+    bool fSysSlept = false;               // set by NVRM standby until the framebuffer completes its wake notifications
 
     thread_call_t fGpuWake = nullptr;
     static void gpuWakeFire(thread_call_param_t p0, thread_call_param_t);
@@ -3215,6 +3215,8 @@ bool NVRMNVDAFramebuffer::start(IOService *provider)
     }
     fConnectNotify = nvrmfbCall(connectNotifyFire, this);
     if (!fConnectNotify) { FBLOG("fb%u: connect notification allocation failed -- refusing to start", fIndex); return false; }
+    fGpuWake = nvrmfbCall(gpuWakeFire, this);
+    if (!fGpuWake) { FBLOG("fb%u: display wake worker allocation failed -- refusing to start", fIndex); return false; }
     nvrmDiscoverBar1(provider, &fBarLen, &fBar1Base);
     FBLOG("BAR1 metadata: %llu MB at 0x%llx; normal surface budget %llu MB",
           (unsigned long long)(fBarLen >> 20), (unsigned long long)fBar1Base,
@@ -3313,7 +3315,6 @@ bool NVRMNVDAFramebuffer::start(IOService *provider)
     FBLOG("hw vblank on head %u: %s", fHead, !hwvblArg ? "OFF (boot-arg nvhwvbl=0) - the timer is the VBL"
                                        : fHwVblWanted ? "deferred until NVKMS latches a flip on this head" : "not available - the timer stays the VBL");
     fReflip = nvrmfbCall(reflipFire, this);
-    fGpuWake = nvrmfbCall(gpuWakeFire, this);
     FBLOG("reflip keep-alive NOT armed: enableController's modeset owns the head, no boot-time re-syncs");
     fBars = nvrmfbCall(barsFire, this);
     uint32_t hudGate = 0;
@@ -3479,9 +3480,10 @@ IOReturn NVRMNVDAFramebuffer::getAppleSense(IOIndex connectIndex, UInt32 *senseT
 
 void NVRMNVDAFramebuffer::free()
 {
-    // cursorInit runs before super::start; an unsuccessful start can go straight to free without stop.
+    // An unsuccessful start can go straight to free without stop.
     if (fCursorCall && thread_call_free(fCursorCall)) fCursorCall = nullptr;
     if (fConnectNotify && thread_call_free(fConnectNotify)) fConnectNotify = nullptr;
+    if (fGpuWake && thread_call_free(fGpuWake)) fGpuWake = nullptr;
     if (fFlipCacheLock) { IOSimpleLockFree(fFlipCacheLock); fFlipCacheLock = nullptr; }
     if (fCurStateLock) { IOSimpleLockFree(fCurStateLock); fCurStateLock = nullptr; }
     fConsKva = nullptr; OSSafeReleaseNULL(fConsMap); OSSafeReleaseNULL(fConsMem);
@@ -4720,8 +4722,8 @@ IOReturn NVRMNVDAFramebuffer::callPlatformFunction(const OSSymbol *functionName,
     if (functionName && functionName->isEqualTo("NVRMGpuPower")) {   // from NVRM: 0 standby, 1 resumed, 2 lost
         const uintptr_t st = (uintptr_t)param1;
         if (st == 0) {
+            __atomic_store_n(&fSysSlept, true, __ATOMIC_RELEASE);
             if (fModeSet && fSurf) fHeadSlept = true;   // nvKmsSuspend shuts every head down
-            fSysSlept = true;                            // the next power-on is a system wake (familyDidWake)
             FBLOG("GPU going to standby: head %u off with it", fHead);
         } else if (st == 1) {
             if (fGpuWake) scheduleCall(fGpuWake, 0);
@@ -5163,6 +5165,7 @@ bool NVRMNVDAFramebuffer::setHeadPower(bool awake)
             FBLOG("display wake: GPU not resumed yet - head %u is lit when NVRM resumes it", fHead);
             return true;
         }
+        FBLOG("display wake: restoring mode and surface on head %u", fHead);
         const bool ok = reflip();
         // A rejected wake must remain retryable on the next power request.
         if (ok) { fHeadSlept = false; publishDisplayAudioProperties(); }
@@ -5182,13 +5185,10 @@ bool NVRMNVDAFramebuffer::setHeadPower(bool awake)
 }
 IOReturn NVRMNVDAFramebuffer::setPowerState(unsigned long ordinal, IOService *device)
 {
+    if (!ordinal) __atomic_store_n(&fPowerOn, false, __ATOMIC_RELEASE);
     ddcSetPowered(ordinal != 0);
     FBLOG("setPowerState %lu", (unsigned long)ordinal);
     if (ordinal) {
-        fPowerOn = true;
-        // a failed wake stays retryable (fHeadSlept kept) but WindowServer is still told the display is on, as 1.14.7 did:
-        // without the notification it never redraws, and the head can sit black with nothing left to retry it (review)
-        (void)setHeadPower(true);
         // A system sleep cleared pagingState (IOGraphics' system work, with kIOFBNotifyWillSleep to every client).
         // This override replaces IOFramebuffer::setPowerState, so the family's wake work never runs, and
         // handleEvent() does nothing off the controller's power thread - so no client ever saw kIOFBNotifyDidWake,
@@ -5196,11 +5196,17 @@ IOReturn NVRMNVDAFramebuffer::setPowerState(unsigned long ordinal, IOService *de
         // PS 0, every client's last event 3 = WillSleep). Do the family's wake work here instead; it delivers
         // DidPowerOn too. Only after a real system sleep: at start pagingState is still clear too, and the wake work
         // then sent every client a DidWake at boot.
-        if (!pagingState && fSysSlept) { fSysSlept = false; familyDidWake(); }
+        if (!pagingState && __atomic_load_n(&fSysSlept, __ATOMIC_ACQUIRE)) familyDidWake();
         else handleEvent(kIOFBNotifyDidPowerOn);
+
+        // A committed NVKMS modeset can keep polling after a lost display notifier. Leave it to the worker
+        // so the PM callout can return. GPU-ready work may already have seen the head off and exited.
+        __atomic_store_n(&fSysSlept, false, __ATOMIC_RELEASE);
+        __atomic_store_n(&fPowerOn, true, __ATOMIC_RELEASE);
+        if (fGpuWake) scheduleCall(fGpuWake, 0);
+        else FBLOG("display wake: no worker for head %u", fHead);
     } else {
         handleEvent(kIOFBNotifyWillPowerOff);
-        fPowerOn = false;
         (void)setHeadPower(false);
     }
     return kIOPMAckImplied;
@@ -5286,8 +5292,8 @@ bool NVRMNVDAFramebuffer::rmGpuReady()
     OSSafeReleaseNULL(fn);
     return r != kIOReturnNotReady;
 }
-// After NVRM resumed the GPU: commit the mode and the front surface again (NVKMS shut every head down for the
-// standby), unless the display itself is still asleep - then setPowerState(1) does it.
+// The framebuffer power command and NVRM's GPU-ready notification both queue this worker. Only
+// commit once the head has powered on and RM has resumed, whichever notification arrived first.
 void NVRMNVDAFramebuffer::gpuWakeFire(thread_call_param_t p0, thread_call_param_t)
 {
     NVRMNVDAFramebuffer *me = (NVRMNVDAFramebuffer *)p0;
@@ -5296,12 +5302,10 @@ void NVRMNVDAFramebuffer::gpuWakeFire(thread_call_param_t p0, thread_call_param_
     NVRMDisplayGate gate; if (!gate.valid()) return;
     NVRMHeadGate primary(startLock(), me->primaryGate(), true);
     if (!primary.valid() || OSAddAtomic(0, &me->fStopping)) return;
-    if (!me->fHeadSlept || !me->fPowerOn || !me->fModeSet || !me->fSurf) {
-        FBLOG("GPU back: head %u left as is (slept %u, power %u)", me->fHead, (unsigned)me->fHeadSlept, (unsigned)me->fPowerOn);
-        return;
-    }
-    const bool ok = me->setHeadPower(true);   // a rejected wake stays retryable on the next power request
-    FBLOG("GPU back: head %u re-lit -> %s", me->fHead, ok ? "ok" : "FAILED");
+    if (!__atomic_load_n(&me->fPowerOn, __ATOMIC_ACQUIRE) ||
+        __atomic_load_n(&me->fSysSlept, __ATOMIC_ACQUIRE) ||
+        !me->fHeadSlept || !me->fModeSet || !me->fSurf) return;
+    (void)me->setHeadPower(true);   // a rejected wake stays retryable on the next power request
 }
 IOReturn NVRMNVDAFramebuffer::setAttributeForConnection(IOIndex connectIndex, IOSelect attribute, uintptr_t value)
 {

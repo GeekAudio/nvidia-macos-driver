@@ -1179,6 +1179,12 @@ IOAccelMemory *NVDisplayPipe::initFramebufferResource(unsigned int index, IOAcce
     m->fScanout = true;
     m->fPhys    = r.phys;
     m->fBytes   = r.actualSize;
+    // Keep the exact framebuffer as the mapping authority. Its KAPI memory
+    // must never enter the allocator-owned fRmHandle path.
+    if (r.handle) {
+        fb->retain();
+        m->fScanoutFramebuffer = fb;
+    }
     *(volatile unsigned long long *)((unsigned char *)m + 0xc8) = r.phys;
     ALOG("NVDisplayPipe::initFramebufferResource(head %u, index %u, res %p) -> vidmem %p over the LIVE SCANOUT "
          "phys 0x%llx %u x %u pitch %u (%llu bytes)",
@@ -1306,7 +1312,8 @@ void NVVidMemory::deallocPhysical()
 {
     if (fScanout) {
         ALOG("NVVidMemory::deallocPhysical(%p): SCANOUT -- not ours to free, only forgetting it", this);
-        fPhys = 0; fBytes = 0; fScanout = false;
+        // A later wire must not turn this wrapper into separately allocated VRAM.
+        fPhys = 0; fBytes = 0;
         *(volatile unsigned long long *)((unsigned char *)this + 0xc8) = 0;
         return;
     }
@@ -1347,6 +1354,7 @@ void NVVidMemory::releaseParked()
 
 void NVVidMemory::free()
 {
+    OSSafeReleaseNULL(fScanoutFramebuffer);
     if (fRmHandle && !fScanout) {
         releaseVram(fRmHandle, fKva, fBytes, fAllocationCookie);
         fRmHandle = nullptr; fKva = nullptr; fPhys = 0; fBytes = 0; fAllocationCookie = 0;
@@ -2955,9 +2963,10 @@ bool NVMemoryMap::commitIntoGPUPageTable()
 {
     if (fMapped) return true;
     NVVidMemory *vm = OSDynamicCast(NVVidMemory, fMem);
-    void *kapiMem = vm ? vm->fRmHandle : nullptr;
+    void *kapiMem = vm && !vm->fScanout ? vm->fRmHandle : nullptr;
+    IOService *scanout = vm && vm->fScanout && vm->fPhys && vm->fBytes ? vm->fScanoutFramebuffer : nullptr;
     unsigned long long len = fVaLen ? fVaLen : getLength();
-    if (!fHVirt || !kapiMem || !len) {
+    if (!fHVirt || (!kapiMem && !scanout) || !len) {
         if (fCommits < 8) { fCommits++;
             ALOG("MM commit: NOT MAPPED -- hVirt 0x%x kapiMem %p len %llu (mem %p%s)",
                  fHVirt, kapiMem, len, fMem, vm ? "" : ", not an NVVidMemory"); }
@@ -2965,24 +2974,36 @@ bool NVMemoryMap::commitIntoGPUPageTable()
     }
     struct NVRMRmHandles h;
     if (!nvAccelRmHandles(&h)) return false;
-    struct NVRMGpuVaRequest g;
-    nvAccelZero(&g, sizeof g);
+    struct NVRMScanoutGpuVaRequest request;
+    nvAccelZero(&request, sizeof request);
+    auto &g = request.map;
     g.version = NVRM_GPUVA_ABI_VERSION;
     g.kapiDevice = h.kapiDevice; g.kapiMemory = kapiMem;
     g.hVirt = fHVirt; g.size = len;
     g.isVidmem = 1;
-    if (nvAccelGpuVaCall(NVRM_GPUVA_FN_MAP, &g) != kIOReturnSuccess) {
+    IOReturn ret;
+    if (scanout) {
+        request.phys = vm->fPhys;
+        request.bytes = vm->fBytes;
+        const OSSymbol *fn = OSSymbol::withCStringNoCopy(NVRM_GPUVA_FN_MAP_SCANOUT);
+        ret = fn ? scanout->callPlatformFunction(fn, false, &request, nullptr, nullptr, nullptr)
+                 : kIOReturnNoMemory;
+        OSSafeReleaseNULL(fn);
+    } else {
+        ret = nvAccelGpuVaCall(NVRM_GPUVA_FN_MAP, &g);
+    }
+    if (ret != kIOReturnSuccess) {
         if (fCommits < 8) { fCommits++;
-            ALOG("MM commit: MAP_MEMORY_DMA refused gpuVA 0x%llx len %llu -> status 0x%x",
-                 fGpuVa, len, g.status); }
+            ALOG("MM commit: MAP_MEMORY_DMA refused gpuVA 0x%llx len %llu -> status 0x%x (ret 0x%x, scanout %u)",
+                 fGpuVa, len, g.status, (unsigned)ret, (unsigned)(scanout != nullptr)); }
         return false;
     }
     fHRmMemory = g.hMemory; fMapped = true;
     OSAddAtomic64(1, &gCntMapCommit);
     if (g.gpuva) fGpuVa = g.gpuva;
     if (fCommits < 8) { fCommits++;
-        ALOG("MM commit: MAPPED gpuVA 0x%llx len %llu <- hMem 0x%x  *** the GPU can reach these bytes ***",
-             fGpuVa, len, g.hMemory); }
+        ALOG("MM commit: MAPPED gpuVA 0x%llx len %llu <- hMem 0x%x  *** the GPU can reach these bytes *** (scanout %u)",
+             fGpuVa, len, g.hMemory, (unsigned)(scanout != nullptr)); }
     return true;
 }
 

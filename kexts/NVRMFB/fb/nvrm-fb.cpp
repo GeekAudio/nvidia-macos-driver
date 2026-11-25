@@ -894,6 +894,7 @@ public:
                                   void *param1, void *param2, void *param3, void *param4) APPLE_KEXT_OVERRIDE;
     bool     vramGrant(struct NVRMVramRequest *r);
     bool     vramRelease(struct NVRMVramRequest *r);
+    IOReturn mapScanoutGpuVa(struct NVRMScanoutGpuVaRequest *r);
     uint32_t fVramGrantLogged = 0;
     uint32_t fVramGrants = 0;
     IOReturn getAttribute(IOSelect attribute, uintptr_t *value) override;
@@ -5102,11 +5103,45 @@ bool NVRMNVDAFramebuffer::vramRelease(struct NVRMVramRequest *r)
     return true;
 }
 
+IOReturn NVRMNVDAFramebuffer::mapScanoutGpuVa(struct NVRMScanoutGpuVaRequest *r)
+{
+    if (!r || r->map.version != NVRM_GPUVA_ABI_VERSION || !r->map.hVirt || !r->map.size)
+        return kIOReturnBadArgument;
+    NVRMDisplayGate gate;
+    if (!gate.valid()) return kIOReturnNoMemory;
+    if (OSAddAtomic(0, &fStopping) || !fMem || !fPhys || !fDev) return kIOReturnNotReady;
+    const NvU64 scanoutBytes = (NvU64)fPitch * fH;
+    if (r->map.kapiDevice != fDev || r->phys != fPhys || !scanoutBytes || r->bytes != scanoutBytes ||
+        r->map.size > fMemBytes)
+        return kIOReturnBadArgument;
+
+    IOService *rm = getProvider();
+    while (rm && strcmp(rm->getMetaClass()->getClassName(), "NVRM") != 0) rm = rm->getProvider();
+    if (!rm) return kIOReturnNotAttached;
+    const OSSymbol *fn = OSSymbol::withCStringNoCopy(NVRM_GPUVA_FN_MAP);
+    if (!fn) return kIOReturnNoMemory;
+
+    // Use the home allocation and its real memory kind while the display gate
+    // serializes changes to the scanout. RM also checks that power permits the map.
+    auto map = r->map;
+    map.kapiMemory = fMem;
+    map.hMemory = 0;
+    map.isVidmem = fScanoutBarBytes != 0;
+    const IOReturn ret = rm->callPlatformFunction(fn, false, &map, nullptr, nullptr, nullptr);
+    fn->release();
+    r->map.status = map.status;
+    r->map.hMemory = map.hMemory;
+    r->map.gpuva = map.gpuva;
+    return ret;
+}
+
 IOReturn NVRMNVDAFramebuffer::callPlatformFunction(const OSSymbol *functionName, bool waitForFunction,
                                                void *param1, void *param2, void *param3, void *param4)
 {
     bool isAlloc = functionName && functionName->isEqualTo(NVRM_VRAM_FN_ALLOC);
     bool isFree  = functionName && functionName->isEqualTo(NVRM_VRAM_FN_FREE);
+    if (functionName && functionName->isEqualTo(NVRM_GPUVA_FN_MAP_SCANOUT))
+        return mapScanoutGpuVa(static_cast<struct NVRMScanoutGpuVaRequest *>(param1));
     if (functionName && functionName->isEqualTo(NVRM_COPY_PRESENT_FN)) {
         const auto *request = static_cast<const NVRMCopyPresentRequest *>(param1);
         if (!request || request->version != NVRM_COPY_PRESENT_ABI_VERSION) return kIOReturnBadArgument;

@@ -11,7 +11,7 @@ enum { kIOAccelLegacyDisplayPipeSize = 0x380 };
 class IOAccelLegacyDisplayPipe : public IOAccelDisplayPipe {
     OSDeclareDefaultStructors(IOAccelLegacyDisplayPipe);
 public:
-    virtual bool initScanoutResource(unsigned int, IOAccelResource2*);
+    virtual IOAccelMemory *initScanoutResource(unsigned int, IOAccelResource2*);
     virtual void destroyScanoutResource(unsigned int, IOAccelResource2*);
     virtual void setStereo(IOAccelStereoMode);
     virtual void needsSecondaryFramebufferResources();

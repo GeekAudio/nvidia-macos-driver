@@ -145,6 +145,9 @@ class NVDisplayPipe : public IOAccelLegacyDisplayPipe {
     NM_TAHOE_FWD(NVDisplayPipe)
 public:
     IOAccelMemory *initFramebufferResource(unsigned int index, IOAccelResource2 *res) APPLE_KEXT_OVERRIDE;
+#ifdef NM_TAHOE
+    IOAccelMemory *initScanoutResource(unsigned int index, IOAccelResource2 *res) APPLE_KEXT_OVERRIDE;
+#endif
     IOReturn validateTransaction(IOAccelDisplayPipeTransaction2 *txn) APPLE_KEXT_OVERRIDE;
     IOReturn performTransaction(IOAccelDisplayPipeTransaction2 *txn) APPLE_KEXT_OVERRIDE;
     bool     isTransactionComplete(IOAccelDisplayPipeTransaction2 *txn) APPLE_KEXT_OVERRIDE;

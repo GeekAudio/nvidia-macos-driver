@@ -1193,6 +1193,66 @@ IOAccelMemory *NVDisplayPipe::initFramebufferResource(unsigned int index, IOAcce
     return (IOAccelMemory *)m;
 }
 
+#ifdef NM_TAHOE
+IOAccelMemory *NVDisplayPipe::initScanoutResource(unsigned int index, IOAccelResource2 *res)
+{
+    // Tahoe's legacy display path allocates a separate, initially blank resource and calls this
+    // callback. Its later prepare path reads these geometry fields directly. The generic
+    // framebuffer resource was already initialized by IOAccelDisplayPipe and is the authoritative
+    // source for the active mode, including the bytes-per-pixel value (which cannot be recovered
+    // from a padded row pitch).
+    IOAccelResource2 *framebufferRes = getFramebufferResource(index);
+    if (!res || !framebufferRes) {
+        ALOG("NVDisplayPipe::initScanoutResource(index %u, res %p): missing legacy or generic resource",
+             index, res);
+        return nullptr;
+    }
+    if (res == framebufferRes) {
+        ALOG("NVDisplayPipe::initScanoutResource(index %u, res %p): legacy resource aliases generic resource",
+             index, res);
+        return nullptr;
+    }
+
+    const uint8_t *src = (const uint8_t *)framebufferRes;
+    const uint16_t width = *(const uint16_t *)(src + 0xb0);
+    const uint16_t height = *(const uint16_t *)(src + 0xb2);
+    const uint16_t bytesPerPixel = *(const uint16_t *)(src + 0xd8);
+    const uint64_t rowBytes = *(const uint64_t *)(src + 0xb8);
+    const uint64_t byteLength = *(const uint64_t *)(src + 0xc8);
+    if (!width || !height || !bytesPerPixel || !rowBytes || !byteLength ||
+        rowBytes < (uint64_t)width * bytesPerPixel ||
+        (uint64_t)height > (~0ull / rowBytes) || rowBytes * height != byteLength) {
+        ALOG("NVDisplayPipe::initScanoutResource(index %u): invalid generic geometry %ux%u bpp %u row %llu size %llu",
+             index, width, height, bytesPerPixel, (unsigned long long)rowBytes,
+             (unsigned long long)byteLength);
+        return nullptr;
+    }
+
+    uint8_t *dst = (uint8_t *)res;
+    *(uint16_t *)(dst + 0xb0) = width;
+    *(uint16_t *)(dst + 0xb2) = height;
+    *(uint16_t *)(dst + 0xd8) = bytesPerPixel;
+    *(uint64_t *)(dst + 0xb8) = rowBytes;
+    *(uint64_t *)(dst + 0xc8) = byteLength;
+
+    // This creates a distinct NVVidMemory wrapper bound to the legacy resource, while mapping
+    // the same framebuffer-owned scanout allocation used by the generic resource. The stock
+    // destroyScanoutResource path releases this per-resource wrapper exactly once.
+    IOAccelMemory *memory = initFramebufferResource(index, res);
+    NVVidMemory *vidMemory = OSDynamicCast(NVVidMemory, memory);
+    if (vidMemory && byteLength > vidMemory->fBytes) {
+        ALOG("NVDisplayPipe::initScanoutResource(index %u): geometry needs %llu bytes, current scanout wrapper has %llu; releasing",
+             index, (unsigned long long)byteLength, vidMemory->fBytes);
+        vidMemory->release();
+        memory = nullptr;
+    }
+    ALOG("NVDisplayPipe::initScanoutResource(index %u, res %p, framebuffer res %p, %ux%u bpp %u row %llu size %llu) -> %p",
+         index, res, framebufferRes, width, height, bytesPerPixel,
+         (unsigned long long)rowBytes, (unsigned long long)byteLength, memory);
+    return memory;
+}
+#endif
+
 static NVVidMemory *nvres_vidmem(IOAccelResource2 *r)
 {
     if (!r) return nullptr;

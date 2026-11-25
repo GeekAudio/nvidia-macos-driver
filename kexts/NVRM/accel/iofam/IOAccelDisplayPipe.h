@@ -51,6 +51,8 @@ public:
     virtual void framebuffer_will_power_off();
     virtual void framebuffer_did_power_on();
     virtual void framebuffer_terminated();
+    // Exported non-virtual accessor used by the native legacy scanout path.
+    IOAccelResource2 *getFramebufferResource(unsigned int) const;
 private:
     uint8_t _opaque[kIOAccelDisplayPipeSize - sizeof(IOService)];
 };

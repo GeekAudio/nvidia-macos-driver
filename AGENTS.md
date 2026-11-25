@@ -59,6 +59,57 @@ the repositories and artifacts that need changing.
    approval before publishing. After approval, publish a regular public release marked
    Latest, with draft and prerelease disabled, unless the user requests otherwise.
 
+### Driver release parity with HighDelay
+
+Standing user instruction, updated 2026-11-25. For every HighDelay-derived
+driver release or revision, use the actual assets of the matching
+[HighDelay NVK release](https://github.com/HighDelay/nvidia-macos-driver-nvk/releases)
+as the package baseline. Record its tag, commit, and asset SHA-256 values.
+Verify the baseline downloads against the release's `SHA256SUMS`. Use the
+original verified artifacts as inputs, including when the only change is packaging.
+
+- Publish four release assets: the complete installable driver with top-level
+  `pkgroot/`, the separate Wine/NVK provider, the separate ARM scripts and
+  `SHA256SUMS`. Keep the installed and standalone Wine providers matched,
+  including DXVK and vkd3d-proton. Use the existing updater-compatible naming
+  on GeekAudio (`v<version>-geekaudio.<revision>-stable` and
+  `01-geekaudio-nullmoth-<version>-full.tar.gz`).
+- Before uploading a draft, run `build/check_release_parity.py` against the two
+  final driver archives. Compare every file and symlink by path, content hash,
+  executable bits or link target. Retain both macOS accelerator variants,
+  codecs, the Zink, Minecraft and Wine/NVK runtimes, bundled options, setup
+  tools, guides, signatures and notices. Review missing, added and replaced
+  files, including any upstream firmware or developer tooling.
+- Trace each intended difference to a fork change, a documented packaging
+  decision or verified redistribution terms. Keep the reasons with the reviewed
+  report outside `pkgroot/`. A missing or changed file requires an explicit
+  reason for this release. A difference in an earlier version does not
+  authorize it against a new baseline. Preserve transferable upstream payloads
+  byte-for-byte when the fork does not intentionally replace them. See
+  [third-party provenance](docs/PROVENANCE.md) for the current handling of
+  NVIDIA firmware and the legacy compiler.
+- Match the release notes to the verified assets and test results, including
+  any first-install downloads and offline steps. A single-file offline install
+  claim requires testing with the final archive, no reusable firmware and no
+  external firmware source. Verify that the draft's four asset names, sizes
+  and SHA-256 digests match the validated local files. After publication, use
+  their public download URLs and verify the downloaded checksums.
+
+Generate a report for the exact artifacts and tags, and review the differences
+against their sources:
+
+```sh
+python3 build/check_release_parity.py "$upstream_archive" "$candidate_archive" \
+  --upstream-tag "$upstream_tag" --candidate-tag "$candidate_tag" \
+  --report "$parity_report"
+```
+
+The command exits unsuccessfully on unreviewed differences. Save the reviewed
+report separately and give it a top-level `reasons` object mapping each
+differing `pkgroot/...` path to its reason. Run the check again with
+`--approved "$reviewed_report"`. Any later replacement of either archive
+requires a new review, even when the published filenames match.
+
 ### ARM translation release asset
 
 Standing user instruction, updated 2026-11-04: include the separate ARM translation

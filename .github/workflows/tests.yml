@@ -55,7 +55,7 @@ jobs:
             test_intel_panel_bridge.py test_intel_panel_install.py \
             test_webkit_fixup_efi.py test_optional_webkit_install.py \
             test_native_gld_install.py test_uninstall_kext_paths.py \
-            test_tree_layout.py
+            test_tree_layout.py test_release_parity.py
       - name: Per-display scale ownership
         run: python3 tools/rotation/native_attributes_test.py
       - name: Wine component package provenance

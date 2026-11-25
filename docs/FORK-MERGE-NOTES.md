@@ -43,9 +43,10 @@ also shows a WebKit sandbox denial. The boot-guard repair addresses a separate
 Defer the 3.1 VFX translator and late NAK load splitting until the shared
 compiler changes have browser, login-window and native NVK coverage against
 Mesa 26.3.1. Keep the existing GPU-copy frontends and leave the software Metal
-WSI profile out. The complete fork package ships firmware and omits the RyzenAdj
-helper, so the 3.1 firmware downloader and RyzenAdj linker fixes do not apply
-to the current installer.
+WSI profile out. The GeekAudio installer reuses the installed NVIDIA 620.70.06
+firmware when its checksums match, or extracts the matching files from NVIDIA's
+driver download. Keep the developer-only vendor compiler out of the archive.
+The fork omits the RyzenAdj helper.
 
 ## Mesa 26.3.1
 

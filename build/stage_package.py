@@ -404,8 +404,6 @@ def stage(args):
 
     for name in ("install.sh", "uninstall.sh", "VERSION", "Library/GPUBundles/nvmtl-allow.txt"):
         regular(base / name)
-    for name in ("Library/GPUBundles/NVIDIAShared.bundle", "Users/Shared/nvfw"):
-        require((base / name).is_dir(), "incomplete upstream package: " + name)
     bundle(base / PLUGIN, "NVMTLDriver")
     for name in ("NVRM", "NVRMAGDC", "NVRMFB"):
         bundle(base / "Library/Extensions" / (name + ".kext"), name)
@@ -487,6 +485,11 @@ def stage(args):
     with tempfile.TemporaryDirectory(prefix=".nullmoth-stage-", dir=output.parent) as temporary:
         work = Path(temporary) / "pkgroot"
         shutil.copytree(base, work, symlinks=True)
+        shared = work / "Library/GPUBundles/NVIDIAShared.bundle"
+        if shared.is_symlink():
+            shared.unlink()
+        elif shared.exists():
+            shutil.rmtree(shared)
         if nvrm:
             destination = work / NVRM
             shutil.rmtree(destination)
@@ -564,7 +567,8 @@ def stage(args):
         for major, accelerator in accelerators.items():
             if accelerator:
                 write_manifest(work / ACCEL[major].parent)
-        replace_file(REPO / "package/sums_complete.sh", work / "sums_complete.sh")
+        for name in ("install.sh", "Verify.command", "fw_fetch.sh", "sums_complete.sh"):
+            replace_file(REPO / "package" / name, work / name)
         for name in ("install.sh", "uninstall.sh"):
             (work / name).chmod(0o755)
         validate_links(work)

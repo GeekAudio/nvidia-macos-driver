@@ -213,11 +213,14 @@ class StagePackage(unittest.TestCase):
                     if p.is_file() and not p.is_symlink() and p != root / "SHA256SUMS"}
         self.assertEqual(set(entries), expected)
 
-    def test_pr_outputs_and_manifests_preserve_upstream_tools_and_unsigned_kexts(self):
+    def test_pr_outputs_omit_legacy_compiler_and_preserve_unchanged_inputs(self):
         self.stage()
         self.assert_unchanged()
-        for name in ("install.sh", "uninstall.sh", "nullmoth-runtime-check.sh", "nullmoth-runtime-check", "VERSION"):
+        for name in ("uninstall.sh", "nullmoth-runtime-check.sh", "nullmoth-runtime-check", "VERSION"):
             self.assertEqual((self.output / name).read_bytes(), (self.base / name).read_bytes())
+        for name in ("install.sh", "Verify.command", "fw_fetch.sh"):
+            self.assertEqual((self.output / name).read_bytes(), (ROOT / "package" / name).read_bytes())
+        self.assertFalse((self.output / "Library/GPUBundles/NVIDIAShared.bundle").exists())
         self.assertEqual((self.output / STAGE.PLUGIN / "Contents/MacOS/NVMTLDriver").read_bytes(), b"new plugin")
         self.assertEqual((self.output / STAGE.BUNDLED_TRANSLATOR).read_bytes(),
                          (self.output / STAGE.TRANSLATOR).read_bytes())

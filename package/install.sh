@@ -573,6 +573,19 @@ done
 ok "测试集合已包含所有选定的 kext"
 [ "${CHECK:-0}" = 1 ] && { rm -rf "$T"; echo; echo "CHECK PASS (nothing changed)"; exit 0; }
 
+FWSRC="$HERE/Users/Shared/nvfw"
+if [ ! -d "$FWSRC" ]; then
+  [ -x "$HERE/fw_fetch.sh" ] || die "缺少固件获取工具 fw_fetch.sh，未更改驱动"
+  local_run=${NULLMOTH_FW_RUN:-}
+  if [ -z "$local_run" ] && [ -f "$SOURCE_PACKAGE/../NVIDIA-Linux-x86_64-620.70.06.run" ]; then
+    local_run="$SOURCE_PACKAGE/../NVIDIA-Linux-x86_64-620.70.06.run"
+  fi
+  mkdir -m 700 "$T/fw" &&
+    "$HERE/fw_fetch.sh" --dest "$T/fw" --installed "$FW" ${local_run:+--run "$local_run"} ||
+    die "无法获取已校验的 NVIDIA 固件，未更改驱动"
+  FWSRC="$T/fw"
+fi
+
 BK=$(mktemp -d "/Library/NullMoth/backup-$(date +%Y%m%d-%H%M%S).XXXXXX") && [ -n "$BK" ] && [ -d "$BK" ] || die "Cannot create a unique backup directory / 无法创建唯一的备份目录"
 [ "${CHECK:-0}" = 1 ] || printf 'bk=%s\n' "$BK" >> "$LOCKDIR/owner" || die "Cannot record the backup in the installer guard / 无法在安装保护标记中记录备份位置"
 step "4. Back up current files / 4. 备份当前文件 -> $BK"
@@ -650,7 +663,8 @@ done
 MYCONF_START='# --- my settings, kept on update ---'; MYCONF_END='# --- end my settings ---'
 [ ! -f "$GB/nvmtl/nvrm610.conf" ] || sed -n "/^$MYCONF_START\$/,/^$MYCONF_END\$/p" "$GB/nvmtl/nvrm610.conf" \
   | grep -E "^($MYCONF_START|$MYCONF_END|(NVMTL|NVK|NVRM)_[A-Z0-9_]+=[A-Za-z0-9._-]{0,64})\$" > "$T/my-conf" || : > "$T/my-conf"
-for b in NVMTLDriver.bundle NVIDIAShared.bundle nvmtl ${GLD_BUNDLE:+"$GLD_BUNDLE"}; do rm -rf "$GB/$b" && ditto "$HERE/Library/GPUBundles/$b" "$GB/$b" || die "无法复制 ${b}（从 ${BK} 恢复）"; done
+for b in NVMTLDriver.bundle nvmtl ${GLD_BUNDLE:+"$GLD_BUNDLE"}; do rm -rf "$GB/$b" && ditto "$HERE/Library/GPUBundles/$b" "$GB/$b" || die "无法复制 ${b}（从 ${BK} 恢复）"; done
+rm -rf "$GB/NVIDIAShared.bundle" || die "无法移除旧编译器组件（从 ${BK} 恢复）"
 [ -n "$GLD_BUNDLE" ] || rm -rf "$GB/NVKZinkGLDriver.bundle" || die "无法移除旧的可选 OpenGL 组件（从 $BK 恢复）"
 if [ -s "$T/my-conf" ] && [ -f "$GB/nvmtl/nvrm610.conf" ]; then
   cat "$T/my-conf" >> "$GB/nvmtl/nvrm610.conf" || die "无法保留 nvrm610.conf 中的自定义设置（从 $BK 恢复）"
@@ -662,7 +676,7 @@ if [ -d "$EXT/NMXGPU.kext" ] && [ -d /Library/NullMoth/gpu-userland ]; then
   ditto /Library/NullMoth/gpu-userland "$GB/nvmtl" || die "无法复制 AMD/Intel Vulkan 驱动（从 $BK 恢复）"
 fi
 cp "$HERE/Library/GPUBundles/nvmtl-allow.txt" "$GB/" || die "无法复制图形组件许可列表"
-ditto "$HERE/Users/Shared/nvfw" "$FW" || die "无法复制固件"
+ditto "$FWSRC" "$FW" || die "无法复制固件"
 chown -R root:wheel "$FW" && chmod -R go-w,a+rX "$FW" || die "无法设置固件权限"
 # nothing reads the old location any more; leaving it behind leaves a writable folder with our name on it
 rm -rf "$FWOLD" 2>/dev/null || true
@@ -688,11 +702,11 @@ if [ -f "$KPDB" ] && [ -x /usr/bin/sqlite3 ]; then
       || echo "   note: $k 的批准记录当前为只读；macOS 可能会再次要求批准"
   done
 fi
-chown -R root:wheel ${GLD_BUNDLE:+"$GB/$GLD_BUNDLE"} "$GB/NVMTLDriver.bundle" "$GB/NVIDIAShared.bundle" "$GB/nvmtl" "$GB/nvmtl-allow.txt" || die "无法设置图形组件权限"
+chown -R root:wheel ${GLD_BUNDLE:+"$GB/$GLD_BUNDLE"} "$GB/NVMTLDriver.bundle" "$GB/nvmtl" "$GB/nvmtl-allow.txt" || die "无法设置图形组件权限"
 # WindowServer runs as _windowserver and must read the bundles and the allow list. WAS: cp under the app's privileged
 # helper (umask 077) left nvmtl-allow.txt at 0600, WindowServer got no Metal device, and CoreDisplay aborted
 # ("Failed to create MetalDevice") on every start: the crash loop after install on many machines.
-chmod -R go-w,a+rX ${GLD_BUNDLE:+"$GB/$GLD_BUNDLE"} "$GB/NVMTLDriver.bundle" "$GB/NVIDIAShared.bundle" "$GB/nvmtl" && chmod 644 "$GB/nvmtl-allow.txt" || die "无法设置图形组件权限"
+chmod -R go-w,a+rX ${GLD_BUNDLE:+"$GB/$GLD_BUNDLE"} "$GB/NVMTLDriver.bundle" "$GB/nvmtl" && chmod 644 "$GB/nvmtl-allow.txt" || die "无法设置图形组件权限"
 sudo -u _windowserver /bin/test -r "$GB/nvmtl-allow.txt" || die "WindowServer 无法读取 $GB/nvmtl-allow.txt（从 $BK 恢复）"
 # Create the shared shader caches the plugin looks for. Without them NVMTL_AIRCACHE_DIR never resolves, so
 # WindowServer, which compiles the compositor's pipelines on demand, re-translates them from scratch at every start

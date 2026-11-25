@@ -14,9 +14,9 @@ kexts/       Builds against NVIDIA's open GPU kernel modules 620.70.06, MIT (wit
 
 NVK          Vulkan driver from Mesa, MIT (licenses/Mesa-license.rst). NullMoth's changes ship as patches.
 
-GSP firmware gsp_tu10x.bin, gsp_ga10x.bin and the matching ucode images from NVIDIA's 620.70.06 driver,
-             redistributed unmodified under NVIDIA's licence (licenses/NVIDIA-firmware-LICENCE.txt), the same
-             terms under which linux-firmware redistributes these images.
+GSP firmware gsp_tu10x.bin, gsp_ga10x.bin and the matching ucode images come from NVIDIA's 620.70.06 driver.
+             The installer reuses matching installed files or retrieves the images from NVIDIA's archive.
+             See licenses/NVIDIA-firmware-LICENCE.txt for NVIDIA's terms.
 
 kexts/NMIntelFB and the optional Intel-panel copy path in NVAccel include adaptations of
   kitsuneislife/nmx-intel (https://github.com/kitsuneislife/nmx-intel), pinned at

@@ -27,7 +27,7 @@ class PackageZinkTests(unittest.TestCase):
         self.zink = self.root / 'zink'
         self.out = self.root / 'output'
         self.commands = []
-        self.firmware = '/Library/NullMoth/nvfw/nvidia/615.78.08/gsp_tu10x.bin\n'
+        self.firmware = '/Library/NullMoth/nvfw/nvidia/620.70.06/gsp_tu10x.bin\n'
         for name in ('install.sh', 'uninstall.sh', 'nullmoth-runtime-check.sh', 'nullmoth-runtime-check', 'VERSION'):
             self.put(self.base / name, b'base')
         for name in ('NVRM', 'NVRMFB', 'NVRMAGDC', 'NVAccel'):
@@ -50,7 +50,7 @@ class PackageZinkTests(unittest.TestCase):
             frontend['files'][name] = pkg.base_tools.digest(wine/name)
             frontend[key] = {'path': name, 'sha256': frontend['files'][name]}
         self.put(wine/'FRONTEND-BUILD.json', json.dumps(frontend).encode())
-        self.put(self.base / 'Users/Shared/nvfw/nvidia/615.78.08/gsp_tu10x.bin', b'firmware')
+        self.put(self.base / 'Users/Shared/nvfw/nvidia/620.70.06/gsp_tu10x.bin', b'firmware')
         self.put(self.base / 'licenses/base-notice.txt', b'keep this notice')
         for name in pkg.ZINK_FILES:
             self.put(self.zink / name, b'25G241\n' if name == 'cgl-os-build.txt' else b'zink ' + name.encode())
@@ -205,6 +205,9 @@ class PackageZinkTests(unittest.TestCase):
             self.assertEqual(sha, pkg.base_tools.digest(self.out/'Library/NullMoth/kexts'/major/'NVAccel.kext/Contents/MacOS/NVAccel'))
         for command in ('Install.command', 'Verify.command', 'Uninstall.command'):
             self.assertTrue((self.out / command).stat().st_mode & 0o111)
+        self.assertTrue((self.out / 'fw_fetch.sh').stat().st_mode & 0o111)
+        self.assertFalse((self.out / 'Users/Shared/nvfw').exists())
+        self.assertFalse((self.out / 'Library/GPUBundles/NVIDIAShared.bundle').exists())
         entries = {}
         for row in (self.out / 'SHA256SUMS').read_text().splitlines():
             digest, name = row.split('  ', 1)
@@ -346,8 +349,8 @@ class PackageZinkTests(unittest.TestCase):
                             and command[-1].endswith('/NVMTLDriver.bundle') for command in self.commands))
 
     def test_missing_firmware_version_cannot_publish_a_package(self):
-        self.firmware = self.firmware.replace('615.78.08', '999.0')
-        with self.assertRaisesRegex(ValueError, 'missing regular file'):
+        self.firmware = self.firmware.replace('620.70.06', '999.0')
+        with self.assertRaisesRegex(ValueError, 'firmware requirements do not match'):
             self.stage()
         self.assertFalse(self.out.exists())
         self.unchanged()

@@ -57,8 +57,8 @@ fail() {
   echo "   STOP: $*" >&2
   echo "   The GPU firmware comes from NVIDIA's own driver package and is not part of this download." >&2
   echo "   To supply it by hand: download $URL_RUN" >&2
-  echo "   (SHA-256 $SHA_RUN) and run this installer again with the file next to it as" >&2
-  echo "   NVIDIA-Linux-x86_64-$VER.run, or pass it as --run FILE. Nothing on this Mac was changed." >&2
+  echo "   (SHA-256 $SHA_RUN), place NVIDIA-Linux-x86_64-$VER.run next to pkgroot and run the installer again." >&2
+  echo "   You can also pass --run FILE directly to this helper." >&2
   rm -rf "$DEST/nvidia" 2>/dev/null
   exit 1
 }
@@ -89,9 +89,16 @@ if [ -n "$RUN" ]; then
   [ -f "$RUN" ] || fail "$RUN does not exist"
   cp "$RUN" "$T/driver.run" || fail "cannot read $RUN"
 else
-  echo "   downloading NVIDIA's $VER driver package (about 550 MB) to read the GPU firmware from it"
-  curl -fL --proto "$CURL_PROTO" --tlsv1.2 --retry 3 --connect-timeout 20 -sS -o "$T/driver.run" "$URL_RUN" \
-    || fail "the download from download.nvidia.com failed (no network?)"
+  echo "   Downloading NVIDIA's $VER driver package (about 550 MB) for the GPU firmware / 正在从 NVIDIA 下载显卡固件所需的驱动归档（约 550 MB）"
+  downloaded=0
+  for attempt in 1 2 3 4; do
+    if curl -fL --proto "$CURL_PROTO" --tlsv1.2 --connect-timeout 20 --speed-time 40 --speed-limit 1024 \
+      --continue-at - -sS -o "$T/driver.run" "$URL_RUN"; then
+      downloaded=1
+      break
+    fi
+  done
+  [ "$downloaded" = 1 ] || fail "the download from download.nvidia.com failed (no network?)"
 fi
 got=$(sha_of "$T/driver.run")
 [ "$got" = "$SHA_RUN" ] || fail "the driver package does not match its pinned SHA-256 (got $got)"

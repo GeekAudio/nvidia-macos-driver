@@ -144,8 +144,7 @@ def stage(base, zink, output, components=None, native_gld=False, records=None, w
         base_tools.bundle(base / 'Library/Extensions' / (name + '.kext'), name)
     for major in ('15', '26'):
         base_tools.bundle(base / 'Library/NullMoth/kexts' / major / 'NVAccel.kext', 'NVAccel')
-    for name in ('NVMTLDriver', 'NVIDIAShared'):
-        base_tools.bundle(base / 'Library/GPUBundles' / (name + '.bundle'), name)
+    base_tools.bundle(base / 'Library/GPUBundles/NVMTLDriver.bundle', 'NVMTLDriver')
     for name in ('libvulkan_nouveau.dylib', 'libvulkan.1.4.362.dylib', 'nvk_icd.json'):
         base_tools.regular(base / BASE_RUNTIME / name)
     base_tools.validate_wine_frontend(base / BASE_RUNTIME / 'wine')
@@ -252,8 +251,17 @@ def stage(base, zink, output, components=None, native_gld=False, records=None, w
         firmware_paths = {p for p in firmware_paths if '/gsp_log_' not in p}
         if not firmware_paths:
             raise ValueError('Cannot establish NVRM firmware requirements')
-        for path in firmware_paths:
-            base_tools.regular(payload / 'Users/Shared/nvfw' / path)
+        firmware_helper = (ROOT / 'package/fw_fetch.sh').read_text()
+        firmware_version = re.search(r'^VER=([0-9.]+)$', firmware_helper, re.M)
+        if not firmware_version or any(
+                Path(path).parent != Path('nvidia') / firmware_version[1]
+                for path in firmware_paths):
+            raise ValueError('NVRM firmware requirements do not match the firmware fetcher')
+        firmware_dir = payload / 'Users/Shared/nvfw'
+        if firmware_dir.is_dir():
+            for path in firmware_paths:
+                base_tools.regular(firmware_dir / path)
+            shutil.rmtree(firmware_dir)
         runtime = payload / RUNTIME
         runtime.mkdir(exist_ok=True)
         for name in ZINK_FILES:
@@ -308,13 +316,12 @@ def stage(base, zink, output, components=None, native_gld=False, records=None, w
             run('codesign', '--force', '--sign', '-', binary)
             run('codesign', '--verify', '--strict', binary)
         run('codesign', '--verify', '--strict', payload / 'Library/GPUBundles/NVMTLDriver.bundle')
-        # Upstream NVIDIAShared seals ELF/scripts as nested code with signatures
-        # in xattrs, which a portable tar does not retain. Check its executable
-        # and Mach-O children; the complete package manifest covers ELF/scripts.
+        # Older base archives still carry the developer-only vendor compiler.
         shared = payload / 'Library/GPUBundles/NVIDIAShared.bundle'
-        run('codesign', '--verify', '--strict', '--ignore-resources', shared)
-        for name in ('libLLVM.dylib', 'libzstd.1.dylib', 'nvvmdrive'):
-            run('codesign', '--verify', '--strict', shared / 'Contents/PlugIns' / name)
+        if shared.is_symlink():
+            shared.unlink()
+        elif shared.exists():
+            shutil.rmtree(shared)
         shutil.copy2(ROOT / 'docs/ZINK-OPENGL.md', runtime / 'ZINK-OPENGL.md')
         shutil.copy2(ROOT / 'docs/ZINK-SEQUOIA-ABI.json', runtime / 'CGL-ABI-EVIDENCE.json')
         shutil.copy2(ROOT / 'docs/ZINK-SEQUOIA-TESTS.json', runtime / 'CGL-SEQUOIA-TESTS.json')
@@ -340,7 +347,7 @@ def stage(base, zink, output, components=None, native_gld=False, records=None, w
         if test_dir.exists(): shutil.rmtree(test_dir)
         # Use this checkout's installer fixes, preserving its private payload,
         # preflight, backup, rollback and OS accelerator-selection behavior.
-        for name in ('install.sh', 'uninstall.sh', 'sums_complete.sh'):
+        for name in ('install.sh', 'uninstall.sh', 'sums_complete.sh', 'fw_fetch.sh'):
             shutil.copy2(ROOT / 'package' / name, payload / name)
             (payload / name).chmod(0o755)
         native_dlss = None

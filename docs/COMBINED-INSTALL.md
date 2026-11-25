@@ -16,6 +16,11 @@ Double-click `Install.command`, or run from this folder:
 sudo ./install.sh
 ```
 
+The installer reuses NVIDIA 620.70.06 firmware when the installed files match
+their checksums. On a fresh install it can fetch NVIDIA's driver archive and
+extract the firmware. For an offline install, place
+`NVIDIA-Linux-x86_64-620.70.06.run` next to the extracted `pkgroot` folder.
+
 Follow the approval and reboot instructions. Optional Intel laptop panel
 support defaults to **No**; an existing opt-in is retained. See
 [the Intel panel guide](https://github.com/HighDelay/nvidia-macos-driver-nvk/blob/main/docs/INTEL-PANEL.md).

@@ -4,6 +4,8 @@
 # unlisted, or if any regular file in the tree is not listed in SHA256SUMS.
 set -uo pipefail
 ROOT=${1:?pkgroot}
+PROFILE=${2:-standard}
+case "$PROFILE" in standard|--nvk) ;; *) echo "usage: $0 pkgroot [--nvk]" >&2; exit 2;; esac
 REL="Library/GPUBundles/NVMTLDriver.bundle/Contents/MacOS/libnvencvt.dylib"
 fail=0
 if [ ! -f "$ROOT/$REL" ]; then echo "STOP: $REL is missing from the package"; exit 1; fi
@@ -21,7 +23,10 @@ fi
 # The Ryzen power parts (package/stage_nmsmn.sh): required, so a release cannot go out without them. The kext is carried only
 # (install.sh never loads it; the Mac app installs it on request), the RyzenAdj build must be the one the app pins.
 N="Library/NullMoth/kexts/NMSMN.kext"; R="Library/NullMoth/ryzenadj/ryzenadj"
-if [ ! -f "$ROOT/$N/Contents/MacOS/NMSMN" ] || [ ! -f "$ROOT/$R" ]; then
+if [ "$PROFILE" = --nvk ]; then
+  [ -x "$ROOT/fw_fetch.sh" ] && [ -x "$ROOT/dlss/nm_unzstd" ] || { echo "STOP: the NVK package lacks its firmware fetch tools"; fail=1; }
+  [ ! -e "$ROOT/Users/Shared/nvfw" ] || { echo "STOP: the NVK package includes firmware instead of fetching it"; fail=1; }
+elif [ ! -f "$ROOT/$N/Contents/MacOS/NMSMN" ] || [ ! -f "$ROOT/$R" ]; then
   echo "STOP: the Ryzen power parts are missing (run package/stage_nmsmn.sh)"; fail=1
 else
   [ "$(plutil -extract CFBundleIdentifier raw -o - "$ROOT/$N/Contents/Info.plist" 2>/dev/null)" = com.nullmoth.NMSMN ] || { echo "STOP: $N is not the NullMoth NMSMN kext"; fail=1; }
@@ -71,5 +76,5 @@ done < <(find "$ROOT/Library" -type d -name '*.kext' -print0 2>/dev/null)
 # Every regular file must be listed: install.sh refuses a package whose SHA256SUMS leaves a file out (sums_complete.sh).
 bash "$HERE/sums_complete.sh" "$ROOT" || fail=1
 [ -f "$ROOT/sums_complete.sh" ] || { echo "STOP: the package lacks sums_complete.sh, which install.sh runs"; fail=1; }
-[ "$fail" = 0 ] && echo "package carries libnvencvt.dylib ${want:0:8} and the Ryzen power parts"
+[ "$fail" = 0 ] && echo "package carries libnvencvt.dylib ${want:0:8} and the required $PROFILE components"
 exit $fail

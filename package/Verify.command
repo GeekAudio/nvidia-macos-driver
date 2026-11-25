@@ -8,13 +8,6 @@ for bundle in NVMTLDriver.bundle NVKZinkGLDriver.bundle; do
     /usr/bin/codesign --verify --strict "$HERE/Library/GPUBundles/$bundle"
   fi
 done
-# NVIDIAShared's upstream ELF/script nested signatures use nonportable xattrs.
-# Their bytes are covered by SHA256SUMS; check the actual Mach-O code separately.
-SHARED="$HERE/Library/GPUBundles/NVIDIAShared.bundle"
-/usr/bin/codesign --verify --strict --ignore-resources "$SHARED"
-for binary in libLLVM.dylib libzstd.1.dylib nvvmdrive; do
-  /usr/bin/codesign --verify --strict "$SHARED/Contents/PlugIns/$binary"
-done
 /bin/bash "$HERE/nullmoth-runtime-check.sh" "$HERE" "$(sw_vers -productVersion)"
 RUNTIME="$HERE/Library/GPUBundles/nvmtl/zink"
 export NVKZINK_PRESENT=gpu NVKZINK_REQUIRE_GPU=1

@@ -5299,7 +5299,8 @@ bool NVRMNVDAFramebuffer::copyPresentSupported() const
 bool NVRMNVDAFramebuffer::copyPresentReady()
 {
     return copyPresentSupported() && !OSAddAtomic(0, &fStopping) && !fSubmissionFaulted &&
-        fKms && fDev && fSurf && fModeSet && !fConsoleAperture && fPowerOn &&
+        fKms && fDev && fSurf && fModeSet && !fConsoleAperture &&
+        __atomic_load_n(&fPowerOn, __ATOMIC_ACQUIRE) &&
         !fHeadSlept && !fDpyLost && fHead < 8 && rmGpuReady();
 }
 

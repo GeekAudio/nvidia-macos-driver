@@ -17,7 +17,7 @@ windows and Metal apps intact.
 | NVRM `setPowerState(0)` | NVRM | Tell the framebuffers; `nvKmsSuspend` (heads off, while the GPU still serves the core channel); close the RM gate; stop user channels; save PCI config, Resizable BAR control and the root port window; `rm_power_management(STANDBY)`. |
 | — | RM | With `PreserveVideoMemoryAllocations=1` RM copies **every** VRAM allocation out through its temporary-file interface. NVRM backs that "file" with pageable kernel memory (no disk I/O). GSP-RM is unloaded. |
 | Slot powered again, NVRM `setPowerState(1)` | NVRM | Restore the root port window and the Resizable BAR size (the firmware resets BAR1 to 256 MB), check `PMC_BOOT_0`, `rm_power_management(RESUME)` (GSP boots again through FSP and VRAM is copied back), restart user channels, `nvKmsResume`, open the RM gate, tell the framebuffers. |
-| NVRMFB `setPowerState(1)` | NVRMFB | Re-light the head once NVRM says the GPU is back, then do IOGraphics' own wake work (below). |
+| NVRMFB `setPowerState(1)` | NVRMFB | Deliver IOGraphics wake notifications and queue the head restore. The framebuffer worker commits the mode once the head is awake and RM is ready. |
 | CPU back on | NVAccel | The sleep window closes: page-offs give VRAM back again. |
 
 ## Why each part is needed
@@ -50,6 +50,9 @@ NVRMFB now does what IOGraphics does (`IOFBController::computeState` and `handle
 IOGraphics-599): deliver `DidWake` with `true` and then `false` (the second re-enables the accelerators), deliver
 `DidPowerOn`, set `pagingState` and wake WindowServer on `fServerConnect`, under the framebuffer's work loop gate. It
 never pushes to NVKMS before NVRM has resumed the GPU (`NVRMGpuReady`, `NVRMGpuPower`).
+Both the framebuffer's power-on and NVRM's GPU-ready notification queue the same restore worker.
+Keeping the committed modeset off the IOKit power callout allows the system power transition
+to continue while NVKMS waits for the display engine.
 
 **NVAccel and VRAM across sleep.** At sleep IOGraphicsAccelerator2 pages off its VRAM resources, and the wake's mode
 change pages them back on. If page-on got fresh VRAM, WindowServer kept drawing into the memory it had imported before

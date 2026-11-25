@@ -1,8 +1,8 @@
 # Retained fork changes for upstream merges
 
-## HighDelay NVK 3.0.3 integration
+## HighDelay NVK 3.0.4 integration
 
-This integration uses [v3.0.3-nvk at 12f45ce4](https://github.com/HighDelay/nvidia-macos-driver-nvk/releases/tag/v3.0.3-nvk).
+This integration uses [v3.0.4-nvk at e419a973](https://github.com/HighDelay/nvidia-macos-driver-nvk/releases/tag/v3.0.4-nvk).
 Keep the upstream DDC transfer and eDP AUX ABI, Mesa 26.3.1 NVK and Zink,
 hybrid Wine presentation, Safari registration, AMD/Intel panel support,
 HDR, Surround, and runtime power transitions. The GeekAudio changes kept
@@ -13,16 +13,39 @@ QuickTime retains the single-Ampere GPU exception for the external decoder.
 It shares the existing access checks with the upstream Safari policy. A
 second display controller, failed enumeration, or denied sandbox bridge
 keeps the normal decoder route. The codec overlay retains C7B0 decode,
-device identity reporting, and completion polling. The separate two-worker
-untile trial and VBlank diagnostics are outside this integration.
+device identity reporting, completion polling, adaptive HEVC Main10 output
+and batched P010 uploads. Keep the native Metal shared events used across
+GPUs. The fixed two-worker trial and VBlank diagnostics stay separate.
 
 The buffered-copy path still tracks a retiring scanout and a queued frame per
-head. HDR, 10-bit scanout and Surround use the corresponding 3.0.3 path.
+head. HDR, 10-bit scanout and Surround use the corresponding upstream paths.
 Rebuild NVRM, NVRMFB, both NVAccel variants, and the plugin together. Match
 the package and tests to the pinned upstream assets. Offline tests cover
-policy, DDC, display lifecycle and buffer ownership. Playback stability,
-CPU comparisons and GA106 still need hardware acceptance on this build.
+policy, DDC, display lifecycle and buffer ownership. Keep 3.0.4's shared
+boot-guard admission and non-blocking Zink and native Vulkan presentation.
+Report hardware results against the particular build tested.
 
+## Upstream 3.1 selective integration
+
+Adapt the [boot guard fix](https://github.com/nullmoth/nvidia-macos-driver/commit/3b7f6c7e)
+so NVRM, NVAccel, NVRMFB and the optional AMD panel share one admission decision
+in the current boot. With one prior failure, NVRM can record a second attempt
+without blocking NVAccel and NVRMFB from starting. Two failed attempts still
+disable the next boot. Keep the explicit recovery overrides and the driver's
+startup-wait exemption. If the registry cannot record admission, skip the
+counter increment. NVRAM persistence across a panic remains platform-dependent.
+
+Retain the fork's ANGLE Metal default, Safari helper and codec registration
+policy. The [3.0 WebGL report](https://github.com/nullmoth/nvidia-macos-driver/issues/600)
+also shows a WebKit sandbox denial. The boot-guard repair addresses a separate
+[system-wide accelerator startup failure](https://github.com/nullmoth/nvidia-macos-driver/issues/633).
+
+Defer the 3.1 VFX translator and late NAK load splitting until the shared
+compiler changes have browser, login-window and native NVK coverage against
+Mesa 26.3.1. Keep the existing GPU-copy frontends and leave the software Metal
+WSI profile out. The complete fork package ships firmware and omits the RyzenAdj
+helper, so the 3.1 firmware downloader and RyzenAdj linker fixes do not apply
+to the current installer.
 
 ## Mesa 26.3.1
 

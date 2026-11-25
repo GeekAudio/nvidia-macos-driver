@@ -115,6 +115,13 @@ class InstallerCoverage(unittest.TestCase):
             (root / 'sums_complete.sh').write_bytes(CHECKER.read_bytes())
             (root / 'runtime').write_bytes(b'checked')
             stage.write_manifest(root)
+            result = self.run_integrity(root)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn('this package has no libnvencvt.dylib', result.stdout)
+            codec = root / stage.VIDEO_ADDON
+            codec.parent.mkdir(parents=True)
+            codec.write_bytes(b'checked')
+            stage.write_manifest(root)
             self.assertEqual(self.run_integrity(root).returncode, 0)
             (root / 'unlisted').write_bytes(b'extra')
             result = self.run_integrity(root)
@@ -130,7 +137,7 @@ class InstallerCoverage(unittest.TestCase):
             (root / 'sums_complete.sh').write_text('touch "' + str(marker) + '"\n')
             result = self.run_integrity(root)
             self.assertNotEqual(result.returncode, 0)
-            self.assertIn('verified sums_complete.sh', result.stdout)
+            self.assertRegex(result.stdout, r'(?:verified|经过校验的) sums_complete\.sh')
             self.assertFalse(marker.exists())
 
     def test_checker_hash_mismatch_stops_before_execution(self):
@@ -141,7 +148,7 @@ class InstallerCoverage(unittest.TestCase):
             (root / 'sums_complete.sh').write_text('echo UNTRUSTED_EXECUTION\n')
             result = self.run_integrity(root)
             self.assertNotEqual(result.returncode, 0)
-            self.assertIn('mismatch', result.stdout)
+            self.assertRegex(result.stdout, r'mismatch|校验不匹配')
             self.assertNotIn('UNTRUSTED_EXECUTION', result.stdout)
 
 

@@ -256,6 +256,8 @@ VAR="$HERE/Library/NullMoth/kexts/$MAJ"
   grep -qE '^[0-9a-fA-F]{64} [ *](\./)?sums_complete\.sh$' "$HERE/SHA256SUMS" \
   || die "此软件包未包含经过校验的 sums_complete.sh：请重新下载软件包"
 bash "$HERE/sums_complete.sh" "$HERE" || die "软件包中存在未列入 SHA256SUMS 的文件：请重新下载软件包"
+[ -f "$HERE/Library/GPUBundles/NVMTLDriver.bundle/Contents/MacOS/libnvencvt.dylib" ] ||
+  die "this package has no libnvencvt.dylib: re-download the complete package / 此软件包缺少视频编解码组件 libnvencvt.dylib：请重新下载完整包"
 for target in 15 26; do
   [ -f "$HERE/Library/NullMoth/kexts/$target/NVAccel.kext/Contents/MacOS/NVAccel" ] && \
     [ -f "$HERE/Library/NullMoth/kexts/$target/NVAccel.kext/Contents/Info.plist" ] || die "此软件包缺少完整的 macOS $target 图形加速组件"

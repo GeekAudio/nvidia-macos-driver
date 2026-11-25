@@ -49,7 +49,9 @@ dl = (R / "plugin/nvmtl_dlss.c").read_text()
 arm("the DLSS trace file is opened without following a link", "O_NOFOLLOW" in dl and 'g_trf = fopen(path, "a")' not in dl)
 nd = (R / "nvk/nvk-diag-nofollow.patch").read_text()
 bld = (R / "build/build_nvk.sh").read_text()
+current_chain = bld.split("  3.0)", 1)[1].split(";;", 1)[0].split('CHAIN="', 1)[1].split('"', 1)[0]
 arm("NVK's diagnostic log (NVK_DIAG=1) is created without following a link, for its owner alone",
     "+         int fd = open(path, O_WRONLY | O_CREAT | O_APPEND | O_NOFOLLOW, 0600);" in nd
-    and "-         int fd = open(path, O_WRONLY | O_CREAT | O_APPEND, 0644);" in nd and 'nvk-diag-nofollow" ;;' in bld)
+    and "-         int fd = open(path, O_WRONLY | O_CREAT | O_APPEND, 0644);" in nd
+    and "nvk-diag-nofollow" in current_chain.split())
 print("FAILED" if fails else "PASS"); sys.exit(1 if fails else 0)
